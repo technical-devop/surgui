@@ -3,7 +3,7 @@
 Unofficial desktop GUI for Surge, the download daemon. Built with Tauri + Svelte.
 
 This is a **third-party controller**, not part of the Surge upstream project and not
-affiliated with it. It targets the Surge v0.12.2 API. The GUI does not bundle or
+affiliated with it. It targets the Surge v0.12.4 API. The GUI does not bundle or
 install Surge — you run the daemon yourself, separately.
 
 ## Scope
@@ -21,7 +21,7 @@ install Surge — you run the daemon yourself, separately.
 ## Running the daemon (Windows)
 
 Surge runs as a separate server process. Download `surge.exe` for Windows from the
-[Surge v0.12.2 release](https://github.com/SurgeDM/Surge/releases/tag/v0.12.2),
+[Surge v0.12.4 release](https://github.com/SurgeDM/Surge/releases/tag/v0.12.4),
 then extract it to a folder.
 
 A minimal local setup uses two PowerShell windows, both opened in that extracted
@@ -51,7 +51,7 @@ Then in the app:
 
 ### Network exposure
 
-Surge v0.12.2's server listens broadly on the host by default — not only on
+Surge v0.12.4's server listens broadly on the host by default — not only on
 loopback. Before starting it, block inbound port 1700 in Windows Firewall (or your
 equivalent), or put the daemon behind an HTTPS tunnel. The app requires HTTPS for
 anything that is not loopback HTTP, but that is a client-side rule only; it does
@@ -60,8 +60,8 @@ not restrict who can reach the daemon.
 ## Running the daemon (Linux)
 
 The same Surge release ships Linux binaries. Download
-`Surge_0.12.2_linux_amd64.tar.gz` (or `linux_arm64`) from the
-[Surge v0.12.2 release](https://github.com/SurgeDM/Surge/releases/tag/v0.12.2),
+`Surge_0.12.4_linux_amd64.tar.gz` (or `Surge_0.12.4_linux_arm64.tar.gz`) from the
+[Surge v0.12.4 release](https://github.com/SurgeDM/Surge/releases/tag/v0.12.4),
 then extract it to a folder.
 
 A minimal local setup uses two terminals, both opened in that extracted Surge

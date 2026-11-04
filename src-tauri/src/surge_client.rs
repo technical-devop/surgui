@@ -15,16 +15,17 @@ const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// hostile or malformed URL from being relayed to the daemon.
 const MAX_URL_BYTES: usize = 8 * 1024;
 
-/// Exact duplicate-rejection message emitted by released Surge v0.12.2 when
-/// headless mode refuses an already-queued download (`cmd/http_api.go`). The
-/// 409 status alone does not prove a duplicate, so the message is matched
-/// case-insensitively in addition to `status == "error"`.
+/// Exact duplicate-rejection message emitted by released Surge v0.12.4 when
+/// headless mode refuses an already-queued download (`cmd/root_downloads.go`,
+/// unchanged from v0.12.2). The 409 status alone does not prove a duplicate,
+/// so the message is matched case-insensitively in addition to
+/// `status == "error"`.
 const DUPLICATE_MESSAGE: &str = "Download rejected: Duplicate download detected (Headless mode)";
 
 /// Bounded round-trip for the authenticated `/list` probe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One entry of the Surge `/list` payload (released Surge v0.12.2
+/// One entry of the Surge `/list` payload (released Surge v0.12.4
 /// `internal/types/models.go` `DownloadStatus`).
 ///
 /// `total_size`, `downloaded` and `eta` are Go `int64` (`eta == -1` means
@@ -32,8 +33,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `i64` for 32/64-bit portability), `added_at`/`time_taken` are Go `int64`,
 /// `avg_speed` is Go `float64`. `dest_path`/`error` are `omitempty` in Go and
 /// `rate_limit`/`rate_limit_set` are only present when a cap is set, so all
-/// four are `Option`. Unknown fields are ignored so a server-side schema
-/// addition stays forward compatible.
+/// four are `Option`. v0.12.4 adds optional forward-compatible fields
+/// (`phase`, `max_connections`, `artifact`, `error_code`, `moving`,
+/// `file_missing`, `category_override`, timestamps); unknown fields are
+/// ignored so a server-side schema addition stays forward compatible.
 #[derive(Clone, Deserialize)]
 pub struct Download {
     pub id: String,
@@ -152,12 +155,14 @@ impl fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
-/// Released Surge v0.12.2 control actions (`cmd/http_api.go`).
+/// Released Surge v0.12.4 control actions (`cmd/http_api.go`).
 ///
 /// Each action maps to one authenticated `POST` route. `RemoveRecord` uses
 /// the distinct `/delete` route (drop the queue record only); the separate
 /// `/purge` route that also removes the payload from disk is intentionally
-/// never reachable through this type.
+/// never reachable through this type. v0.12.4 acknowledges pause/resume as
+/// `pause_requested`/`resume_requested` (v0.12.2 used `paused`/`resumed`);
+/// `/delete` still acknowledges `deleted`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlAction {
     Pause,
@@ -175,12 +180,30 @@ impl ControlAction {
         }
     }
 
-    /// Acknowledgment `status` the daemon must echo for this action.
+    /// Canonical acknowledgment `status` the daemon echoes for this action.
+    ///
+    /// Released Surge v0.12.4 `cmd/http_api.go`: `pause_requested`,
+    /// `resume_requested`, `deleted`. The v0.12.2 `paused`/`resumed` strings
+    /// remain accepted via [`Self::is_acknowledged`] for backward
+    /// compatibility; `/delete` never had a legacy alias.
     fn acknowledged_status(self) -> &'static str {
         match self {
-            Self::Pause => "paused",
-            Self::Resume => "resumed",
+            Self::Pause => "pause_requested",
+            Self::Resume => "resume_requested",
             Self::RemoveRecord => "deleted",
+        }
+    }
+
+    /// True for the canonical v0.12.4 acknowledgment plus the legacy v0.12.2
+    /// `paused`/`resumed` strings (pause/resume only).
+    fn is_acknowledged(self, status: &str) -> bool {
+        if status == self.acknowledged_status() {
+            return true;
+        }
+        match self {
+            Self::Pause => status == "paused",
+            Self::Resume => status == "resumed",
+            Self::RemoveRecord => false,
         }
     }
 }
@@ -211,7 +234,8 @@ struct AddRequest<'a> {
     skip_approval: bool,
 }
 
-/// Released Surge v0.12.2 `POST /download` response body.
+/// Released Surge v0.12.4 `POST /download` response body (unchanged from
+/// v0.12.2).
 ///
 /// Only the trusted routing fields are modeled: `status` (outcome
 /// discriminator), `id` (queue identifier) and `message` (duplicate
@@ -381,7 +405,7 @@ async fn get_list(
     }
     let bytes = read_bounded_body(response).await?;
     // Fresh/empty daemon encodes an uninitialized Go slice as JSON `null`
-    // (upstream v0.12.2 `List()` leaves `var statuses` nil). Accept ONLY
+    // (upstream v0.12.4 `List()` leaves `var statuses` nil). Accept ONLY
     // `null` or an array; any other JSON shape stays `InvalidResponse`.
     let downloads: Option<Vec<Download>> =
         serde_json::from_slice(&bytes).map_err(|_| ConnectError::InvalidResponse)?;
@@ -471,7 +495,7 @@ impl SurgeClient {
         let bytes = read_bounded_body(response).await?;
         let ack: ControlAck =
             serde_json::from_slice(&bytes).map_err(|_| ConnectError::InvalidResponse)?;
-        if ack.status != action.acknowledged_status() || ack.id != id {
+        if !action.is_acknowledged(&ack.status) || ack.id != id {
             return Err(ConnectError::InvalidResponse);
         }
         Ok(())

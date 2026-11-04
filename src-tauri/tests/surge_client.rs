@@ -239,7 +239,100 @@ async fn errors_never_reveal_token_or_body() {
     );
 }
 
-/// Full Surge v0.12.2 `DownloadStatus` shape: signed eta (-1 = unknown),
+/// Upstream v0.12.4 regression: `/pause` acknowledges `pause_requested` and
+/// `/resume` acknowledges `resume_requested` (`cmd/http_api.go` at
+/// v0.12.4; v0.12.2 used `paused`/`resumed`). The client must accept the
+/// canonical v0.12.4 strings.
+#[tokio::test]
+async fn control_download_accepts_v12_4_requested_acks() {
+    use surge_desktop_lib::surge_client::ControlAction;
+
+    const FIXTURE_ID: &str = "v124-fixture";
+    for (action, status) in [
+        (ControlAction::Pause, "pause_requested"),
+        (ControlAction::Resume, "resume_requested"),
+    ] {
+        let control_body = format!(r#"{{"status":"{status}","id":"{FIXTURE_ID}"}}"#);
+        let (base, server) = spawn_connect_then_control(LIST_BODY.to_string(), control_body);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        client
+            .control_download(action, FIXTURE_ID)
+            .await
+            .expect("v0.12.4 requested ack must succeed");
+        let _ = server.join().expect("server thread panicked");
+    }
+}
+
+/// Backward compatibility: the legacy v0.12.2 `paused`/`resumed`
+/// acknowledgments remain accepted so a mixed-version fleet does not break
+/// during the v0.12.4 upgrade window.
+#[tokio::test]
+async fn control_download_accepts_legacy_v12_2_acks() {
+    use surge_desktop_lib::surge_client::ControlAction;
+
+    const FIXTURE_ID: &str = "v122-fixture";
+    for (action, status) in [
+        (ControlAction::Pause, "paused"),
+        (ControlAction::Resume, "resumed"),
+    ] {
+        let control_body = format!(r#"{{"status":"{status}","id":"{FIXTURE_ID}"}}"#);
+        let (base, server) = spawn_connect_then_control(LIST_BODY.to_string(), control_body);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        client
+            .control_download(action, FIXTURE_ID)
+            .await
+            .expect("legacy v0.12.2 ack must still succeed");
+        let _ = server.join().expect("server thread panicked");
+    }
+}
+
+/// A mismatched acknowledgment must not surface as success: the legacy
+/// `paused` string on a resume action (and vice versa) is rejected without
+/// leaking the response body.
+#[tokio::test]
+async fn control_download_rejects_mismatched_ack_without_leaking_body() {
+    use surge_desktop_lib::surge_client::ControlAction;
+
+    const SENTINEL_ID: &str = "mismatch-fixture";
+    for (action, status) in [
+        (ControlAction::Pause, "resume_requested"),
+        (ControlAction::Resume, "pause_requested"),
+        (ControlAction::Pause, "paused-extra"),
+        (ControlAction::RemoveRecord, "pause_requested"),
+    ] {
+        let control_body = format!(r#"{{"status":"{status}","id":"{SENTINEL_ID}"}}"#);
+        let (base, server) = spawn_connect_then_control(LIST_BODY.to_string(), control_body);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let err = client
+            .control_download(action, SENTINEL_ID)
+            .await
+            .expect_err("mismatched ack must fail");
+        let _ = server.join().expect("server thread panicked");
+        assert!(
+            matches!(err, ConnectError::InvalidResponse),
+            "mismatched ack must map to InvalidResponse, got {:?}",
+            err
+        );
+        let debug = format!("{:?}", err);
+        let display = format!("{}", err);
+        assert!(
+            !debug.contains(status),
+            "error Debug must not echo ack status"
+        );
+        assert!(
+            !display.contains(status),
+            "error Display must not echo ack status"
+        );
+    }
+}
+
+/// Full Surge v0.12.4 `DownloadStatus` shape: signed eta (-1 = unknown),
 /// all carried fields, optional dest_path/rate_limit set, `error` omitted,
 /// plus unknown future fields that must be ignored.
 const FULL_SCHEMA_BODY: &str = r#"[{"id":"f-003","url":"https://dl.example.test/gamma.bin?sig=signed-secret-abc","filename":"gamma.bin","dest_path":"/downloads/gamma.bin","total_size":5242880,"downloaded":1048576,"progress":20.0,"speed":1048576.0,"status":"downloading","eta":-1,"connections":4,"added_at":1750000000,"time_taken":0,"avg_speed":0.0,"rate_limit":1048576,"rate_limit_set":true,"some_future_field":"future-value","another_future":123}]"#;
@@ -617,7 +710,7 @@ async fn connection_manager_list_downloads_requeries_daemon() {
     );
 }
 
-/// Sequential loopback helper for released v0.12.2 control routes.
+/// Sequential loopback helper for released v0.12.4 control routes.
 /// Serves `GET /list` then one authenticated control `POST`.
 /// Owns both `String` bodies; each accept is bounded by `accept_one`'s
 /// existing 5s deadline.
@@ -665,8 +758,8 @@ async fn control_download_posts_exact_authenticated_path() {
 
     const FIXTURE_ID: &str = "file 1 & 2";
     let routes = [
-        ("/pause", "paused"),
-        ("/resume", "resumed"),
+        ("/pause", "pause_requested"),
+        ("/resume", "resume_requested"),
         ("/delete", "deleted"),
     ];
     for (index, (path, status)) in routes.iter().enumerate() {
@@ -815,7 +908,7 @@ async fn connection_manager_control_download_forwards_authenticated_pause() {
     use surge_desktop_lib::surge_client::ControlAction;
 
     const FIXTURE_ID: &str = "file 1 & 2";
-    let control_body = format!(r#"{{"status":"paused","id":"{FIXTURE_ID}"}}"#);
+    let control_body = format!(r#"{{"status":"pause_requested","id":"{FIXTURE_ID}"}}"#);
     let (base, server) = spawn_connect_then_control(LIST_BODY.to_string(), control_body);
     let manager = surge_desktop_lib::commands::ConnectionManager::default();
     manager.connect(&base, "test-token").await.expect("connect");
@@ -917,7 +1010,7 @@ fn read_request_with_body(stream: &mut TcpStream) -> CapturedDownload {
     }
 }
 
-/// Sequential loopback helper for released Surge v0.12.2 `POST /download`.
+/// Sequential loopback helper for released Surge v0.12.4 `POST /download`.
 /// Serves `GET /list` then one authenticated `POST /download`.
 /// Each accept is bounded by `accept_one`'s existing 5s deadline.
 fn spawn_connect_then_download(
