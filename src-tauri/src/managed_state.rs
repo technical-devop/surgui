@@ -118,6 +118,8 @@ use windows_sys::Win32::Foundation::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+#[cfg(all(windows, test))]
+use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
 #[cfg(windows)]
 use windows_sys::Win32::Security::{
     AclSizeInformation, AddAccessAllowedAceEx, CreateWellKnownSid, EqualSid, GetAce,
@@ -126,10 +128,9 @@ use windows_sys::Win32::Security::{
     SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenUser,
     WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
     ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    INHERITED_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SE_DACL_DEFAULTED, SE_DACL_PRESENT,
-    SE_DACL_PROTECTED, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    INHERITED_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SE_DACL_DEFAULTED,
+    SE_DACL_PRESENT, SE_DACL_PROTECTED, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -983,7 +984,10 @@ mod tests {
                     unique
                 ));
 
+                #[cfg(unix)]
                 let mut builder = std::fs::DirBuilder::new();
+                #[cfg(not(unix))]
+                let builder = std::fs::DirBuilder::new();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;

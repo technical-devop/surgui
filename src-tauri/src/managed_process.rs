@@ -52,13 +52,13 @@
 //! only codes, pid, and `ErrorKind`.
 
 use std::ffi::OsStr;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::Path;
 use std::process::{Child, ExitStatus};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -113,6 +113,7 @@ impl fmt::Display for SpawnError {
 impl std::error::Error for SpawnError {}
 
 impl SpawnError {
+    #[cfg(target_os = "linux")]
     fn spawn_failed(err: io::Error) -> Self {
         Self::SpawnFailed { kind: err.kind() }
     }
@@ -198,6 +199,7 @@ struct ReapShared {
 }
 
 impl ReapShared {
+    #[cfg(target_os = "linux")]
     fn new() -> Self {
         Self {
             status: Mutex::new(ReapStatus::Owned),
@@ -207,7 +209,7 @@ impl ReapShared {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_test_blocking_entered(&self, tx: Option<mpsc::Sender<()>>) {
         match self.test_blocking_entered.lock() {
             Ok(mut guard) => *guard = tx,
@@ -451,7 +453,7 @@ impl ManagedChild {
         #[cfg(windows)]
         {
             let _ = (args, env_overrides, clear_env);
-            return Err(SpawnError::HardeningUnavailable("windows-job"));
+            Err(SpawnError::HardeningUnavailable("windows-job"))
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -943,6 +945,7 @@ mod tests {
         false
     }
 
+    #[cfg(target_os = "linux")]
     fn wait_for_exit(child: &mut ManagedChild, timeout: Duration) -> Option<ExitStatus> {
         let start = Instant::now();
         while start.elapsed() < timeout {

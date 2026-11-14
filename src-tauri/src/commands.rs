@@ -1299,10 +1299,13 @@ pub async fn add_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(target_os = "linux")]
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(target_os = "linux")]
     fn sandbox_base() -> PathBuf {
         std::env::temp_dir().join(format!(
             "surge-managed-integration-tests-{}",
@@ -1310,6 +1313,7 @@ mod tests {
         ))
     }
 
+    #[cfg(target_os = "linux")]
     fn fresh_dir(tag: &str) -> PathBuf {
         std::fs::create_dir_all(sandbox_base()).expect("create sandbox base");
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -1318,6 +1322,7 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "linux")]
     fn remove_all_best_effort(path: &Path) {
         if path.symlink_metadata().is_ok() {
             if path.is_dir() && !path.is_symlink() {
@@ -1328,6 +1333,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn port_lock() -> &'static tokio::sync::Mutex<()> {
         crate::managed_server::test_port_lock()
     }
@@ -1395,6 +1401,7 @@ mod tests {
         script
     }
 
+    #[cfg(target_os = "linux")]
     fn managed_pid(manager: &ConnectionManager) -> Option<u32> {
         manager
             .state

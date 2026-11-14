@@ -247,7 +247,7 @@ enum OwnerCmd {
     /// the authenticated graceful path.
     StartupComplete,
     /// Test-only: ask the owner to kill and reap exactly its owned child.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     KillOwnedForTest,
 }
 
@@ -671,7 +671,7 @@ fn owner_main_linux(
     loop {
         // Shutdown takes precedence; a disconnected coordinator also means shutdown.
         match cmd_rx.try_recv() {
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             Ok(OwnerCmd::KillOwnedForTest) => {
                 // Test-only crash simulation: kill/reap only the owned handle.
                 owner.wait_cleanup_gate();
@@ -784,7 +784,7 @@ fn owner_main_windows(
     let mut startup_complete = cancel.is_none();
     loop {
         match cmd_rx.try_recv() {
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             Ok(OwnerCmd::KillOwnedForTest) => {
                 // Test-only crash simulation: kill/reap only the owned handle.
                 owner.wait_cleanup_gate();
@@ -1475,7 +1475,7 @@ impl ManagedServer {
 
     /// Test-only: ask the dedicated owner thread to kill and reap its owned
     /// child. Never signals a bare pid. Returns `false` if the owner is gone.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn kill_owned_child_for_test(&self) -> bool {
         match self.cmd_tx.as_ref() {
             Some(tx) => tx.send(OwnerCmd::KillOwnedForTest).is_ok(),
@@ -1546,7 +1546,7 @@ fn _assert_absolute_for_test(p: &Path) -> bool {
 
 /// Serialize tests that bind the fixed managed port. Shared with the command
 /// integration tests so the two modules cannot race each other in one binary.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn test_port_lock() -> &'static tokio::sync::Mutex<()> {
     use std::sync::OnceLock;
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -1556,11 +1556,15 @@ pub(crate) fn test_port_lock() -> &'static tokio::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::ffi::OsStr;
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::AtomicU64;
 
+    #[cfg(target_os = "linux")]
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(target_os = "linux")]
     fn port_lock() -> &'static tokio::sync::Mutex<()> {
         test_port_lock()
     }
@@ -1569,23 +1573,27 @@ mod tests {
         std::env::temp_dir().join(format!("surge-managed-server-tests-{}", std::process::id()))
     }
 
+    #[cfg(target_os = "linux")]
     fn unique_tag(tag: &str) -> String {
         use std::sync::atomic::Ordering;
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         format!("{}-{}-{}", tag, std::process::id(), id)
     }
 
+    #[cfg(target_os = "linux")]
     fn fresh_missing_path(tag: &str) -> PathBuf {
         std::fs::create_dir_all(sandbox_base()).ok();
         sandbox_base().join(unique_tag(tag))
     }
 
+    #[cfg(target_os = "linux")]
     fn make_home_dir(tag: &str) -> PathBuf {
         let dir = fresh_missing_path(tag);
         std::fs::create_dir_all(&dir).expect("create home dir");
         dir
     }
 
+    #[cfg(target_os = "linux")]
     fn remove_all_best_effort(path: &Path) {
         if path.symlink_metadata().is_ok() {
             if path.is_dir() && !path.is_symlink() {

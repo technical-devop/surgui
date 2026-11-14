@@ -174,7 +174,7 @@ fn invalid_input() -> SpawnError {
 /// A transient wait error is never treated as success and the handle is never
 /// discarded. The backoff prevents a busy loop; the caller retains ownership
 /// for the whole loop.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn wait_until_confirmed<T, F>(mut wait: F) -> T
 where
     F: FnMut() -> io::Result<T>,
@@ -512,8 +512,14 @@ fn build_env_block(
 mod win32 {
     use std::ffi::c_void;
 
+    // Windows API spelling is `HANDLE`; keep FFI name, allow upper-case acronym lint.
+    #[allow(clippy::upper_case_acronyms)]
     pub type HANDLE = *mut c_void;
+    // Windows API spelling is `BOOL`; keep FFI name, allow upper-case acronym lint.
+    #[allow(clippy::upper_case_acronyms)]
     pub type BOOL = i32;
+    // Windows API spelling is `DWORD`; keep FFI name, allow upper-case acronym lint.
+    #[allow(clippy::upper_case_acronyms)]
     pub type DWORD = u32;
 
     pub const CREATE_SUSPENDED: DWORD = 0x0000_0004;
