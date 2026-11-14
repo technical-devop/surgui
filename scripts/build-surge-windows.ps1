@@ -19,6 +19,19 @@
 # - Post-apply content assertions verify the managed section is really
 #   present (TLS-only, env-configured, no token persistence) and the managed
 #   tests are present; then the relevant Go tests run. Any failure aborts.
+# - A separate Windows startup diagnostic test runs after those tests. It is
+#   nonfatal evidence only: stdout/stderr are discarded without buffering and
+#   exactly one allowlisted CI_DIAG marker is read from a small bounded marker
+#   file (go_unknown on failure/timeout). Requires PowerShell 7 for Kill(true),
+#   and that PS7 requirement applies only while the diagnostic is enabled.
+#   The diagnostic is opt-in gated: it runs only when BOTH
+#   SURGUI_CI_STARTUP_DIAGNOSTIC=1 and GITHUB_ACTIONS=true are set (set by the
+#   GitHub workflow build step) and is intended for a GitHub-hosted workflow.
+#   Without both variables the diagnostic is skipped entirely and this script
+#   behaves exactly as it did before the probe existed. The probe is
+#   comparison evidence only, not a claim of full isolation: process-tree
+#   cleanup after a timeout is not independently verified, so cleanup remains
+#   unverified until runner teardown.
 # - All temporary files stay inside a unique, exclusively created per-run
 #   directory under .\.surge-stage\ (gitignored), e.g.
 #   .\.surge-stage\run-<guid>\. The script never deletes or overwrites any
@@ -30,6 +43,22 @@
 # - Upstream MIT notice is verified byte-for-byte against the committed copy.
 $ErrorActionPreference = 'Stop'
 
+# Startup diagnostic opt-in: the probe is gated only by the explicit opt-in
+# SURGUI_CI_STARTUP_DIAGNOSTIC=1 AND GITHUB_ACTIONS=true, both required, and
+# is intended for a GitHub-hosted workflow. When either is absent the whole
+# diagnostic (setup, copy, run, marker handling) is skipped below and the
+# build keeps its original, probe-free behavior.
+$DiagnosticEnabled = ([string]$env:SURGUI_CI_STARTUP_DIAGNOSTIC -ceq '1') -and ([string]$env:GITHUB_ACTIONS -ceq 'true')
+
+# PowerShell 7 is required only when the diagnostic actually runs:
+# process-tree termination uses Kill($true), which is unavailable on Windows
+# PowerShell 5. The guard is conditional on $DiagnosticEnabled, so a
+# diagnostic-disabled build never depends on it. Fail closed with a static
+# message before any staging state is created.
+if ($DiagnosticEnabled -and $PSVersionTable.PSVersion.Major -lt 7) {
+  throw 'This script requires PowerShell 7 (pwsh) when the CI startup diagnostic is enabled. Refusing to build.'
+}
+
 $Version = (Get-Content "$PSScriptRoot\..\third-party\surge\SURGE_VERSION" -Raw).Trim()
 $ExpectedSha = (Get-Content "$PSScriptRoot\..\third-party\surge\SURGE_SHA256" -Raw).Trim().ToLowerInvariant()
 $CodeloadUrl = "https://codeload.github.com/SurgeDM/Surge/tar.gz/refs/tags/$Version"
@@ -37,6 +66,7 @@ $CodeloadUrl = "https://codeload.github.com/SurgeDM/Surge/tar.gz/refs/tags/$Vers
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $Stage = Join-Path $RepoRoot '.surge-stage'
 $Patch = Join-Path $RepoRoot 'third-party\surge\surge-bind-loopback.patch'
+$DiagnosticTest = Join-Path $RepoRoot 'third-party\surge\windows-startup-diagnostic_test.go'
 $Out = Join-Path $RepoRoot 'src-tauri\resources\surge-x86_64-pc-windows-msvc.exe'
 $CommittedLicense = Join-Path $RepoRoot 'src-tauri\resources\Surge-LICENSE'
 
@@ -90,11 +120,26 @@ $GoTmp = Join-Path $RunDir 'gotmp'
 $GoCache = Join-Path $RunDir 'gocache'
 $GoModCache = Join-Path $RunDir 'gomodcache'
 $GoPathDir = Join-Path $RunDir 'gopath'
+$DiagnosticTestDest = Join-Path $SrcDir 'cmd\windows-startup-diagnostic_test.go'
+$DiagnosticState = Join-Path $RunDir 'diagnostic-state'
+$DiagAppData = Join-Path $DiagnosticState 'appdata'
+$DiagLocalAppData = Join-Path $DiagnosticState 'localappdata'
+$DiagUserProfile = Join-Path $DiagnosticState 'userprofile'
+$DiagHome = Join-Path $DiagnosticState 'home'
+$DiagTemp = Join-Path $DiagnosticState 'temp'
+$DiagXdgConfig = Join-Path $DiagnosticState 'xdg-config'
+$DiagXdgState = Join-Path $DiagnosticState 'xdg-state'
+$DiagXdgData = Join-Path $DiagnosticState 'xdg-data'
+$DiagXdgCache = Join-Path $DiagnosticState 'xdg-cache'
+$DiagXdgRuntime = Join-Path $DiagnosticState 'xdg-runtime'
+$DiagXdgConfigDirs = Join-Path $DiagnosticState 'xdg-config-dirs'
+$DiagXdgDataDirs = Join-Path $DiagnosticState 'xdg-data-dirs'
+$DiagnosticMarkerFile = Join-Path $RunDir 'diagnostic-marker.txt'
 $RunPrefix = $RunDir + [System.IO.Path]::DirectorySeparatorChar
 
 # Never overwrite preexisting data: every per-run path must be absent
 # (a fresh GUID dir guarantees this; presence means a bug or collision).
-foreach ($p in @($Archive, $SrcParent, $SrcDir, $SandboxTmp, $GoTmp, $GoCache, $GoModCache, $GoPathDir)) {
+foreach ($p in @($Archive, $SrcParent, $SrcDir, $SandboxTmp, $GoTmp, $GoCache, $GoModCache, $GoPathDir, $DiagnosticTestDest, $DiagnosticState, $DiagAppData, $DiagLocalAppData, $DiagUserProfile, $DiagHome, $DiagTemp, $DiagXdgConfig, $DiagXdgState, $DiagXdgData, $DiagXdgCache, $DiagXdgRuntime, $DiagXdgConfigDirs, $DiagXdgDataDirs, $DiagnosticMarkerFile)) {
   if (-not $p.StartsWith($RunPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Per-run path escaped confinement: $p. Refusing to build."
   }
@@ -109,6 +154,13 @@ New-Item -ItemType Directory -Path $GoTmp | Out-Null
 New-Item -ItemType Directory -Path $GoCache | Out-Null
 New-Item -ItemType Directory -Path $GoModCache | Out-Null
 New-Item -ItemType Directory -Path $GoPathDir | Out-Null
+# Diagnostic-only setup: created only when the opt-in gate is open.
+if ($DiagnosticEnabled) {
+  New-Item -ItemType Directory -Path $DiagnosticState | Out-Null
+  foreach ($d in @($DiagAppData, $DiagLocalAppData, $DiagUserProfile, $DiagHome, $DiagTemp, $DiagXdgConfig, $DiagXdgState, $DiagXdgData, $DiagXdgCache, $DiagXdgRuntime, $DiagXdgConfigDirs, $DiagXdgDataDirs)) {
+    New-Item -ItemType Directory -Path $d | Out-Null
+  }
+}
 # Confine child-process temp (curl/tar) and Go caches to the per-run dir so
 # no host default temp/cache is touched.
 $env:TMPDIR = $SandboxTmp
@@ -330,6 +382,223 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "go test failed with exit code $LASTEXITCODE" }
 } finally {
   Pop-Location
+}
+
+# ---------------------------------------------------------------------------
+# Windows startup diagnostic (test-only, nonfatal evidence).
+#
+# Opt-in gate: the entire diagnostic below (state setup, test copy, process
+# start, marker handling and its output) runs ONLY when the gate is open,
+# which requires BOTH SURGUI_CI_STARTUP_DIAGNOSTIC=1 (set explicitly by the
+# GitHub workflow build step) AND GITHUB_ACTIONS=true (set by the runner);
+# the combination is intended for a GitHub-hosted workflow. When the gate is
+# closed the block is skipped cleanly - no state dirs, no file copy, no child
+# process,
+# no marker line - and the build proceeds exactly as it did before the probe
+# existed. The PowerShell 7 guard above is likewise conditional on this gate.
+#
+# This copies the standalone diagnostic test into the already patched source
+# tree, runs it as a separate sequential go test invocation, discards all
+# stdout/stderr without buffering or logging, and reads exactly one
+# allowlisted CI marker from a small bounded marker file. On any failure,
+# timeout, missing marker, or ambiguous marker the wrapper prints only
+# CI_DIAG:go_unknown. No raw test output, paths, environment, token, cert,
+# or error text is ever emitted. Requires PowerShell 7 for Kill($true).
+#
+# Comparison evidence only, not a claim of full isolation: the synthetic
+# per-run environment is a comparison baseline against production paths, not
+# proof that nothing is written outside it. Process-tree cleanup after a
+# timeout (Kill($true) plus bounded WaitForExit) is attempted but is NOT
+# independently verified here, and runner teardown is the final cleanup
+# boundary for anything the probe leaves behind.
+#
+# The diagnostic is intentionally nonfatal for now (evidence only). Existing
+# build/test/packaging failures above and below remain fail-closed.
+# ---------------------------------------------------------------------------
+if ($DiagnosticEnabled) {
+  $DiagnosticMarker = 'CI_DIAG:go_unknown'
+  $DiagnosticAllowed = @(
+    'CI_DIAG:go_startup_ok',
+    'CI_DIAG:go_startup_config',
+    'CI_DIAG:go_startup_cert',
+    'CI_DIAG:go_startup_lock',
+    'CI_DIAG:go_startup_engine',
+    'CI_DIAG:go_startup_lifecycle',
+    'CI_DIAG:go_startup_bind',
+    'CI_DIAG:go_startup_serve',
+    'CI_DIAG:go_startup_other',
+    'CI_DIAG:go_startup_not_ready'
+  )
+  $proc = $null
+  try {
+    if (-not (Test-Path -LiteralPath $DiagnosticTest -PathType Leaf)) {
+      throw 'diagnostic test source missing'
+    }
+    if (-not $DiagnosticTestDest.StartsWith($RunPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw 'diagnostic test destination escaped per-run confinement'
+    }
+    if (Test-Path -LiteralPath $DiagnosticTestDest) {
+      throw 'diagnostic test destination already exists'
+    }
+    if (-not $DiagnosticMarkerFile.StartsWith($RunPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw 'diagnostic marker escaped per-run confinement'
+    }
+    if (Test-Path -LiteralPath $DiagnosticMarkerFile) {
+      throw 'diagnostic marker already exists'
+    }
+    Copy-Item -LiteralPath $DiagnosticTest -Destination $DiagnosticTestDest -ErrorAction Stop
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'go'
+    # No quoting is needed inside this argument string: none of these arguments
+    # contain spaces, and ProcessStartInfo passes it directly without a shell.
+    $psi.Arguments = 'test -p=1 -run=^TestWindowsStartupDiagnostic$ -count=1 -timeout=45s -v ./cmd/'
+    $psi.WorkingDirectory = $SrcDir
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    # Start from an empty child environment so CI secrets are not inherited.
+    # Only the explicit non-secret allowlist below is copied in.
+    $UseEnvironmentDict = ($psi.PSObject.Properties.Name -contains 'Environment')
+    if ($UseEnvironmentDict) { $psi.Environment.Clear() } else { $psi.EnvironmentVariables.Clear() }
+
+    foreach ($n in @('PATH', 'SystemRoot', 'SystemDrive', 'windir', 'ComSpec', 'PATHEXT', 'GOROOT')) {
+      $v = [System.Environment]::GetEnvironmentVariable($n, [System.EnvironmentVariableTarget]::Process)
+      if (-not [string]::IsNullOrEmpty($v)) {
+        if ($UseEnvironmentDict) { $psi.Environment[$n] = $v } else { $psi.EnvironmentVariables[$n] = $v }
+      }
+    }
+
+    # Diagnostic-only confinement via env indirection: all XDG user-dir
+    # variables plus the cached XDG_RUNTIME_DIR are set to isolated per-run
+    # dirs BEFORE the test process starts, so the cached xdg.RuntimeDir value
+    # is confined at startup. The Go test clears XDG_RUNTIME_DIR AFTER process
+    # start to exercise fallback to that cached isolated value. Honest
+    # limitation: on Windows the fallback may still resolve via the
+    # KnownFolder API, which can touch the runner profile outside any
+    # isolated tree. This diagnostic therefore does not claim exact
+    # reproduction of production paths and cannot guarantee zero writes
+    # outside synthetic state; it only confines what env indirection can.
+    # This is a comparison baseline only; see the gate note above: cleanup
+    # remains unverified until runner teardown. No full isolation is claimed.
+    $DiagnosticEnv = @{
+      'APPDATA'                                = $DiagAppData
+      'LOCALAPPDATA'                           = $DiagLocalAppData
+      'USERPROFILE'                            = $DiagUserProfile
+      'HOME'                                   = $DiagHome
+      'TEMP'                                   = $DiagTemp
+      'TMP'                                    = $DiagTemp
+      'TMPDIR'                                 = $DiagTemp
+      'XDG_CONFIG_HOME'                        = $DiagXdgConfig
+      'XDG_STATE_HOME'                         = $DiagXdgState
+      'XDG_DATA_HOME'                          = $DiagXdgData
+      'XDG_CACHE_HOME'                         = $DiagXdgCache
+      'XDG_RUNTIME_DIR'                        = $DiagXdgRuntime
+      'XDG_CONFIG_DIRS'                        = $DiagXdgConfigDirs
+      'XDG_DATA_DIRS'                          = $DiagXdgDataDirs
+      'SURGUI_WINDOWS_DIAGNOSTIC_MARKER_FILE'  = $DiagnosticMarkerFile
+      'GOTMPDIR'                               = $GoTmp
+      'GOCACHE'                                = $GoCache
+      'GOMODCACHE'                             = $GoModCache
+      'GOPATH'                                 = $GoPathDir
+      'GOFLAGS'                                = '-trimpath'
+      'GOTOOLCHAIN'                            = 'local'
+      'GOPROXY'                                = 'off'
+      'GOSUMDB'                                = 'off'
+      'CGO_ENABLED'                            = '0'
+      'GOMAXPROCS'                             = '2'
+    }
+    foreach ($k in $DiagnosticEnv.Keys) {
+      $v = [string]$DiagnosticEnv[$k]
+      if ($UseEnvironmentDict) { $psi.Environment[$k] = $v } else { $psi.EnvironmentVariables[$k] = $v }
+    }
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    # Discard output without buffering: never retain or log raw bytes.
+    $nullStream = [System.IO.Stream]::Null
+    $stdoutDiscard = $proc.StandardOutput.BaseStream.CopyToAsync($nullStream)
+    $stderrDiscard = $proc.StandardError.BaseStream.CopyToAsync($nullStream)
+    $Exited = $proc.WaitForExit(60000)
+    if (-not $Exited) {
+      # Timeout: terminate the entire process tree (PowerShell 7). The Go test
+      # binary spawns a child; Kill() without the tree flag would orphan it.
+      # WaitForExit is bounded and its result is required; a failure to
+      # terminate fails the build and never silently continues. This cleanup
+      # path is not independently verified; runner teardown is the final
+      # cleanup boundary.
+      $Terminated = $false
+      try {
+        try {
+          $proc.Kill($true)
+        } catch {
+          if (-not $proc.HasExited) { throw }
+        }
+        $Terminated = $proc.WaitForExit(5000)
+      } catch {
+        $Terminated = $false
+      }
+      if (-not $Terminated) {
+        throw 'Failed to terminate diagnostic test process tree after timeout. Refusing to build.'
+      }
+    } else {
+      # Bounded drain of the discard pumps; no output retained.
+      try { $stdoutDiscard.Wait(5000) | Out-Null } catch { }
+      try { $stderrDiscard.Wait(5000) | Out-Null } catch { }
+    }
+
+    $FoundMarkers = @()
+    if ($Exited -and $proc.ExitCode -eq 0) {
+      # Small bounded marker read: accept one exact allowlisted literal only.
+      if (Test-Path -LiteralPath $DiagnosticMarkerFile) {
+        $markerInfo = Get-Item -LiteralPath $DiagnosticMarkerFile
+        if ($markerInfo.Length -gt 0 -and $markerInfo.Length -lt 256) {
+          $candidate = ([System.IO.File]::ReadAllText($markerInfo.FullName)).Trim()
+          # Ordinal, case-sensitive comparison against the allowlist. The
+          # emitted value is always the canonical allowlist literal, never
+          # the untrusted candidate text and never a raw error.
+          foreach ($allowedMarker in $DiagnosticAllowed) {
+            if ([string]::Equals($allowedMarker, $candidate, [System.StringComparison]::Ordinal)) {
+              $FoundMarkers += $allowedMarker
+              break
+            }
+          }
+        }
+      }
+    }
+    if ($FoundMarkers.Count -eq 1) {
+      $DiagnosticMarker = $FoundMarkers[0]
+    } else {
+      $DiagnosticMarker = 'CI_DIAG:go_unknown'
+    }
+  } catch {
+    $TerminateFailure = 'Failed to terminate diagnostic test process tree after timeout. Refusing to build.'
+    # Never mask a termination failure as unknown evidence; fail the build.
+    # Never emit marker paths or raw errors here.
+    if ($_.Exception.Message -eq $TerminateFailure) {
+      throw
+    }
+    if ($null -ne $proc) {
+      try {
+        if (-not $proc.HasExited) {
+          try {
+            $proc.Kill($true)
+          } catch {
+            if (-not $proc.HasExited) { throw $TerminateFailure }
+          }
+          if (-not $proc.WaitForExit(5000)) {
+            throw $TerminateFailure
+          }
+        }
+      } catch {
+        # Cleanup failure must fail the build, never silently continue as unknown.
+        throw $TerminateFailure
+      }
+    }
+    $DiagnosticMarker = 'CI_DIAG:go_unknown'
+  }
+  Write-Host $DiagnosticMarker
 }
 
 Write-Host 'Compiling Surge for windows/amd64 (reproducible flags)...'

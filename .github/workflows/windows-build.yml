@@ -39,7 +39,16 @@ jobs:
           cache: false
 
       - name: Build pinned Surge (loopback, Windows x64)
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-surge-windows.ps1
+        # Opt-in for the Windows startup diagnostic probe, gated by
+        # SURGUI_CI_STARTUP_DIAGNOSTIC=1 (this step) plus GITHUB_ACTIONS=true
+        # (set by the runner); intended for this GitHub-hosted workflow. When
+        # either variable is absent the probe is skipped entirely.
+        # The probe is comparison evidence only: process-tree cleanup is not
+        # independently verified, so cleanup remains unverified until runner
+        # teardown, and no full isolation is claimed.
+        env:
+          SURGUI_CI_STARTUP_DIAGNOSTIC: '1'
+        run: pwsh -NoProfile -File scripts/build-surge-windows.ps1
 
       - name: Install frontend dependencies
         run: npm ci
