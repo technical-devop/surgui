@@ -1184,9 +1184,17 @@ impl ManagedServer {
         let client = loop {
             // Immediate exit / port conflict fails closed before any retry.
             match event_rx.try_recv() {
-                Ok(OwnerEvent::Exited(_)) => {
+                Ok(OwnerEvent::Exited(code)) => {
                     #[cfg(all(test, windows))]
-                    eprintln!("CI_DIAG:child_exited");
+                    match code {
+                        Some(0) => eprintln!("CI_DIAG:exit_zero"),
+                        Some(1) => eprintln!("CI_DIAG:exit_one"),
+                        Some(2) => eprintln!("CI_DIAG:exit_two"),
+                        Some(_) => eprintln!("CI_DIAG:exit_other"),
+                        None => eprintln!("CI_DIAG:exit_unknown"),
+                    }
+                    #[cfg(not(all(test, windows)))]
+                    let _ = code;
                     Self::signal_startup_shutdown(&cmd_tx);
                     // Consume the held prepared dir handle ordering: drop here.
                     drop(prepared);
