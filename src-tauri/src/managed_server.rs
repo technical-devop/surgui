@@ -1184,7 +1184,17 @@ impl ManagedServer {
         let client = loop {
             // Immediate exit / port conflict fails closed before any retry.
             match event_rx.try_recv() {
-                Ok(OwnerEvent::Exited(_)) | Ok(OwnerEvent::SpawnFailed) => {
+                Ok(OwnerEvent::Exited(_)) => {
+                    #[cfg(all(test, windows))]
+                    eprintln!("CI_DIAG:child_exited");
+                    Self::signal_startup_shutdown(&cmd_tx);
+                    // Consume the held prepared dir handle ordering: drop here.
+                    drop(prepared);
+                    return Err(startup_err(ErrorKind::Startup));
+                }
+                Ok(OwnerEvent::SpawnFailed) => {
+                    #[cfg(all(test, windows))]
+                    eprintln!("CI_DIAG:spawn_failed_event");
                     Self::signal_startup_shutdown(&cmd_tx);
                     // Consume the held prepared dir handle ordering: drop here.
                     drop(prepared);
@@ -1194,6 +1204,8 @@ impl ManagedServer {
                     // Duplicate spawn notice; ignore and keep probing.
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    #[cfg(all(test, windows))]
+                    eprintln!("CI_DIAG:owner_disconnected");
                     Self::signal_startup_shutdown(&cmd_tx);
                     drop(prepared);
                     return Err(startup_err(ErrorKind::Startup));
@@ -1201,6 +1213,8 @@ impl ManagedServer {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
             if Instant::now() >= deadline {
+                #[cfg(all(test, windows))]
+                eprintln!("CI_DIAG:deadline");
                 // The readiness probe is the first point at which a pinned-TLS
                 // authenticated session is known to exist. A final bounded
                 // attempt can still catch a daemon that became ready just
@@ -1226,6 +1240,8 @@ impl ManagedServer {
                     // fail closed immediately (never retry with same token).
                     use crate::surge_client::ConnectError;
                     if matches!(e, ConnectError::Unauthorized) {
+                        #[cfg(all(test, windows))]
+                        eprintln!("CI_DIAG:unauthorized");
                         // The token was rejected, so no authenticated graceful
                         // request is possible. Only the owned handle is cleaned.
                         Self::signal_startup_shutdown(&cmd_tx);
