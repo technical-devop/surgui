@@ -21,8 +21,9 @@
 #   tests are present; then the relevant Go tests run. Any failure aborts.
 # - A separate Windows startup diagnostic test runs after those tests. It is
 #   nonfatal evidence only: stdout/stderr are discarded without buffering and
-#   exactly one allowlisted CI_DIAG marker is read from a small bounded marker
-#   file (go_unknown on failure/timeout). Requires PowerShell 7 for Kill(true),
+#   one allowlisted startup CI_DIAG marker plus one allowlisted preflight
+#   CI_DIAG marker are read from small bounded marker files (go_unknown /
+#   go_preflight_unknown on failure/timeout). Requires PowerShell 7 for Kill(true),
 #   and that PS7 requirement applies only while the diagnostic is enabled.
 #   The diagnostic is opt-in gated: it runs only when BOTH
 #   SURGUI_CI_STARTUP_DIAGNOSTIC=1 and GITHUB_ACTIONS=true are set (set by the
@@ -135,11 +136,12 @@ $DiagXdgRuntime = Join-Path $DiagnosticState 'xdg-runtime'
 $DiagXdgConfigDirs = Join-Path $DiagnosticState 'xdg-config-dirs'
 $DiagXdgDataDirs = Join-Path $DiagnosticState 'xdg-data-dirs'
 $DiagnosticMarkerFile = Join-Path $RunDir 'diagnostic-marker.txt'
+$DiagnosticPreflightFile = $DiagnosticMarkerFile + '.preflight'
 $RunPrefix = $RunDir + [System.IO.Path]::DirectorySeparatorChar
 
 # Never overwrite preexisting data: every per-run path must be absent
 # (a fresh GUID dir guarantees this; presence means a bug or collision).
-foreach ($p in @($Archive, $SrcParent, $SrcDir, $SandboxTmp, $GoTmp, $GoCache, $GoModCache, $GoPathDir, $DiagnosticTestDest, $DiagnosticState, $DiagAppData, $DiagLocalAppData, $DiagUserProfile, $DiagHome, $DiagTemp, $DiagXdgConfig, $DiagXdgState, $DiagXdgData, $DiagXdgCache, $DiagXdgRuntime, $DiagXdgConfigDirs, $DiagXdgDataDirs, $DiagnosticMarkerFile)) {
+foreach ($p in @($Archive, $SrcParent, $SrcDir, $SandboxTmp, $GoTmp, $GoCache, $GoModCache, $GoPathDir, $DiagnosticTestDest, $DiagnosticState, $DiagAppData, $DiagLocalAppData, $DiagUserProfile, $DiagHome, $DiagTemp, $DiagXdgConfig, $DiagXdgState, $DiagXdgData, $DiagXdgCache, $DiagXdgRuntime, $DiagXdgConfigDirs, $DiagXdgDataDirs, $DiagnosticMarkerFile, $DiagnosticPreflightFile)) {
   if (-not $p.StartsWith($RunPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Per-run path escaped confinement: $p. Refusing to build."
   }
@@ -399,11 +401,13 @@ try {
 #
 # This copies the standalone diagnostic test into the already patched source
 # tree, runs it as a separate sequential go test invocation, discards all
-# stdout/stderr without buffering or logging, and reads exactly one
-# allowlisted CI marker from a small bounded marker file. On any failure,
-# timeout, missing marker, or ambiguous marker the wrapper prints only
-# CI_DIAG:go_unknown. No raw test output, paths, environment, token, cert,
-# or error text is ever emitted. Requires PowerShell 7 for Kill($true).
+# stdout/stderr without buffering or logging, and reads one allowlisted startup
+# CI marker plus one allowlisted preflight CI marker from separate small
+# bounded marker files. On any failure, timeout, missing marker, or ambiguous
+# marker the wrapper prints only CI_DIAG:go_unknown (startup) or
+# CI_DIAG:go_preflight_unknown (preflight). No raw test output, paths,
+# environment, token, cert, or error text is ever emitted. Requires PowerShell
+# 7 for Kill($true).
 #
 # Comparison evidence only, not a claim of full isolation: the synthetic
 # per-run environment is a comparison baseline against production paths, not
@@ -425,9 +429,20 @@ if ($DiagnosticEnabled) {
     'CI_DIAG:go_startup_engine',
     'CI_DIAG:go_startup_lifecycle',
     'CI_DIAG:go_startup_bind',
+    'CI_DIAG:go_startup_bind_invalid',
+    'CI_DIAG:go_startup_bind_addr_in_use',
+    'CI_DIAG:go_startup_bind_access_denied',
+    'CI_DIAG:go_startup_bind_other',
     'CI_DIAG:go_startup_serve',
     'CI_DIAG:go_startup_other',
     'CI_DIAG:go_startup_not_ready'
+  )
+  $PreflightMarker = 'CI_DIAG:go_preflight_unknown'
+  $DiagnosticPreflightAllowed = @(
+    'CI_DIAG:go_preflight_free',
+    'CI_DIAG:go_preflight_address_in_use',
+    'CI_DIAG:go_preflight_access_denied',
+    'CI_DIAG:go_preflight_other'
   )
   $proc = $null
   try {
@@ -445,6 +460,12 @@ if ($DiagnosticEnabled) {
     }
     if (Test-Path -LiteralPath $DiagnosticMarkerFile) {
       throw 'diagnostic marker already exists'
+    }
+    if (-not $DiagnosticPreflightFile.StartsWith($RunPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw 'diagnostic preflight marker escaped per-run confinement'
+    }
+    if (Test-Path -LiteralPath $DiagnosticPreflightFile) {
+      throw 'diagnostic preflight marker already exists'
     }
     Copy-Item -LiteralPath $DiagnosticTest -Destination $DiagnosticTestDest -ErrorAction Stop
 
@@ -548,6 +569,28 @@ if ($DiagnosticEnabled) {
       try { $stderrDiscard.Wait(5000) | Out-Null } catch { }
     }
 
+    # Small bounded preflight marker read: independent of the main marker
+    # because it is written before engine startup. Accept one exact
+    # allowlisted literal only; emit the canonical literal, never raw text.
+    $FoundPreflightMarkers = @()
+    if (Test-Path -LiteralPath $DiagnosticPreflightFile) {
+      $preflightInfo = Get-Item -LiteralPath $DiagnosticPreflightFile
+      if ($preflightInfo.Length -gt 0 -and $preflightInfo.Length -lt 256) {
+        $preflightCandidate = ([System.IO.File]::ReadAllText($preflightInfo.FullName)).Trim()
+        foreach ($allowedPreflightMarker in $DiagnosticPreflightAllowed) {
+          if ([string]::Equals($allowedPreflightMarker, $preflightCandidate, [System.StringComparison]::Ordinal)) {
+            $FoundPreflightMarkers += $allowedPreflightMarker
+            break
+          }
+        }
+      }
+    }
+    if ($FoundPreflightMarkers.Count -eq 1) {
+      $PreflightMarker = $FoundPreflightMarkers[0]
+    } else {
+      $PreflightMarker = 'CI_DIAG:go_preflight_unknown'
+    }
+
     $FoundMarkers = @()
     if ($Exited -and $proc.ExitCode -eq 0) {
       # Small bounded marker read: accept one exact allowlisted literal only.
@@ -599,6 +642,7 @@ if ($DiagnosticEnabled) {
     $DiagnosticMarker = 'CI_DIAG:go_unknown'
   }
   Write-Host $DiagnosticMarker
+  Write-Host $PreflightMarker
 }
 
 Write-Host 'Compiling Surge for windows/amd64 (reproducible flags)...'

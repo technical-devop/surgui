@@ -6,11 +6,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,19 +32,36 @@ const (
 // Set by the PowerShell wrapper to a unique per-run file under $RunDir.
 const surguiDiagnosticMarkerFileEnv = "SURGUI_WINDOWS_DIAGNOSTIC_MARKER_FILE"
 
+// Fixed suffix for the separate preflight marker, derived from the diagnostic
+// marker path. It is exclusively created before the managed engine starts.
+const surguiDiagnosticPreflightMarkerSuffix = ".preflight"
+
 // Exact predeclared category markers. The test writes ONLY one of these
 // literals to the marker file; no raw output, paths, or credentials.
 const (
-	surguiDiagnosticMarkerOk        = "CI_DIAG:go_startup_ok"
-	surguiDiagnosticMarkerConfig    = "CI_DIAG:go_startup_config"
-	surguiDiagnosticMarkerCert      = "CI_DIAG:go_startup_cert"
-	surguiDiagnosticMarkerLock      = "CI_DIAG:go_startup_lock"
-	surguiDiagnosticMarkerEngine    = "CI_DIAG:go_startup_engine"
-	surguiDiagnosticMarkerLifecycle = "CI_DIAG:go_startup_lifecycle"
-	surguiDiagnosticMarkerBind      = "CI_DIAG:go_startup_bind"
-	surguiDiagnosticMarkerServe     = "CI_DIAG:go_startup_serve"
-	surguiDiagnosticMarkerOther     = "CI_DIAG:go_startup_other"
-	surguiDiagnosticMarkerNotReady  = "CI_DIAG:go_startup_not_ready"
+	surguiDiagnosticMarkerOk            = "CI_DIAG:go_startup_ok"
+	surguiDiagnosticMarkerConfig        = "CI_DIAG:go_startup_config"
+	surguiDiagnosticMarkerCert          = "CI_DIAG:go_startup_cert"
+	surguiDiagnosticMarkerLock          = "CI_DIAG:go_startup_lock"
+	surguiDiagnosticMarkerEngine        = "CI_DIAG:go_startup_engine"
+	surguiDiagnosticMarkerLifecycle     = "CI_DIAG:go_startup_lifecycle"
+	surguiDiagnosticMarkerBind          = "CI_DIAG:go_startup_bind"
+	surguiDiagnosticMarkerBindInvalid   = "CI_DIAG:go_startup_bind_invalid"
+	surguiDiagnosticMarkerBindAddrInUse = "CI_DIAG:go_startup_bind_addr_in_use"
+	surguiDiagnosticMarkerBindDenied    = "CI_DIAG:go_startup_bind_access_denied"
+	surguiDiagnosticMarkerBindOther     = "CI_DIAG:go_startup_bind_other"
+	surguiDiagnosticMarkerServe         = "CI_DIAG:go_startup_serve"
+	surguiDiagnosticMarkerOther         = "CI_DIAG:go_startup_other"
+	surguiDiagnosticMarkerNotReady      = "CI_DIAG:go_startup_not_ready"
+)
+
+// Exact predeclared preflight category markers. These are written to the
+// separate exclusively created ".preflight" marker before engine startup.
+const (
+	surguiDiagnosticMarkerPreflightFree         = "CI_DIAG:go_preflight_free"
+	surguiDiagnosticMarkerPreflightAddrInUse    = "CI_DIAG:go_preflight_address_in_use"
+	surguiDiagnosticMarkerPreflightAccessDenied = "CI_DIAG:go_preflight_access_denied"
+	surguiDiagnosticMarkerPreflightOther        = "CI_DIAG:go_preflight_other"
 )
 
 // emitSurguiWindowsDiagnosticMarker selects one fixed literal via an explicit
@@ -66,6 +86,14 @@ func emitSurguiWindowsDiagnosticMarker(category string) {
 		marker = surguiDiagnosticMarkerLifecycle
 	case "bind":
 		marker = surguiDiagnosticMarkerBind
+	case "bind_invalid":
+		marker = surguiDiagnosticMarkerBindInvalid
+	case "bind_addr_in_use":
+		marker = surguiDiagnosticMarkerBindAddrInUse
+	case "bind_access_denied":
+		marker = surguiDiagnosticMarkerBindDenied
+	case "bind_other":
+		marker = surguiDiagnosticMarkerBindOther
 	case "serve":
 		marker = surguiDiagnosticMarkerServe
 	case "not_ready":
@@ -87,8 +115,83 @@ func emitSurguiWindowsDiagnosticMarker(category string) {
 	_, _ = f.WriteString(marker)
 }
 
+// emitSurguiWindowsPreflightMarker selects one fixed literal via an explicit
+// category switch and writes ONLY that literal to the separate exclusively
+// created preflight marker derived from the diagnostic marker path. All file
+// errors are swallowed (the outer wrapper then emits go_preflight_unknown).
+// It never prints the marker path or raw errors.
+func emitSurguiWindowsPreflightMarker(category string) {
+	var marker string
+	switch category {
+	case "free":
+		marker = surguiDiagnosticMarkerPreflightFree
+	case "address_in_use":
+		marker = surguiDiagnosticMarkerPreflightAddrInUse
+	case "access_denied":
+		marker = surguiDiagnosticMarkerPreflightAccessDenied
+	case "other":
+		marker = surguiDiagnosticMarkerPreflightOther
+	default:
+		marker = surguiDiagnosticMarkerPreflightOther
+	}
+	path := os.Getenv(surguiDiagnosticMarkerFileEnv)
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path+surguiDiagnosticPreflightMarkerSuffix, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(marker)
+}
+
+// classifySurguiWindowsPreflightError maps only fixed Windows socket errors to
+// a static category using errors.Is. It never returns or prints raw values.
+func classifySurguiWindowsPreflightError(err error) string {
+	switch {
+	case err == nil:
+		return "free"
+	case errors.Is(err, syscall.Errno(10048)):
+		return "address_in_use"
+	case errors.Is(err, syscall.Errno(10013)):
+		return "access_denied"
+	default:
+		return "other"
+	}
+}
+
+// runSurguiWindowsStartupPreflight directly probes the fixed diagnostic port
+// before the managed engine starts, then immediately closes the listener on
+// success. It never inspects or signals any socket owner and never touches
+// any other port.
+func runSurguiWindowsStartupPreflight() {
+	ln, err := net.Listen("tcp", "127.0.0.1:47531")
+	if err != nil {
+		emitSurguiWindowsPreflightMarker(classifySurguiWindowsPreflightError(err))
+		return
+	}
+	_ = ln.Close()
+	emitSurguiWindowsPreflightMarker(classifySurguiWindowsPreflightError(nil))
+}
+
+// classifySurguiWindowsBindError maps a managed-server bind error to a fixed
+// category using errors.Is. It never returns or prints the original error.
+func classifySurguiWindowsBindError(err error) string {
+	switch {
+	case errors.Is(err, syscall.Errno(10048)):
+		return "bind_addr_in_use"
+	case errors.Is(err, syscall.Errno(10013)):
+		return "bind_access_denied"
+	default:
+		return "bind_other"
+	}
+}
+
 // classifySurguiWindowsStartupError maps only known, fixed error prefixes to a
-// static category. It never returns or prints the original error text.
+// static category. It never returns or prints the original error text. The
+// bind prefix is preserved only to identify a bind error; the underlying
+// wrapped errno is then classified separately.
 func classifySurguiWindowsStartupError(err error) string {
 	if err == nil {
 		return "ok"
@@ -108,9 +211,10 @@ func classifySurguiWindowsStartupError(err error) string {
 		return "engine"
 	case strings.HasPrefix(msg, "surgui managed server: error creating lifecycle event stream"):
 		return "lifecycle"
-	case strings.HasPrefix(msg, "surgui managed server: port must be in 1-65535"),
-		strings.HasPrefix(msg, "surgui managed server: could not bind"):
-		return "bind"
+	case strings.HasPrefix(msg, "surgui managed server: port must be in 1-65535"):
+		return "bind_invalid"
+	case strings.HasPrefix(msg, "surgui managed server: could not bind"):
+		return classifySurguiWindowsBindError(err)
 	case strings.HasPrefix(msg, "surgui managed server: HTTPS server error"):
 		return "serve"
 	default:
@@ -134,13 +238,20 @@ func surguiWindowsDiagnosticHealthy(client *http.Client, token string) bool {
 }
 
 // TestWindowsStartupDiagnostic exercises the patched managed-server entrypoint
-// in-process on loopback. It writes at most one exact predeclared literal to
-// the marker file named by the diagnostic-only env var and never prints raw
-// output, paths, or credentials, and never calls t.Fatal with a dynamic
-// error. The wrapper discards stdout/stderr and accepts only one exact
-// allowlisted literal from the small bounded marker file; a missing marker
-// becomes CI_DIAG:go_unknown.
+// in-process on loopback. Before engine startup it writes one exact predeclared
+// preflight literal to a separate ".preflight" marker derived from the
+// diagnostic-only env var, then writes at most one exact predeclared startup
+// literal to the main marker file. It never prints raw output, paths, or
+// credentials, and never calls t.Fatal with a dynamic error. The wrapper
+// discards stdout/stderr and accepts only exact allowlisted literals from the
+// small bounded marker files; a missing startup marker becomes
+// CI_DIAG:go_unknown and a missing preflight marker becomes
+// CI_DIAG:go_preflight_unknown.
 func TestWindowsStartupDiagnostic(t *testing.T) {
+	// Baseline evidence: probe the fixed fixture port BEFORE any engine
+	// initialization. On success the listener is closed immediately.
+	runSurguiWindowsStartupPreflight()
+
 	// Diagnostic-only XDG handling; differs from production.
 	// The PowerShell wrapper sets all relevant XDG user-dir variables
 	// (XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME, XDG_CACHE_HOME,
