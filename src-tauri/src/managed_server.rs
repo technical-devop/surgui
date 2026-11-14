@@ -1546,7 +1546,7 @@ fn _assert_absolute_for_test(p: &Path) -> bool {
 
 /// Serialize tests that bind the fixed managed port. Shared with the command
 /// integration tests so the two modules cannot race each other in one binary.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 pub(crate) fn test_port_lock() -> &'static tokio::sync::Mutex<()> {
     use std::sync::OnceLock;
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
