@@ -927,6 +927,7 @@ impl Drop for ManagedChild {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
 
     const SECRET: &str = "s3cret-t0ken-value-xyz";
