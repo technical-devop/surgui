@@ -757,7 +757,15 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match listener.accept() {
-                Ok((stream, _)) => return stream,
+                Ok((stream, _)) => {
+                    // Windows: sockets accepted from a nonblocking listener
+                    // can inherit nonblocking mode (WSAEWOULDBLOCK 10035 in
+                    // rustls). Force blocking before any rustls read/write.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("accepted stream must be blocking");
+                    return stream;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "accept timed out");
                     thread::sleep(Duration::from_millis(10));
@@ -781,6 +789,9 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("write timeout");
             let mut conn = rustls::ServerConnection::new(server_config).expect("server conn");
             let mut tls = rustls::Stream::new(&mut conn, &mut stream);
             let request = read_headers(&mut tls);
@@ -825,6 +836,9 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("write timeout");
             let mut conn = rustls::ServerConnection::new(server_config).expect("server conn");
             let mut tls = rustls::Stream::new(&mut conn, &mut stream);
             // With the wrong trust anchor the handshake fails before any HTTP

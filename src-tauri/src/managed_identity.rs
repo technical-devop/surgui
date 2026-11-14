@@ -406,9 +406,18 @@ mod tests {
                 }
             };
             let mut stream = stream;
+            // Windows: sockets accepted from a nonblocking listener can
+            // inherit nonblocking mode (WSAEWOULDBLOCK 10035 in rustls).
+            // Force blocking before any rustls read/write.
+            stream
+                .set_nonblocking(false)
+                .expect("accepted stream must be blocking");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("write timeout");
             let mut conn = rustls::ServerConnection::new(server_config).expect("server conn");
             let mut tls = rustls::Stream::new(&mut conn, &mut stream);
             let mut buf = [0u8; 5];

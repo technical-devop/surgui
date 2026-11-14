@@ -1476,6 +1476,8 @@ mod tests {
             std::fs::create_dir_all(&target).expect("mkdir");
             let sentinel = target.join("settings.json");
             std::fs::write(&sentinel, b"keep").expect("sentinel");
+            let mut sentinel_reader =
+                std::fs::File::open(&sentinel).expect("open sentinel before DACL mutation");
             test_set_dacl(&target, null_dacl);
 
             let err = ManagedStateDir::prepare(&target)
@@ -1483,7 +1485,11 @@ mod tests {
             assert_eq!(format!("{err}"), "managed state preparation failed");
             assert!(format!("{err:?}").contains("redacted"));
             assert!(sentinel.symlink_metadata().is_ok(), "data must survive");
-            assert_eq!(std::fs::read(&sentinel).expect("read"), b"keep");
+            let mut contents = Vec::new();
+            std::io::Read::read_to_end(&mut sentinel_reader, &mut contents)
+                .expect("read original sentinel handle");
+            assert_eq!(contents, b"keep");
+            drop(sentinel_reader);
             assert_test_dacl_preserved(&target, null_dacl);
 
             let _ = std::fs::remove_file(&sentinel);
