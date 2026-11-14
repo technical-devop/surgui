@@ -4,7 +4,7 @@
   import type { QueueItem } from "./queue/types";
   import { NativeQueueController } from "./queue/native-controller";
   import type { NativeState } from "./queue/native-controller";
-  import { onDestroy } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import logoUrl from "../assets/surge-logo.webp";
 
@@ -35,6 +35,17 @@
       5000,
     );
   }
+
+  // Managed auto-start: exactly once on native mount, never in browser
+  // sample mode. Preserves the optional manual endpoint/token form below.
+  let managedAutoStarted = $state(false);
+
+  onMount(() => {
+    if (!isTauri || !controller) return;
+    if (managedAutoStarted) return;
+    managedAutoStarted = true;
+    void controller.startManaged();
+  });
 
   onDestroy(() => {
     controller?.dispose();
@@ -89,6 +100,16 @@
     void controller?.disconnect();
   }
 
+  function handleManagedRetry() {
+    if (!controller || isConnecting) return;
+    void controller.startManaged();
+  }
+
+  const showManagedRetry = $derived(
+    snapshot.phase === "error" || (snapshot.phase === "offline" && managedAutoStarted),
+  );
+  const managedRetryLabel = $derived(snapshot.phase === "error" ? "Retry bundled daemon" : "Start bundled daemon");
+
   function handleNativeControl(action: "pause" | "resume" | "removeRecord", id: string) {
     // Native-only: always route through the controller bridge. Never mutate
     // rows locally; ack does not mean the daemon transitioned (it settles async).
@@ -126,63 +147,78 @@
       </span>
     </header>
     <section class="conn-panel" aria-label="Daemon connection">
-      <form class="conn-form" onsubmit={handleConnect}>
-        <div class="field">
-          <label class="field-label" for="daemon-endpoint">Daemon endpoint URL</label>
-          <input
-            id="daemon-endpoint"
-            class="field-input"
-            type="url"
-            inputmode="url"
-            autocomplete="off"
-            spellcheck="false"
-            required
-            placeholder="https://daemon.example.com"
-            bind:value={endpoint}
-            aria-describedby="daemon-endpoint-help"
-          />
-          <p class="field-help" id="daemon-endpoint-help">Remote HTTPS, or loopback HTTP via SSH tunnel. Enter the actual daemon port.</p>
-        </div>
-        <div class="field">
-          <label class="field-label" for="daemon-token">Bearer token</label>
-          <input
-            id="daemon-token"
-            class="field-input"
-            type="password"
-            autocomplete="off"
-            required
-            placeholder="••••••••"
-            bind:value={token}
-            aria-invalid={snapshot.phase === "error" ? "true" : undefined}
-            aria-describedby={snapshot.error ? "daemon-error" : undefined}
-          />
-          <p class="field-help" aria-hidden="true">Sent to the daemon only; never stored.</p>
-        </div>
-        {#if snapshot.error}
-          <p class="conn-error" id="daemon-error" role="alert">{snapshot.error}</p>
+      {#if snapshot.error}
+        <p class="conn-error" id="daemon-error" role="alert">{snapshot.error}</p>
+      {/if}
+      <div class="conn-actions">
+        {#if showManagedRetry}
+          <button
+            type="button"
+            class="btn"
+            onclick={handleManagedRetry}
+            disabled={isConnecting}
+          >
+            {managedRetryLabel}
+          </button>
         {/if}
-        <div class="conn-actions">
-          <button type="submit" class="btn" disabled={isConnecting || snapshot.refreshing && !isConnected}>
-            {isConnecting ? "Connecting…" : "Connect"}
-          </button>
-          <button
-            type="button"
-            class="btn"
-            onclick={handleRefresh}
-            disabled={!isConnected || snapshot.refreshing}
-          >
-            {snapshot.refreshing && isConnected ? "Refreshing…" : "Refresh"}
-          </button>
-          <button
-            type="button"
-            class="btn"
-            onclick={handleDisconnect}
-            disabled={snapshot.phase === "offline"}
-          >
-            Disconnect
-          </button>
-        </div>
-      </form>
+        <button
+          type="button"
+          class="btn"
+          onclick={handleRefresh}
+          disabled={!isConnected || snapshot.refreshing}
+        >
+          {snapshot.refreshing && isConnected ? "Refreshing…" : "Refresh"}
+        </button>
+        <button
+          type="button"
+          class="btn"
+          onclick={handleDisconnect}
+          disabled={snapshot.phase === "offline"}
+        >
+          Disconnect
+        </button>
+      </div>
+      <details class="conn-advanced">
+        <summary class="conn-advanced-summary">Advanced: connect to another daemon</summary>
+        <form class="conn-form" onsubmit={handleConnect}>
+          <div class="field">
+            <label class="field-label" for="daemon-endpoint">Daemon endpoint URL</label>
+            <input
+              id="daemon-endpoint"
+              class="field-input"
+              type="url"
+              inputmode="url"
+              autocomplete="off"
+              spellcheck="false"
+              required
+              placeholder="https://daemon.example.com"
+              bind:value={endpoint}
+              aria-describedby="daemon-endpoint-help"
+            />
+            <p class="field-help" id="daemon-endpoint-help">Remote HTTPS, or loopback HTTP via SSH tunnel. Enter the actual daemon port.</p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="daemon-token">Bearer token</label>
+            <input
+              id="daemon-token"
+              class="field-input"
+              type="password"
+              autocomplete="off"
+              required
+              placeholder="••••••••"
+              bind:value={token}
+              aria-invalid={snapshot.phase === "error" ? "true" : undefined}
+              aria-describedby={snapshot.error ? "daemon-error" : undefined}
+            />
+            <p class="field-help" aria-hidden="true">Sent to the daemon only; never stored.</p>
+          </div>
+          <div class="conn-actions">
+            <button type="submit" class="btn" disabled={isConnecting || snapshot.refreshing && !isConnected}>
+              {isConnecting ? "Connecting…" : "Connect"}
+            </button>
+          </div>
+        </form>
+      </details>
     </section>
     {#if isConnected}
       <section class="add-panel" aria-label="Add download">
@@ -372,6 +408,30 @@
     margin-inline: auto;
     padding: var(--space-md) var(--space-md) 0;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+  }
+
+  .conn-advanced {
+    min-width: 0;
+  }
+
+  .conn-advanced-summary {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--color-ink);
+    cursor: pointer;
+    min-height: var(--control-h);
+    display: list-item;
+    align-items: center;
+  }
+
+  .conn-advanced .conn-form {
+    margin-top: var(--space-sm);
   }
 
   .conn-form {

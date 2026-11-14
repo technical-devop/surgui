@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -36,15 +36,24 @@ jobs:
             librsvg2-dev
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
 
       - name: Setup stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
+
+      - name: Setup Go 1.26.0
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.0'
+          cache: false
+
+      - name: Build pinned Surge (loopback, Linux x64)
+        run: bash scripts/build-surge-linux.sh
 
       - name: Install frontend dependencies
         run: npm ci
@@ -64,17 +73,28 @@ jobs:
 
       - name: Test Rust
         working-directory: src-tauri
-        run: cargo test
+        env:
+          SURGUI_TEST_DAEMON: ${{ github.workspace }}/src-tauri/resources/surge-x86_64-unknown-linux-gnu
+        run: |
+          test -x "$SURGUI_TEST_DAEMON"
+          cargo test
 
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check Surge Tauri resources
+        run: |
+          test -f src-tauri/resources/Surge-LICENSE
+          test -f src-tauri/resources/surge-x86_64-unknown-linux-gnu
+          test -x src-tauri/resources/surge-x86_64-unknown-linux-gnu
+          ls -l src-tauri/resources/
+
       - name: Build Tauri deb + AppImage
         run: npm run tauri build -- --bundles deb,appimage
 
       - name: Upload deb artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: surge-desktop-linux-x64-deb
           path: src-tauri/target/release/bundle/deb/*.deb
@@ -82,7 +102,7 @@ jobs:
           retention-days: 7
 
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: surge-desktop-linux-x64-appimage
           path: src-tauri/target/release/bundle/appimage/*.AppImage

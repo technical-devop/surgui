@@ -101,6 +101,7 @@ function mapToSafeMessage(err: unknown, fallback: string): string | null {
 const CONNECT_FALLBACK = "Could not connect. Check the address and try again.";
 const REFRESH_FALLBACK = "Refresh failed. Check the connection and retry.";
 const ADD_FALLBACK = "Could not add download. Check the URL and try again.";
+const MANAGED_FALLBACK = "Could not start the bundled daemon. Try again.";
 
 const KNOWN_ADD_OUTCOMES: ReadonlySet<string> = new Set(["queued", "pendingApproval", "duplicate"]);
 
@@ -131,6 +132,7 @@ export class NativeQueueController {
   private disposed = false;
   private controlEpoch: number | null = null;
   private addEpoch: number | null = null;
+  private managedEpoch: number | null = null;
   private refreshPromise: Promise<void> | null = null;
   private refreshEpoch: number | null = null;
   private refreshSeq = 0;
@@ -179,6 +181,7 @@ export class NativeQueueController {
     const epoch = this.epoch;
     this.stopTimer();
     this.addEpoch = null;
+    this.managedEpoch = null;
     this.state.phase = "connecting";
     this.state.items = [];
     this.state.refreshing = true;
@@ -226,6 +229,87 @@ export class NativeQueueController {
     this.state.addOutcome = null;
     this.emit();
     this.startTimer();
+  }
+
+  /**
+   * Start the single bundled managed daemon.
+   *
+   * - Frontend supplies no args: `start_managed_surge` derives all paths
+   *   from Tauri resolvers and returns the same sanitized queue DTO.
+   * - Same epoch fence as manual `connect`: bumps `epoch`, clears any
+   *   in-flight manual rows, and discards late results after
+   *   `connect`/`disconnect`/`dispose`.
+   * - Same-epoch duplicate starts issue exactly one IPC and report `false`;
+   *   disposal/supersession never emit stale callbacks.
+   * - Failures map to the sanitized `MANAGED_FALLBACK`; no endpoint, token,
+   *   URL, path, or raw transport detail ever reaches state or logs.
+   */
+  async startManaged(): Promise<boolean> {
+    if (this.disposed) return false;
+    if (this.managedEpoch === this.epoch) return false;
+    this.epoch += 1;
+    const epoch = this.epoch;
+    this.managedEpoch = epoch;
+    this.stopTimer();
+    this.addEpoch = null;
+    this.state.phase = "connecting";
+    this.state.items = [];
+    this.state.refreshing = true;
+    this.state.error = null;
+    this.state.controllingId = null;
+    this.state.adding = false;
+    this.state.addOutcome = null;
+    this.emit();
+    try {
+      let raw: unknown;
+      try {
+        raw = await this.invoke("start_managed_surge");
+      } catch (err) {
+        if (epoch !== this.epoch || this.disposed) return false;
+        if (this.managedEpoch !== epoch) return false;
+        this.state.phase = "error";
+        this.state.items = [];
+        this.state.error = mapToSafeMessage(err, MANAGED_FALLBACK) ?? MANAGED_FALLBACK;
+        this.state.refreshing = false;
+        this.state.controllingId = null;
+        this.state.adding = false;
+        this.state.addOutcome = null;
+        this.emit();
+        return false;
+      }
+      if (epoch !== this.epoch || this.disposed) return false;
+      if (this.managedEpoch !== epoch) return false;
+      let items: QueueItem[];
+      try {
+        items = sanitizeList(raw);
+      } catch (err) {
+        if (epoch !== this.epoch || this.disposed) return false;
+        if (this.managedEpoch !== epoch) return false;
+        this.state.phase = "error";
+        this.state.items = [];
+        this.state.error = mapToSafeMessage(err, MANAGED_FALLBACK) ?? MANAGED_FALLBACK;
+        this.state.refreshing = false;
+        this.state.controllingId = null;
+        this.state.adding = false;
+        this.state.addOutcome = null;
+        this.emit();
+        return false;
+      }
+      if (epoch !== this.epoch || this.disposed) return false;
+      if (this.managedEpoch !== epoch) return false;
+      this.state.phase = "connected";
+      this.state.items = items;
+      this.state.error = null;
+      this.state.refreshing = false;
+      this.state.controllingId = null;
+      this.state.adding = false;
+      this.state.addOutcome = null;
+      this.emit();
+      this.startTimer();
+      return true;
+    } finally {
+      if (this.managedEpoch === epoch) this.managedEpoch = null;
+    }
   }
 
   async refresh(): Promise<void> {
@@ -400,6 +484,7 @@ export class NativeQueueController {
     this.epoch += 1;
     this.stopTimer();
     this.addEpoch = null;
+    this.managedEpoch = null;
     this.state.phase = "offline";
     this.state.items = [];
     this.state.error = null;
@@ -424,6 +509,7 @@ export class NativeQueueController {
     this.state.adding = false;
     this.state.addOutcome = null;
     this.addEpoch = null;
+    this.managedEpoch = null;
     try {
       const pending = this.invoke("disconnect_surge");
       if (pending && typeof (pending as Promise<unknown>).catch === "function") {

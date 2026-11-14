@@ -787,3 +787,259 @@ describe("NativeQueueController", () => {
     }
   });
 });
+
+describe("NativeQueueController managed start", () => {
+  it("startManaged success calls with no args and sanitizes rows", async () => {
+    const rawRow = {
+      id: "dl-m1",
+      name: "managed.iso",
+      status: "active",
+      bytesDone: 200,
+      bytesTotal: 1000,
+      speedBps: 50,
+      addedAt: 7,
+      url: "https://example.com/secret-managed.iso",
+      dest_path: "/secret/path",
+      error: "raw-server-text",
+    };
+    const { invoke, calls } = makeInvoke((command) => {
+      if (command === "start_managed_surge") return [rawRow];
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const seen = [];
+    const c = new NativeQueueController(invoke, (s) => seen.push(s), 60_000);
+    try {
+      const ok = await c.startManaged();
+      assert.equal(ok, true);
+      assert.equal(c.state.phase, "connected");
+      assert.equal(c.state.items.length, 1);
+      assert.equal(c.state.items[0].id, "dl-m1");
+      assert.equal(c.state.items[0].bytesDone, 200);
+      // Sanitized DTO drops server-only fields.
+      assert.ok(!("url" in c.state.items[0]), "managed row must not carry url");
+      const startCall = calls.find((x) => x.command === "start_managed_surge");
+      assert.ok(startCall, "expected start_managed_surge call");
+      assert.ok(startCall.args === undefined, "managed start takes no args");
+      assert.ok(!JSON.stringify(c.state).includes("secret-managed"), "state must not leak URL");
+      assert.ok(!JSON.stringify(c.state).includes("/secret/path"), "state must not leak path");
+      assert.ok(!JSON.stringify(c.state).includes("raw-server-text"), "state must not leak raw text");
+    } finally {
+      c.dispose();
+    }
+  });
+
+  it("startManaged failure maps to sanitized fallback and retry succeeds", async () => {
+    const rawDetail = "raw-managed-boom-/secret/xyz-9f3a";
+    let attempts = 0;
+    const { invoke } = makeInvoke((command) => {
+      if (command === "start_managed_surge") {
+        attempts += 1;
+        if (attempts === 1) throw new Error(`startup failed ${rawDetail}`);
+        return [];
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    try {
+      const first = await c.startManaged();
+      assert.equal(first, false);
+      assert.equal(c.state.phase, "error");
+      assert.ok(typeof c.state.error === "string" && c.state.error.length > 0);
+      assert.equal(c.state.error, "Could not start the bundled daemon. Try again.");
+      assert.ok(!c.state.error.includes(rawDetail), "error must not echo raw detail");
+      assert.ok(!JSON.stringify(c.state).includes(rawDetail), "state must not echo raw detail");
+      const second = await c.startManaged();
+      assert.equal(second, true);
+      assert.equal(c.state.phase, "connected");
+      assert.equal(c.state.error, null);
+      assert.deepEqual(c.state.items, []);
+    } finally {
+      c.dispose();
+    }
+  });
+
+  it("same-epoch duplicate startManaged issues exactly one IPC and second reports false", async () => {
+    let releaseStart = null;
+    let startCount = 0;
+    const { invoke, calls } = makeInvoke((command) => {
+      if (command === "start_managed_surge") {
+        startCount += 1;
+        return new Promise((resolve) => {
+          releaseStart = () => resolve([]);
+        });
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    let first = null;
+    let secondResult = null;
+    try {
+      first = c.startManaged();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      assert.equal(c.state.phase, "connecting");
+      assert.equal(calls.filter((x) => x.command === "start_managed_surge").length, 1);
+      secondResult = await c.startManaged();
+      assert.equal(secondResult, false, "duplicate start must report false");
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      assert.equal(calls.filter((x) => x.command === "start_managed_surge").length, 1, "duplicate must not issue second IPC");
+      assert.equal(c.state.phase, "connecting", "duplicate must not disturb in-flight start");
+      releaseStart();
+      const firstResult = await first;
+      first = null;
+      assert.equal(firstResult, true);
+      assert.equal(c.state.phase, "connected");
+      assert.equal(startCount, 1);
+    } finally {
+      try {
+        if (first && releaseStart) releaseStart();
+      } catch {}
+      try {
+        if (first) await first;
+      } catch {}
+      c.dispose();
+    }
+  });
+
+  it("stale startManaged after disconnect stays offline with empty rows", async () => {
+    let releaseStart = null;
+    const { invoke, calls } = makeInvoke((command) => {
+      if (command === "start_managed_surge") {
+        return new Promise((resolve) => {
+          releaseStart = () => resolve([{ id: "stale-m", name: "stale", status: "queued", bytesDone: 0, bytesTotal: 10, speedBps: 0, addedAt: 3 }]);
+        });
+      }
+      if (command === "disconnect_surge") return { ok: true };
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    let pending = null;
+    try {
+      pending = c.startManaged();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      assert.equal(c.state.phase, "connecting");
+      await c.disconnect();
+      assert.equal(c.state.phase, "offline");
+      releaseStart();
+      const ok = await pending;
+      pending = null;
+      assert.equal(ok, false);
+      assert.equal(c.state.phase, "offline");
+      assert.deepEqual(c.state.items, []);
+      assert.ok(calls.some((x) => x.command === "disconnect_surge"), "expected disconnect_surge call");
+    } finally {
+      try {
+        if (pending && releaseStart) releaseStart();
+      } catch {}
+      try {
+        if (pending) await pending;
+      } catch {}
+      c.dispose();
+    }
+  });
+
+  it("dispose suppresses late startManaged emit", async () => {
+    let releaseStart = null;
+    const { invoke, calls } = makeInvoke((command) => {
+      if (command === "start_managed_surge") {
+        return new Promise((resolve) => {
+          releaseStart = () => resolve([]);
+        });
+      }
+      if (command === "disconnect_surge") return { ok: true };
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const seen = [];
+    const c = new NativeQueueController(invoke, (s) => seen.push(s), 60_000);
+    let pending = null;
+    try {
+      pending = c.startManaged();
+      for (let i = 0; i < 3; i++) await Promise.resolve();
+      c.dispose();
+      assert.ok(calls.some((x) => x.command === "disconnect_surge"), "expected best-effort disconnect_surge on dispose");
+      const emittedAfterDispose = seen.length;
+      releaseStart();
+      const ok = await pending;
+      pending = null;
+      assert.equal(ok, false);
+      assert.equal(seen.length, emittedAfterDispose, "no onChange after late managed resolve post-dispose");
+    } finally {
+      try {
+        if (pending && releaseStart) releaseStart();
+      } catch {}
+      try {
+        if (pending) await pending;
+      } catch {}
+      try {
+        c.dispose();
+      } catch {}
+    }
+  });
+
+  it("stale managed start discarded when manual connect supersedes it", async () => {
+    const managedRow = { id: "dl-managed", name: "m.bin", status: "active", bytesDone: 1, bytesTotal: 10, speedBps: 1, addedAt: 1 };
+    const manualRow = { id: "dl-manual", name: "manual.bin", status: "active", bytesDone: 2, bytesTotal: 20, speedBps: 2, addedAt: 2 };
+    let releaseManaged = null;
+    const { invoke } = makeInvoke((command) => {
+      if (command === "start_managed_surge") {
+        return new Promise((resolve) => {
+          releaseManaged = () => resolve([managedRow]);
+        });
+      }
+      if (command === "connect_surge") return [manualRow];
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    let pendingManaged = null;
+    try {
+      pendingManaged = c.startManaged();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      assert.equal(c.state.phase, "connecting");
+      await c.connect(TEST_ENDPOINT, TEST_TOKEN);
+      assert.equal(c.state.phase, "connected");
+      assert.equal(c.state.items[0].id, "dl-manual");
+      releaseManaged();
+      const ok = await pendingManaged;
+      pendingManaged = null;
+      assert.equal(ok, false);
+      assert.equal(c.state.phase, "connected");
+      assert.equal(c.state.items[0].id, "dl-manual", "stale managed result must not override manual");
+    } finally {
+      try {
+        if (pendingManaged && releaseManaged) releaseManaged();
+      } catch {}
+      try {
+        if (pendingManaged) await pendingManaged;
+      } catch {}
+      c.dispose();
+    }
+  });
+
+  it("manual connect path unchanged after managed failure", async () => {
+    const manualRow = { id: "dl-1", name: "surge-macos-aarch64.tar.gz", status: "active", bytesDone: 500, bytesTotal: 1000, speedBps: 100, addedAt: 1 };
+    let managedAttempts = 0;
+    const { invoke, calls } = makeInvoke((command) => {
+      if (command === "start_managed_surge") {
+        managedAttempts += 1;
+        throw "Startup";
+      }
+      if (command === "connect_surge") return [manualRow];
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    try {
+      const managedOk = await c.startManaged();
+      assert.equal(managedOk, false);
+      assert.equal(c.state.phase, "error");
+      assert.equal(managedAttempts, 1);
+      await c.connect(TEST_ENDPOINT, TEST_TOKEN);
+      assert.equal(c.state.phase, "connected");
+      assert.equal(c.state.items[0].id, "dl-1");
+      const connectCall = calls.find((x) => x.command === "connect_surge");
+      assert.ok(connectCall, "expected connect_surge call");
+      assert.deepEqual(connectCall.args, { endpoint: TEST_ENDPOINT, token: TEST_TOKEN });
+      assert.ok(!JSON.stringify(c.state).includes(TEST_TOKEN), "state must not leak token");
+    } finally {
+      c.dispose();
+    }
+  });
+});

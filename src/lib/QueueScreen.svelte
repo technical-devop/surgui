@@ -138,7 +138,7 @@
     </p>
   {:else}
     <p class="notice" role="note">
-      <strong>Offline — daemon not connected.</strong> The queue starts empty. Connect to a daemon on another machine to load downloads.
+      <strong>Offline — daemon not connected.</strong> The queue starts empty. Start the bundled daemon or connect to another daemon to load downloads.
     </p>
   {/if}
 

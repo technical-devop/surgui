@@ -1,3 +1,9 @@
 node_modules
 dist
 /src-tauri/target
+# Pinned Surge source build: in-repo staging only (never /tmp or outside repo)
+/.surge-stage/
+# Built Surge binaries staged as Tauri resources (CI-built, never committed).
+# The upstream notice src-tauri/resources/Surge-LICENSE stays committed.
+/src-tauri/resources/surge-x86_64-unknown-linux-gnu
+/src-tauri/resources/surge-x86_64-pc-windows-msvc.exe

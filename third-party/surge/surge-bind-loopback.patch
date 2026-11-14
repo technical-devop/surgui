@@ -1,0 +1,715 @@
+--- a/cmd/root_http_server.go
++++ b/cmd/root_http_server.go
+@@ -2,19 +2,24 @@
+ 
+ import (
+ 	"crypto/subtle"
++	"crypto/tls"
+ 	"fmt"
+ 	"net"
+ 	"net/http"
+ 	"os"
++	"os/signal"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"sync"
++	"syscall"
+ 	"time"
+ 
+ 	"github.com/SurgeDM/Surge/internal/config"
+ 	"github.com/SurgeDM/Surge/internal/service"
+ 	"github.com/SurgeDM/Surge/internal/utils"
+ 	"github.com/google/uuid"
++	"github.com/spf13/cobra"
+ )
+ 
+ func resolveTokenPath() string {
+@@ -25,7 +30,7 @@
+ 	return config.GetRuntimeDir()
+ }
+ 
+-const serverBindHost = "0.0.0.0"
++const serverBindHost = "127.0.0.1"
+ 
+ const maxAPIRequestBodyBytes = 8 << 20
+ 
+@@ -211,3 +216,255 @@
+ 	}
+ 	return os.Chmod(path, 0o600)
+ }
++
++// Surgui-managed Surge server (TLS-only loopback, environment-configured).
++//
++// This file is part of the Surgui auditable patch set on top of Surge
++// v0.12.4. It adds an internal `surgui-managed-server` command used only by
++// the Surgui desktop app to spawn its bundled daemon. Design rules:
++//
++//   - Listens only on 127.0.0.1 with an explicit port from SURGUI_PORT.
++//     There is no port scan fallback: an occupied port fails closed.
++//   - TLS only. ServeTLS with the in-memory PEM pair from SURGUI_TLS_CERT_PEM /
++//     SURGUI_TLS_KEY_PEM via tls.X509KeyPair. There is no plaintext path in
++//     this file and no TLS key/cert files are read.
++//   - Fails closed when any of SURGUI_PORT, SURGUI_TLS_CERT_PEM,
++//     SURGUI_TLS_KEY_PEM, or SURGUI_AUTH_TOKEN is missing or invalid.
++//   - The bearer token comes only from SURGUI_AUTH_TOKEN. It is never read
++//     from --token / SURGE_TOKEN, never written to disk (no token-file
++//     persistence), and never logged (errors are sanitized).
++//   - Download state is preserved: the same local engine, settings, store,
++//     startup integrity check, headless consumer, and auto-resume path as
++//     `surge server` are used. No unrelated upstream behavior is changed.
++
++// surguiManagedHost is fixed. It is intentionally separate from
++// serverBindHost so the managed listener stays loopback-only even if the
++// general bind host ever changes.
++const surguiManagedHost = "127.0.0.1"
++
++// surguiManagedConfig carries the validated managed-mode launch inputs.
++// authToken is held in memory only and must never be logged or persisted.
++// certPEM and keyPEM are held in memory only and must never be written to disk.
++type surguiManagedConfig struct {
++	port      int
++	certPEM   string
++	keyPEM    string
++	authToken string
++}
++
++// validateSurguiManagedToken mirrors the Surgui client's managed-token rule:
++// non-empty, and no ASCII whitespace or control bytes. The value itself is
++// never included in the returned error.
++func validateSurguiManagedToken(token string) error {
++	if token == "" || strings.TrimSpace(token) == "" {
++		return fmt.Errorf("surgui managed server: SURGUI_AUTH_TOKEN is required")
++	}
++	for i := 0; i < len(token); i++ {
++		if token[i] <= 0x20 || token[i] == 0x7f {
++			return fmt.Errorf("surgui managed server: SURGUI_AUTH_TOKEN contains invalid characters")
++		}
++	}
++	return nil
++}
++
++// surguiManagedConfigFromEnv loads the managed launch inputs strictly from
++// the environment. There are no flag or default fallbacks: anything missing
++// or malformed is an error (fail closed).
++func surguiManagedConfigFromEnv() (surguiManagedConfig, error) {
++	var cfg surguiManagedConfig
++
++	portStr := strings.TrimSpace(os.Getenv("SURGUI_PORT"))
++	if portStr == "" {
++		return cfg, fmt.Errorf("surgui managed server: SURGUI_PORT is required")
++	}
++	port, err := strconv.Atoi(portStr)
++	if err != nil || port < 1 || port > 65535 {
++		return cfg, fmt.Errorf("surgui managed server: SURGUI_PORT must be an integer in 1-65535")
++	}
++	cfg.port = port
++
++	certPEM := os.Getenv("SURGUI_TLS_CERT_PEM")
++	if strings.TrimSpace(certPEM) == "" {
++		return cfg, fmt.Errorf("surgui managed server: SURGUI_TLS_CERT_PEM is required")
++	}
++	cfg.certPEM = certPEM
++
++	keyPEM := os.Getenv("SURGUI_TLS_KEY_PEM")
++	if strings.TrimSpace(keyPEM) == "" {
++		return cfg, fmt.Errorf("surgui managed server: SURGUI_TLS_KEY_PEM is required")
++	}
++	cfg.keyPEM = keyPEM
++
++	// NOTE: raw value, no TrimSpace assignment: surrounding whitespace is
++	// rejected by validation rather than silently stripped.
++	token := os.Getenv("SURGUI_AUTH_TOKEN")
++	if err := validateSurguiManagedToken(token); err != nil {
++		return cfg, err
++	}
++	cfg.authToken = token
++
++	return cfg, nil
++}
++
++// bindSurguiManagedListener binds exactly 127.0.0.1:port. An occupied or
++// otherwise unavailable port is an error; unlike the scanning helper there
++// is no scan for a nearby free port.
++func bindSurguiManagedListener(port int) (net.Listener, error) {
++	if port < 1 || port > 65535 {
++		return nil, fmt.Errorf("surgui managed server: port must be in 1-65535")
++	}
++	ln, err := net.Listen("tcp", net.JoinHostPort(surguiManagedHost, strconv.Itoa(port)))
++	if err != nil {
++		return nil, fmt.Errorf("surgui managed server: could not bind %s:%d: %w", surguiManagedHost, port, err)
++	}
++	return ln, nil
++}
++
++// loadSurguiManagedCert validates the configured PEM pair in memory so a
++// missing value, invalid PEM, or mismatched key fails closed before the
++// listener is advertised. The error carries no key material and no raw
++// TLS error details.
++func loadSurguiManagedCert(certPEM, keyPEM string) (tls.Certificate, error) {
++	if strings.TrimSpace(certPEM) == "" || strings.TrimSpace(keyPEM) == "" {
++		return tls.Certificate{}, fmt.Errorf("surgui managed server: TLS cert and key are required")
++	}
++	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
++	if err != nil {
++		return tls.Certificate{}, fmt.Errorf("surgui managed server: invalid TLS cert/key")
++	}
++	return cert, nil
++}
++
++// newSurguiManagedServer builds the HTTPS handler stack (same routes, auth,
++// CORS, and body limit as the standard server) without starting anything and
++// without touching any token file. The caller serves it over TLS only.
++func newSurguiManagedServer(authToken string, port int, svc service.DownloadService) *http.Server {
++	mux := http.NewServeMux()
++	registerHTTPRoutes(mux, port, "", svc)
++	handler := corsMiddleware(authMiddleware(authToken, limitAPIRequestBody(mux)))
++	return &http.Server{
++		Handler:           handler,
++		ReadHeaderTimeout: 10 * time.Second,
++		ReadTimeout:       30 * time.Second,
++		IdleTimeout:       60 * time.Second,
++	}
++}
++
++var surguiManagedServerCmd = &cobra.Command{
++	Use:    "surgui-managed-server",
++	Short:  "Start the Surgui-managed Surge server (internal, TLS-only loopback)",
++	Hidden: true,
++	Args:   cobra.NoArgs,
++	RunE: func(cmd *cobra.Command, _ []string) error {
++		return runSurguiManagedServer(cmd)
++	},
++}
++
++func init() {
++	rootCmd.AddCommand(surguiManagedServerCmd)
++}
++
++// runSurguiManagedServer is the managed-daemon entrypoint. All inputs come
++// from the environment (see surguiManagedConfigFromEnv); flag and persisted
++// token inputs are deliberately ignored here so an ephemeral managed token
++// can never arrive via process arguments or be confused with the persisted
++// user token. The token and TLS PEM values are kept in memory and never
++// written to disk.
++func runSurguiManagedServer(cmd *cobra.Command) error {
++	cfg, err := surguiManagedConfigFromEnv()
++	if err != nil {
++		return err
++	}
++	cert, err := loadSurguiManagedCert(cfg.certPEM, cfg.keyPEM)
++	if err != nil {
++		return err
++	}
++
++	lock, isMaster, err := TryAcquireInstanceLock(resolveRuntimeDir())
++	if err != nil {
++		return fmt.Errorf("surgui managed server: error acquiring lock: %w", err)
++	}
++	if !isMaster {
++		return fmt.Errorf("surgui managed server: surge server is already running")
++	}
++	defer func() {
++		if err := lock.Release(); err != nil {
++			utils.Debug("Error releasing lock: %v", err)
++		}
++	}()
++
++	if err := initializeLocalEngine(); err != nil {
++		return err
++	}
++	resetGlobalEnqueueContext()
++
++	if msg := runStartupIntegrityCheck(); msg != "" {
++		utils.Debug("%s", msg)
++		fmt.Println(msg)
++	}
++
++	if err := ensureGlobalLocalServiceAndLifecycle(); err != nil {
++		return fmt.Errorf("surgui managed server: error creating lifecycle event stream: %w", err)
++	}
++
++	ln, err := bindSurguiManagedListener(cfg.port)
++	if err != nil {
++		return err
++	}
++
++	saveActivePort(cfg.port)
++	defer removeActivePort()
++
++	savePID()
++	defer removePID()
++
++	srv := newSurguiManagedServer(cfg.authToken, cfg.port, GlobalService)
++	srv.TLSConfig = &tls.Config{
++		Certificates: []tls.Certificate{cert},
++		MinVersion:   tls.VersionTLS12,
++	}
++	globalHTTPServerMu.Lock()
++	globalHTTPServer = srv
++	globalHTTPServerMu.Unlock()
++
++	serveErrCh := make(chan error, 1)
++	go func() {
++		// TLS only: ServeTLS with empty file arguments uses the
++		// prevalidated in-memory certificate from TLSConfig.
++		// No files are reopened here. A non-graceful
++		// failure is forwarded so the daemon shuts down promptly with a
++		// sanitized error (no token or cert material). The channel is
++		// buffered so the goroutine never blocks; on graceful shutdown
++		// ServeTLS returns http.ErrServerClosed and the goroutine exits.
++		if serveErr := srv.ServeTLS(ln, "", ""); serveErr != nil && serveErr != http.ErrServerClosed {
++			utils.Debug("surgui managed server: HTTPS server error")
++			serveErrCh <- serveErr
++		}
++	}()
++
++	fmt.Printf("Surge %s running in surgui-managed mode.\n", Version)
++	fmt.Printf("Serving on %s:%d (TLS)\n", surguiManagedHost, cfg.port)
++
++	StartHeadlessConsumer(cmd.Root().Context(), GlobalService)
++	resumePausedDownloads()
++
++	sigChan := make(chan os.Signal, 1)
++	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
++	defer signal.Stop(sigChan)
++
++	select {
++	case sig := <-sigChan:
++		fmt.Printf("\nReceived %s. Shutting down...\n", sig)
++		_ = executeGlobalShutdown(fmt.Sprintf("surgui managed server signal: %s", sig))
++	case <-cmd.Root().Context().Done():
++		fmt.Printf("\nService stop requested. Shutting down...\n")
++		_ = executeGlobalShutdown("surgui managed server: service context cancelled")
++	case reason := <-shutDownRequested:
++		fmt.Printf("\n%s Shutting down...\n", reason)
++		_ = executeGlobalShutdown(reason)
++	case <-serveErrCh:
++		_ = executeGlobalShutdown("surgui managed server: HTTPS server error")
++		return fmt.Errorf("surgui managed server: HTTPS server error")
++	}
++	return nil
++}
+--- a/cmd/cmd_test.go
++++ b/cmd/cmd_test.go
+@@ -4,16 +4,25 @@
+ 	"github.com/SurgeDM/Surge/internal/types"
+ 
+ 	"bytes"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
+ 	"encoding/json"
++	"encoding/pem"
+ 	"fmt"
+ 	"io"
++	"math/big"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/SurgeDM/Surge/internal/config"
+ 	"github.com/SurgeDM/Surge/internal/scheduler"
+@@ -1549,3 +1558,394 @@
+ 		t.Fatalf("resolveServerToken() = %q, want %q", got, "flag-token-xyz")
+ 	}
+ }
++
++// Tests for the Surgui-managed server (see root_http_server.go managed section).
++//
++// Every test uses isolated temp dirs / env and never touches the real user
++// state. TLS tests generate throwaway self-signed certs in memory; no TLS
++// key/cert files are written.
++
++func makeSurguiTestCertPEM(t *testing.T) (certPEM, keyPEM string) {
++	t.Helper()
++
++	priv, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatalf("failed to generate test key: %v", err)
++	}
++	template := x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "surgui-managed-test"},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
++		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
++		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
++		DNSNames:              []string{"localhost"},
++		BasicConstraintsValid: true,
++	}
++	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
++	if err != nil {
++		t.Fatalf("failed to create test certificate: %v", err)
++	}
++	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
++	if err != nil {
++		t.Fatalf("failed to marshal test key: %v", err)
++	}
++
++	certPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
++	keyPEM = string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
++	if certPEM == "" || keyPEM == "" {
++		t.Fatal("failed to encode test PEM")
++	}
++	return certPEM, keyPEM
++}
++
++// setSurguiTestEnv points the managed config at explicit in-memory values.
++func setSurguiTestEnv(t *testing.T, port int, certPEM, keyPEM, token string) {
++	t.Helper()
++	t.Setenv("SURGUI_PORT", strconv.Itoa(port))
++	t.Setenv("SURGUI_TLS_CERT_PEM", certPEM)
++	t.Setenv("SURGUI_TLS_KEY_PEM", keyPEM)
++	t.Setenv("SURGUI_AUTH_TOKEN", token)
++}
++
++// clearSurguiTestEnv blanks every managed input (fail-closed baseline).
++func clearSurguiTestEnv(t *testing.T) {
++	t.Helper()
++	t.Setenv("SURGUI_PORT", "")
++	t.Setenv("SURGUI_TLS_CERT_PEM", "")
++	t.Setenv("SURGUI_TLS_KEY_PEM", "")
++	t.Setenv("SURGUI_AUTH_TOKEN", "")
++}
++
++// surguiTestFreePort returns a currently-free loopback port. The socket is
++// closed before return, so callers must tolerate a (very unlikely) race and
++// treat bind errors as fatal.
++func surguiTestFreePort(t *testing.T) int {
++	t.Helper()
++	requireTCPListener(t)
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("failed to find free port: %v", err)
++	}
++	defer func() { _ = ln.Close() }()
++	return ln.Addr().(*net.TCPAddr).Port
++}
++
++// surguiTestHTTPSClient trusts only the throwaway test certs.
++func surguiTestHTTPSClient() *http.Client {
++	return &http.Client{
++		Timeout: 5 * time.Second,
++		Transport: &http.Transport{
++			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // test-only throwaway certs
++		},
++	}
++}
++
++// startSurguiTestTLSServer serves the managed handler over TLS on an explicit
++// loopback port using the prevalidated in-memory certificate and waits until
++// /health answers over HTTPS.
++func startSurguiTestTLSServer(t *testing.T, port int, certPEM, keyPEM, token string) *http.Server {
++	t.Helper()
++
++	ln, err := bindSurguiManagedListener(port)
++	if err != nil {
++		t.Fatalf("failed to bind managed listener: %v", err)
++	}
++	cert, err := loadSurguiManagedCert(certPEM, keyPEM)
++	if err != nil {
++		_ = ln.Close()
++		t.Fatalf("failed to load test cert: %v", err)
++	}
++	svc := service.NewLocalDownloadService(nil)
++	srv := newSurguiManagedServer(token, port, svc)
++	srv.TLSConfig = &tls.Config{
++		Certificates: []tls.Certificate{cert},
++		MinVersion:   tls.VersionTLS12,
++	}
++
++	serveErr := make(chan error, 1)
++	go func() { serveErr <- srv.ServeTLS(ln, "", "") }()
++	t.Cleanup(func() {
++		_ = srv.Close()
++		select {
++		case <-serveErr:
++		case <-time.After(10 * time.Second):
++			t.Errorf("managed TLS test server did not stop")
++		}
++	})
++
++	client := surguiTestHTTPSClient()
++	defer client.CloseIdleConnections()
++	url := fmt.Sprintf("https://127.0.0.1:%d/health", port)
++	deadline := time.Now().Add(10 * time.Second)
++	for {
++		req, reqErr := http.NewRequest(http.MethodGet, url, nil)
++		if reqErr != nil {
++			t.Fatalf("failed to build request: %v", reqErr)
++		}
++		req.Header.Set("Authorization", "Bearer "+token)
++		resp, doErr := client.Do(req)
++		if doErr == nil {
++			_, _ = io.Copy(io.Discard, resp.Body)
++			_ = resp.Body.Close()
++			if resp.StatusCode == http.StatusOK {
++				return srv
++			}
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("managed TLS test server on port %d never became ready", port)
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++}
++
++func TestSurguiManaged_ConfigMissingFailsClosed(t *testing.T) {
++	certPEM, keyPEM := makeSurguiTestCertPEM(t)
++	port := surguiTestFreePort(t)
++	const token = "surgui-test-token-0123456789abcdef"
++
++	cases := map[string]func(){
++		"port":     func() { setSurguiTestEnv(t, port, certPEM, keyPEM, token); t.Setenv("SURGUI_PORT", "") },
++		"certPEM":  func() { setSurguiTestEnv(t, port, certPEM, keyPEM, token); t.Setenv("SURGUI_TLS_CERT_PEM", "") },
++		"keyPEM":   func() { setSurguiTestEnv(t, port, certPEM, keyPEM, token); t.Setenv("SURGUI_TLS_KEY_PEM", "") },
++		"token":    func() { setSurguiTestEnv(t, port, certPEM, keyPEM, token); t.Setenv("SURGUI_AUTH_TOKEN", "") },
++		"cert PEM": func() { setSurguiTestEnv(t, port, "   ", keyPEM, token) },
++		"key PEM":  func() { setSurguiTestEnv(t, port, certPEM, "   ", token) },
++	}
++	for name, setup := range cases {
++		t.Run("missing_"+strings.ReplaceAll(name, " ", "_"), func(t *testing.T) {
++			setup()
++			if _, err := surguiManagedConfigFromEnv(); err == nil {
++				t.Fatalf("expected error with missing %s, got nil", name)
++			}
++		})
++	}
++}
++
++func TestSurguiManaged_ConfigInvalidPortFailsClosed(t *testing.T) {
++	certPEM, keyPEM := makeSurguiTestCertPEM(t)
++	for _, bad := range []string{"0", "-1", "65536", "99999", "abc", "1700.5", "  "} {
++		t.Run("port_"+strings.ReplaceAll(strings.TrimSpace(bad), " ", "_"), func(t *testing.T) {
++			clearSurguiTestEnv(t)
++			t.Setenv("SURGUI_PORT", bad)
++			t.Setenv("SURGUI_TLS_CERT_PEM", certPEM)
++			t.Setenv("SURGUI_TLS_KEY_PEM", keyPEM)
++			t.Setenv("SURGUI_AUTH_TOKEN", "surgui-test-token-0123456789abcdef")
++			if _, err := surguiManagedConfigFromEnv(); err == nil {
++				t.Fatalf("expected error for SURGUI_PORT=%q, got nil", bad)
++			}
++		})
++	}
++}
++
++func TestSurguiManaged_ConfigBadTokenFailsClosed(t *testing.T) {
++	certPEM, keyPEM := makeSurguiTestCertPEM(t)
++	port := surguiTestFreePort(t)
++	for _, bad := range []string{"", "   ", "has space", "tab\there", "nl\nhere", "ctl\x01here"} {
++		t.Run(fmt.Sprintf("token_%q", bad), func(t *testing.T) {
++			setSurguiTestEnv(t, port, certPEM, keyPEM, bad)
++			if _, err := surguiManagedConfigFromEnv(); err == nil {
++				t.Fatalf("expected error for invalid token %q, got nil", bad)
++			}
++		})
++	}
++}
++
++func TestSurguiManaged_ConfigValid(t *testing.T) {
++	certPEM, keyPEM := makeSurguiTestCertPEM(t)
++	port := surguiTestFreePort(t)
++	const token = "surgui-test-token-0123456789abcdef"
++	setSurguiTestEnv(t, port, certPEM, keyPEM, token)
++
++	cfg, err := surguiManagedConfigFromEnv()
++	if err != nil {
++		t.Fatalf("expected valid config, got: %v", err)
++	}
++	if cfg.port != port || cfg.certPEM != certPEM || cfg.keyPEM != keyPEM || cfg.authToken != token {
++		t.Fatalf("config mismatch: port=%d want %d", cfg.port, port)
++	}
++}
++
++func TestSurguiManaged_BindsLoopbackOnly(t *testing.T) {
++	if surguiManagedHost != "127.0.0.1" {
++		t.Fatalf("managed host must stay 127.0.0.1, got %q", surguiManagedHost)
++	}
++	port := surguiTestFreePort(t)
++	ln, err := bindSurguiManagedListener(port)
++	if err != nil {
++		t.Fatalf("failed to bind: %v", err)
++	}
++	defer func() { _ = ln.Close() }()
++
++	addr, ok := ln.Addr().(*net.TCPAddr)
++	if !ok {
++		t.Fatalf("listener addr is %T, want *net.TCPAddr", ln.Addr())
++	}
++	if !addr.IP.IsLoopback() || addr.Port != port {
++		t.Fatalf("listener bound %v, want loopback 127.0.0.1:%d", ln.Addr(), port)
++	}
++}
++
++func TestSurguiManaged_TLSListenerServesHTTPS(t *testing.T) {
++	requireTCPListener(t)
++	certPEM, keyPEM := makeSurguiTestCertPEM(t)
++	port := surguiTestFreePort(t)
++	const token = "surgui-test-token-0123456789abcdef"
++	startSurguiTestTLSServer(t, port, certPEM, keyPEM, token)
++
++	client := surguiTestHTTPSClient()
++	defer client.CloseIdleConnections()
++
++	validReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://127.0.0.1:%d/health", port), nil)
++	validReq.Header.Set("Authorization", "Bearer "+token)
++	validResp, err := client.Do(validReq)
++	if err != nil {
++		t.Fatalf("valid HTTPS request failed: %v", err)
++	}
++	_, _ = io.Copy(io.Discard, validResp.Body)
++	_ = validResp.Body.Close()
++	if validResp.StatusCode != http.StatusOK {
++		t.Fatalf("expected 200 for valid token over TLS, got %d", validResp.StatusCode)
++	}
++
++	// Wrong token must be rejected.
++	badReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://127.0.0.1:%d/list", port), nil)
++	badReq.Header.Set("Authorization", "Bearer wrong-token")
++	badResp, err := client.Do(badReq)
++	if err != nil {
++		t.Fatalf("HTTPS request failed: %v", err)
++	}
++	_, _ = io.Copy(io.Discard, badResp.Body)
++	_ = badResp.Body.Close()
++	if badResp.StatusCode != http.StatusUnauthorized {
++		t.Fatalf("expected 401 for wrong token, got %d", badResp.StatusCode)
++	}
++}
++
++func TestSurguiManaged_NoPlaintextFallback(t *testing.T) {
++	requireTCPListener(t)
++	certPEM, keyPEM := makeSurguiTestCertPEM(t)
++	port := surguiTestFreePort(t)
++	const token = "surgui-test-token-0123456789abcdef"
++	startSurguiTestTLSServer(t, port, certPEM, keyPEM, token)
++
++	// Plain HTTP against the TLS-only port must never succeed.
++	plain := &http.Client{Timeout: 5 * time.Second}
++	defer plain.CloseIdleConnections()
++	resp, err := plain.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port)) //nolint:bodyclose // error path has no body; success path closed below
++	if err == nil && resp.StatusCode != http.StatusBadRequest {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++		t.Fatalf("plaintext HTTP unexpectedly succeeded with status %d; TLS-only listener must not serve plaintext", resp.StatusCode)
++	}
++	if err == nil && resp.StatusCode == http.StatusBadRequest {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++	}
++}
++
++func TestSurguiManaged_PortCollisionFailsClosed(t *testing.T) {
++	requireTCPListener(t)
++	// An unrelated occupant holds the port; the managed bind must fail
++	// instead of scanning for a nearby free port.
++	occupant, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("failed to occupy port: %v", err)
++	}
++	defer func() { _ = occupant.Close() }()
++	occupiedPort := occupant.Addr().(*net.TCPAddr).Port
++
++	if _, err := bindSurguiManagedListener(occupiedPort); err == nil {
++		t.Fatalf("expected bind error on occupied port %d, got nil", occupiedPort)
++	}
++}
++
++func TestSurguiManaged_WrongCertFailsClosed(t *testing.T) {
++	certPEMA, _ := makeSurguiTestCertPEM(t)
++	_, keyPEMB := makeSurguiTestCertPEM(t)
++
++	// Mismatched pair must fail validation with a sanitized error.
++	if _, err := loadSurguiManagedCert(certPEMA, keyPEMB); err == nil {
++		t.Fatal("expected error for mismatched cert/key pair, got nil")
++	} else if strings.Contains(err.Error(), certPEMA) || strings.Contains(err.Error(), keyPEMB) {
++		t.Fatal("cert/key error must not contain key material")
++	}
++
++	// Garbage PEM values must fail validation with a sanitized error.
++	if _, err := loadSurguiManagedCert("not a pem", "not a pem either"); err == nil {
++		t.Fatal("expected error for garbage cert/key values, got nil")
++	} else if strings.Contains(err.Error(), "not a pem") {
++		t.Fatal("cert/key error must not echo raw input")
++	}
++
++	// Empty values must fail validation.
++	if _, err := loadSurguiManagedCert("", ""); err == nil {
++		t.Fatal("expected error for empty cert/key values, got nil")
++	}
++	if _, err := loadSurguiManagedCert("   ", "   "); err == nil {
++		t.Fatal("expected error for whitespace cert/key values, got nil")
++	}
++
++	// A server with no in-memory certificate must fail at serve time, never
++	// falling back to plaintext: ServeTLS returns promptly with an error.
++	port := surguiTestFreePort(t)
++	ln, err := bindSurguiManagedListener(port)
++	if err != nil {
++		t.Fatalf("failed to bind: %v", err)
++	}
++	defer func() { _ = ln.Close() }()
++	svc := service.NewLocalDownloadService(nil)
++	srv := newSurguiManagedServer("surgui-test-token-0123456789abcdef", port, svc)
++	serveErr := make(chan error, 1)
++	go func() { serveErr <- srv.ServeTLS(ln, "", "") }()
++	select {
++	case err := <-serveErr:
++		if err == nil {
++			_ = srv.Close()
++			t.Fatal("ServeTLS without certificates unexpectedly succeeded")
++		}
++	case <-time.After(10 * time.Second):
++		_ = srv.Close()
++		<-serveErr
++		t.Fatal("ServeTLS without certificates neither failed nor served; expected a prompt error")
++	}
++}
++
++func TestSurguiManaged_TokenNotPersisted(t *testing.T) {
++	// Isolate every XDG location so the assertion cannot see (or pollute)
++	// real or suite-shared state.
++	stateDir := t.TempDir()
++	t.Setenv("XDG_STATE_HOME", stateDir)
++	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
++	t.Setenv("XDG_DATA_HOME", t.TempDir())
++	t.Setenv("XDG_CACHE_HOME", t.TempDir())
++	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
++	t.Setenv("HOME", t.TempDir())
++	t.Setenv("APPDATA", t.TempDir())
++
++	certPEM, keyPEM := makeSurguiTestCertPEM(t)
++	port := surguiTestFreePort(t)
++	const token = "surgui-ephemeral-token-0123456789abcdef"
++	setSurguiTestEnv(t, port, certPEM, keyPEM, token)
++
++	cfg, err := surguiManagedConfigFromEnv()
++	if err != nil {
++		t.Fatalf("expected valid config, got: %v", err)
++	}
++	if _, err := loadSurguiManagedCert(cfg.certPEM, cfg.keyPEM); err != nil {
++		t.Fatalf("expected valid PEM pair, got: %v", err)
++	}
++	startSurguiTestTLSServer(t, cfg.port, cfg.certPEM, cfg.keyPEM, cfg.authToken)
++
++	// The ephemeral token must never land in the persisted token file, and
++	// no token file may be created as a side effect.
++	if data, err := os.ReadFile(resolveTokenPath()); err == nil {
++		if strings.Contains(string(data), token) {
++			t.Fatalf("ephemeral managed token was persisted to %s", resolveTokenPath())
++		}
++		t.Fatalf("managed server created token file %s (must not persist auth state)", resolveTokenPath())
++	} else if !os.IsNotExist(err) {
++		t.Fatalf("unexpected error reading token file: %v", err)
++	}
++}

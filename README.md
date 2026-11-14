@@ -3,22 +3,18 @@
 Unofficial desktop GUI for Surge, the download daemon. Built with Tauri + Svelte.
 
 This is a **third-party controller**, not part of the Surge upstream project and not
-affiliated with it. It targets the Surge v0.12.4 API. The GUI does not bundle or
-install Surge — you run the daemon yourself, separately.
+affiliated with it. It targets the Surge v0.12.4 API. The app bundles a patched Surge v0.12.4 daemon for Windows x64 and Linux x64. It starts the daemon automatically on 127.0.0.1:1700 over TLS and stops its owned daemon on disconnect or exit. If the port is occupied, startup fails rather than using an unrelated listener.
 
 ## Scope
 
-- Native Tauri app for Windows x64 and Linux x64. Connect with the daemon
-  endpoint URL + bearer token (verified with an authenticated `GET /list`), then
-  live queue refresh and disconnect.
+- Native Tauri app for Windows x64 and Linux x64. The bundled daemon starts automatically; advanced manual connection accepts an endpoint URL and bearer token.
 - Add URL through the UI; pause, resume, and remove with an in-app confirmation step.
-- The bearer token is held in Rust memory only. It is never persisted to disk,
-  browser storage, or logs.
+- Managed credentials are generated per launch and passed to the child process environment, not the UI, disk, arguments, or logs. Local processes with sufficient privileges may inspect that environment.
 - Remote endpoints must use HTTPS. Plain HTTP is loopback-only (e.g. `localhost`, or
   an SSH tunnel to the daemon host).
 - Browser preview is sample-only and never connects to a daemon.
 
-## Running the daemon (Windows)
+## Advanced: Running the daemon (Windows)
 
 Surge runs as a separate server process. Download `surge.exe` for Windows from the
 [Surge v0.12.4 release](https://github.com/SurgeDM/Surge/releases/tag/v0.12.4),
@@ -57,7 +53,7 @@ equivalent), or put the daemon behind an HTTPS tunnel. The app requires HTTPS fo
 anything that is not loopback HTTP, but that is a client-side rule only; it does
 not restrict who can reach the daemon.
 
-## Running the daemon (Linux)
+## Advanced: Running the daemon (Linux)
 
 The same Surge release ships Linux binaries. Download
 `Surge_0.12.4_linux_amd64.tar.gz` (or `Surge_0.12.4_linux_arm64.tar.gz`) from the
@@ -100,8 +96,7 @@ connection before starting a broadly-listening server.
 - **Remove**: asks for confirmation, then calls `/delete`. It never calls `/purge`.
   Removing may delete the incomplete working file of a transfer still in progress;
   a completed final file is left on disk.
-- **Disconnect**: drops the UI's connection and clears the in-memory token. It does
-  **not** stop the daemon — downloads keep running.
+- **Disconnect**: stops the bundled managed daemon and clears the connection. An externally managed daemon is not stopped.
 
 ### Where files land
 

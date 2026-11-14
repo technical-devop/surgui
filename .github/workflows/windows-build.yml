@@ -17,20 +17,29 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
 
       - name: Setup stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
+
+      - name: Setup Go 1.26.0
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.0'
+          cache: false
+
+      - name: Build pinned Surge (loopback, Windows x64)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-surge-windows.ps1
 
       - name: Install frontend dependencies
         run: npm ci
@@ -56,11 +65,17 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check Surge Tauri resources
+        run: |
+          if (-not (Test-Path src-tauri/resources/Surge-LICENSE)) { throw 'missing Surge-LICENSE resource' }
+          if (-not (Test-Path src-tauri/resources/surge-x86_64-pc-windows-msvc.exe)) { throw 'missing surge Windows x64 resource' }
+          Get-Item src-tauri/resources/* | Format-Table Name, Length | Out-String | Write-Host
+
       - name: Build Tauri NSIS setup
         run: npm run tauri build -- --bundles nsis
 
       - name: Upload NSIS setup artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: surge-desktop-windows-x64-exe
           path: src-tauri/target/release/bundle/nsis/*.exe

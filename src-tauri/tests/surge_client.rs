@@ -239,6 +239,142 @@ async fn errors_never_reveal_token_or_body() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Managed-mode TLS client foundation (pinned https://127.0.0.1:1700).
+//
+// All fixtures are inline bytes only: no external files, no temp files, no
+// network TLS server. These tests cover the negative and pinning surface
+// that does not require a TLS handshake.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn managed_base_url_is_pinned_https_loopback_never_http() {
+    use surge_desktop_lib::surge_client::MANAGED_BASE_URL;
+    assert_eq!(
+        MANAGED_BASE_URL, "https://127.0.0.1:1700",
+        "managed origin must stay pinned"
+    );
+    assert!(
+        MANAGED_BASE_URL.starts_with("https://"),
+        "managed origin must never fall back to http"
+    );
+    assert!(
+        !MANAGED_BASE_URL.starts_with("http://"),
+        "plain http must never be used in managed mode"
+    );
+    assert!(
+        MANAGED_BASE_URL.contains("127.0.0.1:1700"),
+        "managed origin must stay on loopback 1700"
+    );
+}
+
+#[tokio::test]
+async fn managed_rejects_invalid_ca_cert_without_leaking() {
+    use surge_desktop_lib::surge_client::SurgeClient;
+    // Fixture only: garbage bytes presented as a CA bundle.
+    const BAD_CA: &[u8] = b"not a pem certificate fixture-only";
+    let err = SurgeClient::connect_managed(BAD_CA, "test-token")
+        .await
+        .expect_err("invalid CA must be rejected");
+    assert!(
+        matches!(err, ConnectError::InvalidEndpoint(_)),
+        "invalid CA must map to InvalidEndpoint, got {:?}",
+        err
+    );
+    let debug = format!("{:?}", err);
+    let display = format!("{}", err);
+    assert!(
+        !debug.contains("not a pem"),
+        "error Debug must not echo CA bytes"
+    );
+    assert!(
+        !display.contains("not a pem"),
+        "error Display must not echo CA bytes"
+    );
+    assert!(
+        !debug.contains("test-token") && !display.contains("test-token"),
+        "managed error must redact bearer token"
+    );
+}
+
+#[tokio::test]
+async fn managed_rejects_private_key_pem_as_ca_without_leaking() {
+    use surge_desktop_lib::surge_client::SurgeClient;
+    // Fixture only: private-key PEM bytes passed in place of a CA bundle.
+    const KEY_AS_CA: &[u8] =
+        b"-----BEGIN PRIVATE KEY-----\nZmFrZS1rZXktZml4dHVyZS1vbmx5\n-----END PRIVATE KEY-----\n";
+    let err = SurgeClient::connect_managed(KEY_AS_CA, "test-token")
+        .await
+        .expect_err("private key bytes passed as CA must be rejected");
+    assert!(
+        matches!(err, ConnectError::InvalidEndpoint(_)),
+        "key-as-CA must map to InvalidEndpoint, got {:?}",
+        err
+    );
+    let debug = format!("{:?}", err);
+    assert!(
+        !debug.contains("PRIVATE KEY") && !debug.contains("ZmFrZS"),
+        "error must not echo the private-key bytes passed as CA"
+    );
+}
+
+#[tokio::test]
+async fn managed_rejects_empty_token_without_network() {
+    use surge_desktop_lib::surge_client::SurgeClient;
+    const BAD_CA: &[u8] = b"not a pem certificate fixture-only";
+    for token in ["", "   "] {
+        let err = SurgeClient::connect_managed(BAD_CA, token)
+            .await
+            .expect_err("empty token must be rejected");
+        assert!(
+            matches!(err, ConnectError::EmptyToken),
+            "empty managed token must map to EmptyToken, got {:?}",
+            err
+        );
+    }
+    // Whitespace/control-bearing token is rejected locally as well.
+    let err = SurgeClient::connect_managed(BAD_CA, "bad token")
+        .await
+        .expect_err("whitespace token must be rejected");
+    assert!(
+        matches!(err, ConnectError::InvalidEndpoint(_)),
+        "whitespace token must map to InvalidEndpoint, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn managed_malformed_ca_fails_closed_and_redacts_secrets() {
+    use surge_desktop_lib::surge_client::{SurgeClient, MANAGED_BASE_URL};
+    // The managed constructor takes no endpoint argument: with malformed CA
+    // bytes it fails closed with a sanitized InvalidEndpoint error instead of
+    // returning a usable client, and the error never echoes the CA bytes or
+    // the bearer token.
+    assert_eq!(MANAGED_BASE_URL, "https://127.0.0.1:1700");
+    const SECRET: &str = "managed-secret-token-fixture";
+    const BAD_CA: &[u8] = b"managed-fixture-bad-ca-bytes";
+    let err = SurgeClient::connect_managed(BAD_CA, SECRET)
+        .await
+        .expect_err("managed connect with bad CA must fail");
+    assert!(
+        matches!(err, ConnectError::InvalidEndpoint(_)),
+        "must fail closed, got {:?}",
+        err
+    );
+    let debug = format!("{:?}", err);
+    let display = format!("{}", err);
+    for leaked in [SECRET, "managed-fixture-bad-ca-bytes"] {
+        assert!(
+            !debug.contains(leaked),
+            "managed error Debug must redact secrets"
+        );
+        assert!(
+            !display.contains(leaked),
+            "managed error Display must redact secrets"
+        );
+    }
+}
+
 /// Upstream v0.12.4 regression: `/pause` acknowledges `pause_requested` and
 /// `/resume` acknowledges `resume_requested` (`cmd/http_api.go` at
 /// v0.12.4; v0.12.2 used `paused`/`resumed`). The client must accept the

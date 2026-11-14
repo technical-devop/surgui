@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use reqwest::header::CONTENT_TYPE;
-use reqwest::{redirect::Policy, Client, StatusCode};
+use reqwest::{redirect::Policy, Certificate, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
@@ -24,6 +24,19 @@ const DUPLICATE_MESSAGE: &str = "Download rejected: Duplicate download detected 
 
 /// Bounded round-trip for the authenticated `/list` probe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pinned managed-mode origin.
+///
+/// Managed mode always talks to the locally spawned Surge daemon over TLS at
+/// this exact origin. It takes no endpoint argument and never falls back to
+/// plain HTTP or any other host/port.
+pub const MANAGED_BASE_URL: &str = "https://127.0.0.1:1700";
+
+/// Upper bound for the per-launch PEM CA bundle (64 KiB).
+///
+/// Rejects empty/oversized input before parsing so a hostile caller cannot
+/// force a large allocation; the bytes themselves are never logged.
+const MAX_CA_PEM_BYTES: usize = 64 * 1024;
 
 /// One entry of the Surge `/list` payload (released Surge v0.12.4
 /// `internal/types/models.go` `DownloadStatus`).
@@ -501,6 +514,34 @@ impl SurgeClient {
         Ok(())
     }
 
+    /// Request a graceful shutdown of this managed daemon.
+    ///
+    /// Uses the same retained pinned-TLS `reqwest::Client` as every other
+    /// managed call, so the bearer token travels only in the `Authorization`
+    /// header to the already-verified managed origin. The daemon's released
+    /// contract is `POST /shutdown` -> `202 Accepted` with
+    /// `{"status":"shutting_down"}`. Redirects are already disabled and the
+    /// response body is bounded before it is discarded. Request URL, token and
+    /// body never appear in an error.
+    pub async fn shutdown(&self) -> Result<(), ConnectError> {
+        let response = self
+            .client
+            .post(format!("{}/shutdown", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(ConnectError::Unauthorized);
+        }
+        if status != StatusCode::ACCEPTED {
+            return Err(ConnectError::InvalidResponse);
+        }
+        let _ = read_bounded_body(response).await?;
+        Ok(())
+    }
+
     /// Enqueue a download through the released `POST /download` route.
     ///
     /// The URL is validated locally (no network on rejection) and forwarded
@@ -564,5 +605,246 @@ impl SurgeClient {
                 }
             }
         }
+    }
+}
+
+/// Validate the managed-mode bearer token (same rules as manual `connect`).
+///
+/// Empty/blank or whitespace/control-bearing tokens are rejected locally with
+/// sanitized errors; the token value never appears in an error.
+fn validate_managed_token(token: &str) -> Result<(), ConnectError> {
+    if token.is_empty() || token.trim().is_empty() {
+        return Err(ConnectError::EmptyToken);
+    }
+    if token
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(invalid("token contains invalid characters"));
+    }
+    Ok(())
+}
+
+/// Parse the per-launch PEM CA bundle for managed mode.
+///
+/// Accepts one or more PEM certificates via `from_pem_bundle`. Empty,
+/// oversized, or unparseable input (including private-key PEM masquerading as
+/// a CA) is rejected as a sanitized `InvalidEndpoint`; the bytes are never
+/// echoed.
+fn parse_managed_ca(ca_pem: &[u8]) -> Result<Vec<Certificate>, ConnectError> {
+    if ca_pem.is_empty() || ca_pem.len() > MAX_CA_PEM_BYTES {
+        return Err(invalid("invalid managed CA certificate"));
+    }
+    let certs = Certificate::from_pem_bundle(ca_pem)
+        .map_err(|_| invalid("invalid managed CA certificate"))?;
+    if certs.is_empty() {
+        return Err(invalid("invalid managed CA certificate"));
+    }
+    Ok(certs)
+}
+
+/// Build the managed-mode `reqwest` client with the pinned security posture.
+///
+/// - Rustls backend (`use_rustls_tls`); default/system roots disabled via
+///   `tls_built_in_root_certs(false)` so only the per-launch CA is trusted.
+///   Hostname/IP SAN validation stays enabled: `danger_accept_invalid_certs`
+///   / `danger_accept_invalid_hostnames` are never set.
+/// - `https_only(true)`: no plain-HTTP request can ever be built.
+/// - `no_proxy()`: environment/system proxies are never used.
+/// - `redirect(Policy::none())`: the `Authorization` header never follows a
+///   redirect.
+/// - Bounded round trip via `CONNECT_TIMEOUT`.
+/// - No idle connection pool: shutdown/host-exit uses the retained client from
+///   a dedicated current-thread runtime, and reusing an idle socket bound to a
+///   different (possibly blocked) runtime could stall the graceful request.
+/// - TLS early data is never enabled: this crate does not enable reqwest's
+///   `http3`/`reqwest_unstable` early-data API, so no early data is sent.
+fn build_managed_client(certs: Vec<Certificate>) -> Result<Client, ConnectError> {
+    let mut builder = Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .https_only(true)
+        .redirect(Policy::none())
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .timeout(CONNECT_TIMEOUT);
+    for cert in certs {
+        builder = builder.add_root_certificate(cert);
+    }
+    builder.build().map_err(|_| ConnectError::Network)
+}
+
+impl SurgeClient {
+    /// Internal Rust-only managed-mode constructor (no Tauri IPC).
+    ///
+    /// `ca_pem` is the per-launch PEM CA bundle bytes and `token` the
+    /// per-launch secret bearer token; both are held in memory only, never
+    /// persisted, never logged, and never sent over IPC (this method takes
+    /// Rust values, not a Tauri command). The origin is always pinned to
+    /// [`MANAGED_BASE_URL`] (`https://127.0.0.1:1700`); there is no endpoint
+    /// argument and no HTTP fallback.
+    ///
+    /// All later requests on the returned client (`refresh`,
+    /// `control_download`, `add_download`) reuse the same hardened
+    /// `reqwest::Client`, so the rustls / pinned-CA / no-proxy / no-redirect /
+    /// https-only posture applies to every request, not just the `/list`
+    /// probe.
+    pub async fn connect_managed(ca_pem: &[u8], token: &str) -> Result<Self, ConnectError> {
+        validate_managed_token(token)?;
+        let certs = parse_managed_ca(ca_pem)?;
+        let client = build_managed_client(certs)?;
+        let base = MANAGED_BASE_URL.to_string();
+        let downloads = get_list(&client, &base, token).await?;
+        Ok(Self {
+            client,
+            base_url: base,
+            token: token.to_string(),
+            downloads,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_identity::ManagedIdentity;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn server_config_for(id: &ManagedIdentity) -> Arc<rustls::ServerConfig> {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let leaf_der = CertificateDer::from(id.server_cert_der().to_vec());
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(id.server_key_der().to_vec()));
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf_der], key_der)
+                .expect("server identity"),
+        )
+    }
+
+    fn managed_client_for(id: &ManagedIdentity) -> SurgeClient {
+        let certs = parse_managed_ca(id.ca_cert_pem().as_bytes()).expect("managed CA");
+        let client = build_managed_client(certs).expect("managed client");
+        SurgeClient {
+            client,
+            base_url: MANAGED_BASE_URL.to_string(),
+            token: id.bearer_token().to_owned(),
+            downloads: Vec::new(),
+        }
+    }
+
+    fn read_headers(stream: &mut impl Read) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") && buf.len() < 16 * 1024 {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => buf.push(byte[0]),
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    fn accept_with_deadline(listener: &TcpListener) -> std::net::TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "accept timed out");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_posts_authenticated_request_over_pinned_tls() {
+        let _guard = crate::managed_server::test_port_lock().lock().await;
+        let id = ManagedIdentity::generate().expect("identity");
+        let surge = managed_client_for(&id);
+        let token = id.bearer_token().to_owned();
+        let server_config = server_config_for(&id);
+        let listener = TcpListener::bind("127.0.0.1:1700").expect("bind 1700");
+        let (capture_tx, capture_rx) = mpsc::channel::<(bool, bool)>();
+        let server = thread::spawn(move || {
+            let mut stream = accept_with_deadline(&listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut conn = rustls::ServerConnection::new(server_config).expect("server conn");
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            let request = read_headers(&mut tls);
+            let text = String::from_utf8_lossy(&request);
+            let route_ok = text.starts_with("POST /shutdown HTTP/1.1");
+            let auth_ok = text.to_ascii_lowercase().contains(&format!(
+                "authorization: bearer {}",
+                token.to_ascii_lowercase()
+            ));
+            let body = br#"{"status":"shutting_down"}"#;
+            let response = format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            tls.write_all(response.as_bytes())
+                .expect("response headers");
+            tls.write_all(body).expect("response body");
+            tls.flush().expect("flush");
+            let _ = capture_tx.send((route_ok, auth_ok));
+        });
+
+        surge.shutdown().await.expect("202 must be accepted");
+        let (route_ok, auth_ok) = capture_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured request");
+        server.join().expect("server thread");
+        assert!(route_ok, "shutdown must use POST /shutdown");
+        assert!(auth_ok, "bearer must travel only in Authorization header");
+    }
+
+    #[tokio::test]
+    async fn shutdown_never_reaches_untrusted_tls_identity() {
+        let _guard = crate::managed_server::test_port_lock().lock().await;
+        let client_id = ManagedIdentity::generate().expect("client identity");
+        let server_id = ManagedIdentity::generate().expect("server identity");
+        let surge = managed_client_for(&client_id);
+        let server_config = server_config_for(&server_id);
+        let listener = TcpListener::bind("127.0.0.1:1700").expect("bind 1700");
+        let (capture_tx, capture_rx) = mpsc::channel::<bool>();
+        let server = thread::spawn(move || {
+            let mut stream = accept_with_deadline(&listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut conn = rustls::ServerConnection::new(server_config).expect("server conn");
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            // With the wrong trust anchor the handshake fails before any HTTP
+            // request bytes can be read; `read_headers` returns empty/failed.
+            let request = read_headers(&mut tls);
+            let _ = capture_tx.send(!request.is_empty());
+        });
+
+        let result = surge.shutdown().await;
+        assert!(
+            result.is_err(),
+            "shutdown must not succeed against an untrusted TLS identity"
+        );
+        let request_reached = capture_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured handshake result");
+        server.join().expect("server thread");
+        assert!(
+            !request_reached,
+            "no HTTP request may reach an untrusted listener"
+        );
     }
 }
