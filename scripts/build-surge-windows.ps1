@@ -159,9 +159,9 @@ if (Select-String -Path $Patch -Pattern '^diff --git' -Quiet) {
 Write-Host 'Applying loopback patch strictly (fail closed on mismatch)...'
 Push-Location $SrcDir
 try {
-  & git apply --check --verbose $Patch
+  & git -c core.autocrlf=false apply --check --verbose $Patch
   if ($LASTEXITCODE -ne 0) { throw "git apply --check failed with exit code $LASTEXITCODE" }
-  & git apply --verbose $Patch
+  & git -c core.autocrlf=false apply --verbose $Patch
   if ($LASTEXITCODE -ne 0) { throw "git apply failed with exit code $LASTEXITCODE" }
 } finally {
   Pop-Location
