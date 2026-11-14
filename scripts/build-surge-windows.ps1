@@ -137,11 +137,15 @@ $DiagXdgConfigDirs = Join-Path $DiagnosticState 'xdg-config-dirs'
 $DiagXdgDataDirs = Join-Path $DiagnosticState 'xdg-data-dirs'
 $DiagnosticMarkerFile = Join-Path $RunDir 'diagnostic-marker.txt'
 $DiagnosticPreflightFile = $DiagnosticMarkerFile + '.preflight'
+# Separate sanitized numeric errno marker derived from the existing preflight
+# marker path. Comparison only; the value is bounded to the fixed 16-bit range
+# 0..65535. No raw error text is read or emitted.
+$DiagnosticPreflightErrnoFile = $DiagnosticPreflightFile + '.errno'
 $RunPrefix = $RunDir + [System.IO.Path]::DirectorySeparatorChar
 
 # Never overwrite preexisting data: every per-run path must be absent
 # (a fresh GUID dir guarantees this; presence means a bug or collision).
-foreach ($p in @($Archive, $SrcParent, $SrcDir, $SandboxTmp, $GoTmp, $GoCache, $GoModCache, $GoPathDir, $DiagnosticTestDest, $DiagnosticState, $DiagAppData, $DiagLocalAppData, $DiagUserProfile, $DiagHome, $DiagTemp, $DiagXdgConfig, $DiagXdgState, $DiagXdgData, $DiagXdgCache, $DiagXdgRuntime, $DiagXdgConfigDirs, $DiagXdgDataDirs, $DiagnosticMarkerFile, $DiagnosticPreflightFile)) {
+foreach ($p in @($Archive, $SrcParent, $SrcDir, $SandboxTmp, $GoTmp, $GoCache, $GoModCache, $GoPathDir, $DiagnosticTestDest, $DiagnosticState, $DiagAppData, $DiagLocalAppData, $DiagUserProfile, $DiagHome, $DiagTemp, $DiagXdgConfig, $DiagXdgState, $DiagXdgData, $DiagXdgCache, $DiagXdgRuntime, $DiagXdgConfigDirs, $DiagXdgDataDirs, $DiagnosticMarkerFile, $DiagnosticPreflightFile, $DiagnosticPreflightErrnoFile)) {
   if (-not $p.StartsWith($RunPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Per-run path escaped confinement: $p. Refusing to build."
   }
@@ -470,6 +474,12 @@ if ($DiagnosticEnabled) {
     'CI_DIAG:go_preflight_other_non_syscall',
     'CI_DIAG:go_preflight_other'
   )
+  # Sanitized bounded numeric OS errno evidence, comparison only. The value is
+  # a canonical decimal within the fixed 16-bit range 0..65535; no raw error
+  # text, paths, identity, auth, stdout, or stderr is emitted. This numeric
+  # category describes the synthetic CI preflight only. Missing, invalid, or
+  # failed reads report the fixed unknown.
+  $PreflightWinErr = 'CI_DIAG:preflight_winerr_unknown'
   $proc = $null
   try {
     if (-not (Test-Path -LiteralPath $DiagnosticTest -PathType Leaf)) {
@@ -492,6 +502,12 @@ if ($DiagnosticEnabled) {
     }
     if (Test-Path -LiteralPath $DiagnosticPreflightFile) {
       throw 'diagnostic preflight marker already exists'
+    }
+    if (-not $DiagnosticPreflightErrnoFile.StartsWith($RunPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw 'diagnostic preflight errno marker escaped per-run confinement'
+    }
+    if (Test-Path -LiteralPath $DiagnosticPreflightErrnoFile) {
+      throw 'diagnostic preflight errno marker already exists'
     }
     Copy-Item -LiteralPath $DiagnosticTest -Destination $DiagnosticTestDest -ErrorAction Stop
 
@@ -617,6 +633,38 @@ if ($DiagnosticEnabled) {
       $PreflightMarker = 'CI_DIAG:go_preflight_unknown'
     }
 
+    # Small bounded numeric errno read, comparison only. Accept the separate
+    # "<existing preflight marker>.errno" file ONLY on successful process
+    # completion, and ONLY 1..5 ASCII digit bytes matching the fixed canonical
+    # form. Re-derive the decimal output from the parsed invariant uint; never
+    # echo candidate or arbitrary bytes. Fixed 16-bit bound: 0..65535.
+    if ($Exited -and $proc.ExitCode -eq 0) {
+      if (Test-Path -LiteralPath $DiagnosticPreflightErrnoFile -PathType Leaf) {
+        $errnoInfo = Get-Item -LiteralPath $DiagnosticPreflightErrnoFile
+        if ($errnoInfo.Length -ge 1 -and $errnoInfo.Length -le 5) {
+          $errnoBytes = [System.IO.File]::ReadAllBytes($errnoInfo.FullName)
+          $errnoDigitsOnly = $true
+          foreach ($errnoByte in $errnoBytes) {
+            if ($errnoByte -lt 0x30 -or $errnoByte -gt 0x39) {
+              $errnoDigitsOnly = $false
+              break
+            }
+          }
+          if ($errnoDigitsOnly) {
+            $errnoText = [System.Text.Encoding]::ASCII.GetString($errnoBytes)
+            if ($errnoText -match '^(0|[1-9][0-9]{0,4})$') {
+              $errnoValue = [uint32]0
+              if ([uint32]::TryParse($errnoText, [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$errnoValue)) {
+                if ($errnoValue -le 65535) {
+                  $PreflightWinErr = 'CI_DIAG:preflight_winerr_' + $errnoValue.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     $FoundMarkers = @()
     if ($Exited -and $proc.ExitCode -eq 0) {
       # Small bounded marker read: accept one exact allowlisted literal only.
@@ -666,9 +714,11 @@ if ($DiagnosticEnabled) {
       }
     }
     $DiagnosticMarker = 'CI_DIAG:go_unknown'
+    $PreflightWinErr = 'CI_DIAG:preflight_winerr_unknown'
   }
   Write-Host $DiagnosticMarker
   Write-Host $PreflightMarker
+  Write-Host $PreflightWinErr
 }
 
 Write-Host 'Compiling Surge for windows/amd64 (reproducible flags)...'

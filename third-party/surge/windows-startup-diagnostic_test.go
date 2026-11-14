@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -35,6 +36,11 @@ const surguiDiagnosticMarkerFileEnv = "SURGUI_WINDOWS_DIAGNOSTIC_MARKER_FILE"
 // Fixed suffix for the separate preflight marker, derived from the diagnostic
 // marker path. It is exclusively created before the managed engine starts.
 const surguiDiagnosticPreflightMarkerSuffix = ".preflight"
+
+// Fixed suffix appended to the existing preflight marker path for the
+// sanitized numeric OS errno evidence. Comparison only; the value is bounded
+// to the fixed 16-bit range 0..65535. No raw error text is ever written.
+const surguiDiagnosticPreflightErrnoSuffix = ".errno"
 
 // Exact predeclared category markers. The test writes ONLY one of these
 // literals to the marker file; no raw output, paths, or credentials.
@@ -267,6 +273,49 @@ func emitSurguiWindowsPreflightMarker(category string) {
 	_, _ = f.WriteString(marker)
 }
 
+// surguiWindowsPreflightErrno extracts ONLY a sanitized numeric OS errno from
+// a failed preflight error. errors.As must find a wrapped syscall.Errno and
+// the value must be within the fixed 16-bit bound 0..65535; otherwise it
+// reports false so no errno file is created. It never returns error text,
+// paths, identity, auth, stdout, or stderr. This numeric category describes
+// the synthetic CI preflight only.
+func surguiWindowsPreflightErrno(err error) (uint16, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return 0, false
+	}
+	value := uint64(errno)
+	if value > 65535 {
+		return 0, false
+	}
+	return uint16(value), true
+}
+
+// emitSurguiWindowsPreflightErrno writes ONLY the canonical decimal ASCII
+// digits of a sanitized bounded errno to the exclusive separate
+// "<existing preflight marker>.errno" file. It creates no file when
+// extraction fails, and never writes candidate or arbitrary bytes. All file
+// errors are swallowed; the wrapper then reports the fixed unknown literal.
+func emitSurguiWindowsPreflightErrno(err error) {
+	value, ok := surguiWindowsPreflightErrno(err)
+	if !ok {
+		return
+	}
+	path := os.Getenv(surguiDiagnosticMarkerFileEnv)
+	if path == "" {
+		return
+	}
+	f, openErr := os.OpenFile(path+surguiDiagnosticPreflightMarkerSuffix+surguiDiagnosticPreflightErrnoSuffix, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if openErr != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(strconv.FormatUint(uint64(value), 10))
+}
+
 // classifySurguiWindowsSocketError maps an error to exactly one fixed socket
 // category. Known Windows syscall errnos map to fixed literals; any other
 // syscall errno maps to other_syscall via errors.As. Address and DNS errors
@@ -331,6 +380,7 @@ func runSurguiWindowsStartupPreflight() {
 	ln, err := net.Listen("tcp", "127.0.0.1:47531")
 	if err != nil {
 		emitSurguiWindowsPreflightMarker(classifySurguiWindowsPreflightError(err))
+		emitSurguiWindowsPreflightErrno(err)
 		return
 	}
 	_ = ln.Close()
@@ -517,8 +567,10 @@ func TestWindowsStartupDiagnostic(t *testing.T) {
 }
 
 // TestSurguiWindowsSocketErrorClassification verifies the shared classifier on
-// wrapped representative errnos and non-syscall errors. Assertions contain
-// only fixed category literals; no error details are included.
+// wrapped representative errnos and non-syscall errors, plus focused
+// extraction of a sanitized bounded preflight errno. Assertions contain only
+// fixed category literals and bounded numeric values; no error details are
+// included.
 func TestSurguiWindowsSocketErrorClassification(t *testing.T) {
 	tests := []struct {
 		name string
@@ -540,6 +592,30 @@ func TestSurguiWindowsSocketErrorClassification(t *testing.T) {
 			got := classifySurguiWindowsSocketError(tt.err)
 			if got != tt.want {
 				t.Fatalf("unexpected category: got %q want %q", got, tt.want)
+			}
+		})
+	}
+
+	// Focused extraction tests: only a wrapped syscall.Errno within the fixed
+	// 16-bit bound 0..65535 is accepted. Non-errno and out-of-range values must
+	// report false so no errno marker file is created. Comparison only; no raw
+	// error text is asserted or emitted.
+	extractTests := []struct {
+		name   string
+		err    error
+		want   uint16
+		wantOK bool
+	}{
+		{"extract_wrapped_errno", fmt.Errorf("wrapped: %w", syscall.Errno(10099)), 10099, true},
+		{"extract_non_errno", fmt.Errorf("wrapped: %w", errors.New("plain test error")), 0, false},
+		{"extract_errno_above_65535", fmt.Errorf("wrapped: %w", syscall.Errno(65536)), 0, false},
+	}
+	for _, tt := range extractTests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := surguiWindowsPreflightErrno(tt.err)
+			if ok != tt.wantOK || (ok && got != tt.want) {
+				t.Fatalf("unexpected errno extraction: got=%d ok=%t want=%d wantOK=%t", got, ok, tt.want, tt.wantOK)
 			}
 		})
 	}
