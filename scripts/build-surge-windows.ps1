@@ -433,6 +433,19 @@ if ($DiagnosticEnabled) {
     'CI_DIAG:go_startup_bind_addr_in_use',
     'CI_DIAG:go_startup_bind_access_denied',
     'CI_DIAG:go_startup_bind_other',
+    'CI_DIAG:go_startup_bind_address_unavailable',
+    'CI_DIAG:go_startup_bind_network_down',
+    'CI_DIAG:go_startup_bind_address_family_unsupported',
+    'CI_DIAG:go_startup_bind_invalid_argument',
+    'CI_DIAG:go_startup_bind_socket_limit',
+    'CI_DIAG:go_startup_bind_no_buffer_space',
+    'CI_DIAG:go_startup_bind_winsock_not_ready',
+    'CI_DIAG:go_startup_bind_winsock_version',
+    'CI_DIAG:go_startup_bind_winsock_uninitialized',
+    'CI_DIAG:go_startup_bind_other_syscall',
+    'CI_DIAG:go_startup_bind_addr_error',
+    'CI_DIAG:go_startup_bind_dns_error',
+    'CI_DIAG:go_startup_bind_other_non_syscall',
     'CI_DIAG:go_startup_serve',
     'CI_DIAG:go_startup_other',
     'CI_DIAG:go_startup_not_ready'
@@ -442,6 +455,19 @@ if ($DiagnosticEnabled) {
     'CI_DIAG:go_preflight_free',
     'CI_DIAG:go_preflight_address_in_use',
     'CI_DIAG:go_preflight_access_denied',
+    'CI_DIAG:go_preflight_address_unavailable',
+    'CI_DIAG:go_preflight_network_down',
+    'CI_DIAG:go_preflight_address_family_unsupported',
+    'CI_DIAG:go_preflight_invalid_argument',
+    'CI_DIAG:go_preflight_socket_limit',
+    'CI_DIAG:go_preflight_no_buffer_space',
+    'CI_DIAG:go_preflight_winsock_not_ready',
+    'CI_DIAG:go_preflight_winsock_version',
+    'CI_DIAG:go_preflight_winsock_uninitialized',
+    'CI_DIAG:go_preflight_other_syscall',
+    'CI_DIAG:go_preflight_addr_error',
+    'CI_DIAG:go_preflight_dns_error',
+    'CI_DIAG:go_preflight_other_non_syscall',
     'CI_DIAG:go_preflight_other'
   )
   $proc = $null
@@ -473,7 +499,7 @@ if ($DiagnosticEnabled) {
     $psi.FileName = 'go'
     # No quoting is needed inside this argument string: none of these arguments
     # contain spaces, and ProcessStartInfo passes it directly without a shell.
-    $psi.Arguments = 'test -p=1 -run=^TestWindowsStartupDiagnostic$ -count=1 -timeout=45s -v ./cmd/'
+    $psi.Arguments = 'test -p=1 -run=^(TestWindowsStartupDiagnostic|TestSurguiWindowsSocketErrorClassification)$ -count=1 -timeout=45s -v ./cmd/'
     $psi.WorkingDirectory = $SrcDir
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true

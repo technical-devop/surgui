@@ -64,6 +64,77 @@ const (
 	surguiDiagnosticMarkerPreflightOther        = "CI_DIAG:go_preflight_other"
 )
 
+// Additional fixed startup bind markers for the refined shared socket
+// classifier. Each marker is a static literal selected explicitly.
+const (
+	surguiDiagnosticMarkerBindAddressUnavailable       = "CI_DIAG:go_startup_bind_address_unavailable"
+	surguiDiagnosticMarkerBindNetworkDown              = "CI_DIAG:go_startup_bind_network_down"
+	surguiDiagnosticMarkerBindAddressFamilyUnsupported = "CI_DIAG:go_startup_bind_address_family_unsupported"
+	surguiDiagnosticMarkerBindInvalidArgument          = "CI_DIAG:go_startup_bind_invalid_argument"
+	surguiDiagnosticMarkerBindSocketLimit              = "CI_DIAG:go_startup_bind_socket_limit"
+	surguiDiagnosticMarkerBindNoBufferSpace            = "CI_DIAG:go_startup_bind_no_buffer_space"
+	surguiDiagnosticMarkerBindWinsockNotReady          = "CI_DIAG:go_startup_bind_winsock_not_ready"
+	surguiDiagnosticMarkerBindWinsockVersion           = "CI_DIAG:go_startup_bind_winsock_version"
+	surguiDiagnosticMarkerBindWinsockUninitialized     = "CI_DIAG:go_startup_bind_winsock_uninitialized"
+	surguiDiagnosticMarkerBindOtherSyscall             = "CI_DIAG:go_startup_bind_other_syscall"
+	surguiDiagnosticMarkerBindAddrError                = "CI_DIAG:go_startup_bind_addr_error"
+	surguiDiagnosticMarkerBindDNSError                 = "CI_DIAG:go_startup_bind_dns_error"
+	surguiDiagnosticMarkerBindOtherNonSyscall          = "CI_DIAG:go_startup_bind_other_non_syscall"
+)
+
+// Additional fixed preflight markers for the refined shared socket classifier.
+const (
+	surguiDiagnosticMarkerPreflightAddressUnavailable       = "CI_DIAG:go_preflight_address_unavailable"
+	surguiDiagnosticMarkerPreflightNetworkDown              = "CI_DIAG:go_preflight_network_down"
+	surguiDiagnosticMarkerPreflightAddressFamilyUnsupported = "CI_DIAG:go_preflight_address_family_unsupported"
+	surguiDiagnosticMarkerPreflightInvalidArgument          = "CI_DIAG:go_preflight_invalid_argument"
+	surguiDiagnosticMarkerPreflightSocketLimit              = "CI_DIAG:go_preflight_socket_limit"
+	surguiDiagnosticMarkerPreflightNoBufferSpace            = "CI_DIAG:go_preflight_no_buffer_space"
+	surguiDiagnosticMarkerPreflightWinsockNotReady          = "CI_DIAG:go_preflight_winsock_not_ready"
+	surguiDiagnosticMarkerPreflightWinsockVersion           = "CI_DIAG:go_preflight_winsock_version"
+	surguiDiagnosticMarkerPreflightWinsockUninitialized     = "CI_DIAG:go_preflight_winsock_uninitialized"
+	surguiDiagnosticMarkerPreflightOtherSyscall             = "CI_DIAG:go_preflight_other_syscall"
+	surguiDiagnosticMarkerPreflightAddrError                = "CI_DIAG:go_preflight_addr_error"
+	surguiDiagnosticMarkerPreflightDNSError                 = "CI_DIAG:go_preflight_dns_error"
+	surguiDiagnosticMarkerPreflightOtherNonSyscall          = "CI_DIAG:go_preflight_other_non_syscall"
+)
+
+// Fixed Windows socket errno values classified by the shared function.
+const (
+	surguiWindowsSocketErrnoAddressInUse             = syscall.Errno(10048)
+	surguiWindowsSocketErrnoAccessDenied             = syscall.Errno(10013)
+	surguiWindowsSocketErrnoAddressUnavailable       = syscall.Errno(10049)
+	surguiWindowsSocketErrnoNetworkDown              = syscall.Errno(10050)
+	surguiWindowsSocketErrnoAddressFamilyUnsupported = syscall.Errno(10047)
+	surguiWindowsSocketErrnoInvalidArgument          = syscall.Errno(10022)
+	surguiWindowsSocketErrnoSocketLimit              = syscall.Errno(10024)
+	surguiWindowsSocketErrnoNoBufferSpace            = syscall.Errno(10055)
+	surguiWindowsSocketErrnoWinsockNotReady          = syscall.Errno(10091)
+	surguiWindowsSocketErrnoWinsockVersion           = syscall.Errno(10092)
+	surguiWindowsSocketErrnoWinsockUninitialized     = syscall.Errno(10093)
+)
+
+// Fixed socket-error category literals returned by the shared classifier.
+// These are the only category values; emitters map them to fixed markers.
+const (
+	surguiSocketCategoryFree                     = "free"
+	surguiSocketCategoryAddressInUse             = "address_in_use"
+	surguiSocketCategoryAccessDenied             = "access_denied"
+	surguiSocketCategoryAddressUnavailable       = "address_unavailable"
+	surguiSocketCategoryNetworkDown              = "network_down"
+	surguiSocketCategoryAddressFamilyUnsupported = "address_family_unsupported"
+	surguiSocketCategoryInvalidArgument          = "invalid_argument"
+	surguiSocketCategorySocketLimit              = "socket_limit"
+	surguiSocketCategoryNoBufferSpace            = "no_buffer_space"
+	surguiSocketCategoryWinsockNotReady          = "winsock_not_ready"
+	surguiSocketCategoryWinsockVersion           = "winsock_version"
+	surguiSocketCategoryWinsockUninitialized     = "winsock_uninitialized"
+	surguiSocketCategoryOtherSyscall             = "other_syscall"
+	surguiSocketCategoryAddrError                = "addr_error"
+	surguiSocketCategoryDNSError                 = "dns_error"
+	surguiSocketCategoryOtherNonSyscall          = "other_non_syscall"
+)
+
 // emitSurguiWindowsDiagnosticMarker selects one fixed literal via an explicit
 // category switch and writes ONLY that literal to the marker file. All
 // unknown categories map to the fixed other literal. All file errors are
@@ -88,12 +159,36 @@ func emitSurguiWindowsDiagnosticMarker(category string) {
 		marker = surguiDiagnosticMarkerBind
 	case "bind_invalid":
 		marker = surguiDiagnosticMarkerBindInvalid
-	case "bind_addr_in_use":
+	case surguiSocketCategoryAddressInUse:
 		marker = surguiDiagnosticMarkerBindAddrInUse
-	case "bind_access_denied":
+	case surguiSocketCategoryAccessDenied:
 		marker = surguiDiagnosticMarkerBindDenied
-	case "bind_other":
-		marker = surguiDiagnosticMarkerBindOther
+	case surguiSocketCategoryAddressUnavailable:
+		marker = surguiDiagnosticMarkerBindAddressUnavailable
+	case surguiSocketCategoryNetworkDown:
+		marker = surguiDiagnosticMarkerBindNetworkDown
+	case surguiSocketCategoryAddressFamilyUnsupported:
+		marker = surguiDiagnosticMarkerBindAddressFamilyUnsupported
+	case surguiSocketCategoryInvalidArgument:
+		marker = surguiDiagnosticMarkerBindInvalidArgument
+	case surguiSocketCategorySocketLimit:
+		marker = surguiDiagnosticMarkerBindSocketLimit
+	case surguiSocketCategoryNoBufferSpace:
+		marker = surguiDiagnosticMarkerBindNoBufferSpace
+	case surguiSocketCategoryWinsockNotReady:
+		marker = surguiDiagnosticMarkerBindWinsockNotReady
+	case surguiSocketCategoryWinsockVersion:
+		marker = surguiDiagnosticMarkerBindWinsockVersion
+	case surguiSocketCategoryWinsockUninitialized:
+		marker = surguiDiagnosticMarkerBindWinsockUninitialized
+	case surguiSocketCategoryOtherSyscall:
+		marker = surguiDiagnosticMarkerBindOtherSyscall
+	case surguiSocketCategoryAddrError:
+		marker = surguiDiagnosticMarkerBindAddrError
+	case surguiSocketCategoryDNSError:
+		marker = surguiDiagnosticMarkerBindDNSError
+	case surguiSocketCategoryOtherNonSyscall:
+		marker = surguiDiagnosticMarkerBindOtherNonSyscall
 	case "serve":
 		marker = surguiDiagnosticMarkerServe
 	case "not_ready":
@@ -123,12 +218,38 @@ func emitSurguiWindowsDiagnosticMarker(category string) {
 func emitSurguiWindowsPreflightMarker(category string) {
 	var marker string
 	switch category {
-	case "free":
+	case surguiSocketCategoryFree:
 		marker = surguiDiagnosticMarkerPreflightFree
-	case "address_in_use":
+	case surguiSocketCategoryAddressInUse:
 		marker = surguiDiagnosticMarkerPreflightAddrInUse
-	case "access_denied":
+	case surguiSocketCategoryAccessDenied:
 		marker = surguiDiagnosticMarkerPreflightAccessDenied
+	case surguiSocketCategoryAddressUnavailable:
+		marker = surguiDiagnosticMarkerPreflightAddressUnavailable
+	case surguiSocketCategoryNetworkDown:
+		marker = surguiDiagnosticMarkerPreflightNetworkDown
+	case surguiSocketCategoryAddressFamilyUnsupported:
+		marker = surguiDiagnosticMarkerPreflightAddressFamilyUnsupported
+	case surguiSocketCategoryInvalidArgument:
+		marker = surguiDiagnosticMarkerPreflightInvalidArgument
+	case surguiSocketCategorySocketLimit:
+		marker = surguiDiagnosticMarkerPreflightSocketLimit
+	case surguiSocketCategoryNoBufferSpace:
+		marker = surguiDiagnosticMarkerPreflightNoBufferSpace
+	case surguiSocketCategoryWinsockNotReady:
+		marker = surguiDiagnosticMarkerPreflightWinsockNotReady
+	case surguiSocketCategoryWinsockVersion:
+		marker = surguiDiagnosticMarkerPreflightWinsockVersion
+	case surguiSocketCategoryWinsockUninitialized:
+		marker = surguiDiagnosticMarkerPreflightWinsockUninitialized
+	case surguiSocketCategoryOtherSyscall:
+		marker = surguiDiagnosticMarkerPreflightOtherSyscall
+	case surguiSocketCategoryAddrError:
+		marker = surguiDiagnosticMarkerPreflightAddrError
+	case surguiSocketCategoryDNSError:
+		marker = surguiDiagnosticMarkerPreflightDNSError
+	case surguiSocketCategoryOtherNonSyscall:
+		marker = surguiDiagnosticMarkerPreflightOtherNonSyscall
 	case "other":
 		marker = surguiDiagnosticMarkerPreflightOther
 	default:
@@ -146,19 +267,60 @@ func emitSurguiWindowsPreflightMarker(category string) {
 	_, _ = f.WriteString(marker)
 }
 
-// classifySurguiWindowsPreflightError maps only fixed Windows socket errors to
-// a static category using errors.Is. It never returns or prints raw values.
-func classifySurguiWindowsPreflightError(err error) string {
-	switch {
-	case err == nil:
-		return "free"
-	case errors.Is(err, syscall.Errno(10048)):
-		return "address_in_use"
-	case errors.Is(err, syscall.Errno(10013)):
-		return "access_denied"
-	default:
-		return "other"
+// classifySurguiWindowsSocketError maps an error to exactly one fixed socket
+// category. Known Windows syscall errnos map to fixed literals; any other
+// syscall errno maps to other_syscall via errors.As. Address and DNS errors
+// map to addr_error and dns_error; all remaining errors map to
+// other_non_syscall. It never returns or prints dynamic error text.
+func classifySurguiWindowsSocketError(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case surguiWindowsSocketErrnoAddressInUse:
+			return surguiSocketCategoryAddressInUse
+		case surguiWindowsSocketErrnoAccessDenied:
+			return surguiSocketCategoryAccessDenied
+		case surguiWindowsSocketErrnoAddressUnavailable:
+			return surguiSocketCategoryAddressUnavailable
+		case surguiWindowsSocketErrnoNetworkDown:
+			return surguiSocketCategoryNetworkDown
+		case surguiWindowsSocketErrnoAddressFamilyUnsupported:
+			return surguiSocketCategoryAddressFamilyUnsupported
+		case surguiWindowsSocketErrnoInvalidArgument:
+			return surguiSocketCategoryInvalidArgument
+		case surguiWindowsSocketErrnoSocketLimit:
+			return surguiSocketCategorySocketLimit
+		case surguiWindowsSocketErrnoNoBufferSpace:
+			return surguiSocketCategoryNoBufferSpace
+		case surguiWindowsSocketErrnoWinsockNotReady:
+			return surguiSocketCategoryWinsockNotReady
+		case surguiWindowsSocketErrnoWinsockVersion:
+			return surguiSocketCategoryWinsockVersion
+		case surguiWindowsSocketErrnoWinsockUninitialized:
+			return surguiSocketCategoryWinsockUninitialized
+		default:
+			return surguiSocketCategoryOtherSyscall
+		}
 	}
+	var addrErr *net.AddrError
+	if errors.As(err, &addrErr) {
+		return surguiSocketCategoryAddrError
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return surguiSocketCategoryDNSError
+	}
+	return surguiSocketCategoryOtherNonSyscall
+}
+
+// classifySurguiWindowsPreflightError maps the preflight listen error to the
+// shared fixed socket category, preserving the dedicated free category. It
+// never returns or prints raw values.
+func classifySurguiWindowsPreflightError(err error) string {
+	if err == nil {
+		return surguiSocketCategoryFree
+	}
+	return classifySurguiWindowsSocketError(err)
 }
 
 // runSurguiWindowsStartupPreflight directly probes the fixed diagnostic port
@@ -175,17 +337,10 @@ func runSurguiWindowsStartupPreflight() {
 	emitSurguiWindowsPreflightMarker(classifySurguiWindowsPreflightError(nil))
 }
 
-// classifySurguiWindowsBindError maps a managed-server bind error to a fixed
-// category using errors.Is. It never returns or prints the original error.
+// classifySurguiWindowsBindError maps a managed-server bind error to the
+// shared fixed socket category. It never returns or prints the original error.
 func classifySurguiWindowsBindError(err error) string {
-	switch {
-	case errors.Is(err, syscall.Errno(10048)):
-		return "bind_addr_in_use"
-	case errors.Is(err, syscall.Errno(10013)):
-		return "bind_access_denied"
-	default:
-		return "bind_other"
-	}
+	return classifySurguiWindowsSocketError(err)
 }
 
 // classifySurguiWindowsStartupError maps only known, fixed error prefixes to a
@@ -359,4 +514,33 @@ func TestWindowsStartupDiagnostic(t *testing.T) {
 		return
 	}
 	emitSurguiWindowsDiagnosticMarker(classifySurguiWindowsStartupError(runErr))
+}
+
+// TestSurguiWindowsSocketErrorClassification verifies the shared classifier on
+// wrapped representative errnos and non-syscall errors. Assertions contain
+// only fixed category literals; no error details are included.
+func TestSurguiWindowsSocketErrorClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"wrapped_address_in_use", fmt.Errorf("wrapped: %w", syscall.Errno(10048)), surguiSocketCategoryAddressInUse},
+		{"wrapped_access_denied", fmt.Errorf("wrapped: %w", syscall.Errno(10013)), surguiSocketCategoryAccessDenied},
+		{"wrapped_address_unavailable", fmt.Errorf("wrapped: %w", syscall.Errno(10049)), surguiSocketCategoryAddressUnavailable},
+		{"wrapped_winsock_not_ready", fmt.Errorf("wrapped: %w", syscall.Errno(10091)), surguiSocketCategoryWinsockNotReady},
+		{"wrapped_unknown_errno", fmt.Errorf("wrapped: %w", syscall.Errno(10099)), surguiSocketCategoryOtherSyscall},
+		{"wrapped_addr_error", fmt.Errorf("wrapped: %w", &net.AddrError{Err: "test", Addr: "test"}), surguiSocketCategoryAddrError},
+		{"wrapped_dns_error", fmt.Errorf("wrapped: %w", &net.DNSError{Err: "test", Name: "test"}), surguiSocketCategoryDNSError},
+		{"wrapped_non_syscall", fmt.Errorf("wrapped: %w", errors.New("plain test error")), surguiSocketCategoryOtherNonSyscall},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifySurguiWindowsSocketError(tt.err)
+			if got != tt.want {
+				t.Fatalf("unexpected category: got %q want %q", got, tt.want)
+			}
+		})
+	}
 }
