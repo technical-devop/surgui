@@ -130,6 +130,10 @@ pub enum ManagedError {
     UnsupportedPlatform,
     Resource,
     Paths,
+    InvalidInput,
+    Identity,
+    Process,
+    Readiness,
     AlreadyStarted,
     Superseded,
     Retry,
@@ -150,6 +154,10 @@ impl fmt::Display for ManagedError {
             Self::UnsupportedPlatform => "managed daemon unavailable on this platform",
             Self::Resource => "managed daemon resource unavailable",
             Self::Paths => "managed daemon state path unavailable",
+            Self::InvalidInput => "managed daemon invalid input",
+            Self::Identity => "managed daemon identity stage failed",
+            Self::Process => "managed daemon process stage failed",
+            Self::Readiness => "managed daemon readiness stage failed",
             Self::AlreadyStarted => "managed daemon already started",
             Self::Superseded => "managed daemon start was superseded",
             Self::Retry => "managed daemon is retiring; retry the start",
@@ -167,6 +175,10 @@ impl ManagedError {
             Self::UnsupportedPlatform => "UnsupportedPlatform",
             Self::Resource => "Resource",
             Self::Paths => "Paths",
+            Self::InvalidInput => "InvalidInput",
+            Self::Identity => "Identity",
+            Self::Process => "Process",
+            Self::Readiness => "Readiness",
             Self::AlreadyStarted => "AlreadyStarted",
             Self::Superseded => "Superseded",
             Self::Retry => "Retry",
@@ -178,6 +190,20 @@ impl ManagedError {
 }
 
 impl std::error::Error for ManagedError {}
+
+impl From<crate::managed_server::ManagedStartupStage> for ManagedError {
+    fn from(stage: crate::managed_server::ManagedStartupStage) -> Self {
+        use crate::managed_server::ManagedStartupStage;
+        match stage {
+            ManagedStartupStage::InvalidInput => Self::InvalidInput,
+            ManagedStartupStage::UnsupportedPlatform => Self::UnsupportedPlatform,
+            ManagedStartupStage::Paths => Self::Paths,
+            ManagedStartupStage::Identity => Self::Identity,
+            ManagedStartupStage::Process => Self::Process,
+            ManagedStartupStage::Readiness => Self::Readiness,
+        }
+    }
+}
 
 impl From<ConnectError> for BridgeError {
     fn from(err: ConnectError) -> Self {
@@ -1207,7 +1233,7 @@ async fn start_managed_at_with_owner(
     }
     let server = match started {
         Some(Ok(server)) => server,
-        Some(Err(_)) => return Err(ManagedError::Startup),
+        Some(Err(error)) => return Err(ManagedError::from(error.stage())),
         None => return Err(ManagedError::ShuttingDown),
     };
     let result = manager.finish_managed_start(ticket, server);
@@ -1410,6 +1436,13 @@ mod tests {
             .and_then(|state| state.managed.as_ref().map(|server| server.pid()))
     }
 
+    #[cfg(target_os = "linux")]
+    fn read_pidfile(pidfile: &Path) -> Option<u32> {
+        std::fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    }
+
     fn claim(manager: &ConnectionManager) -> ManagedStartTicket {
         let (ticket, retired) = manager.begin_managed_start().expect("managed start claim");
         assert!(
@@ -1417,6 +1450,66 @@ mod tests {
             "a fresh manager must not retire a server"
         );
         ticket
+    }
+
+    const HOSTILE_INPUT_MARKERS: &[&str] = &[
+        "sk_live_",
+        "Bearer ",
+        "BEGIN PRIVATE KEY",
+        "BEGIN CERTIFICATE",
+        "alice@example.com",
+        "alice",
+        "SURGUI_AUTH_TOKEN",
+        "SURGUI_TLS_KEY_PEM",
+        "--token",
+        "surgui-managed-server",
+        "Permission denied",
+        "os error",
+    ];
+
+    fn assert_managed_stage_code(
+        error: &ManagedError,
+        expected_debug: &str,
+        expected_json: &str,
+        extra_forbidden: &[&str],
+    ) {
+        let display = format!("{error}");
+        let debug = format!("{error:?}");
+        let json = serde_json::to_string(error).expect("serialize managed error");
+        assert_eq!(
+            debug, expected_debug,
+            "stage code must be fixed and specific"
+        );
+        assert_eq!(
+            json,
+            format!("\"{expected_json}\""),
+            "serialized code must stay fixed"
+        );
+        for marker in extra_forbidden.iter().chain(HOSTILE_INPUT_MARKERS.iter()) {
+            let marker = *marker;
+            assert!(
+                !display.contains(marker),
+                "Display leaked {marker:?}: {display}"
+            );
+            assert!(!debug.contains(marker), "Debug leaked {marker:?}: {debug}");
+            assert!(
+                !json.contains(marker),
+                "serialized code leaked {marker:?}: {json}"
+            );
+        }
+        for text in [&display, &debug, &json] {
+            assert!(!text.contains('/'), "error text leaked a path: {text}");
+            assert!(!text.contains('\\'), "error text leaked a path: {text}");
+        }
+    }
+
+    fn assert_managed_failure_closed(manager: &ConnectionManager) {
+        let state = manager.state.lock().unwrap();
+        assert!(!state.starting, "failed start must release the claim");
+        assert!(
+            state.managed.is_none(),
+            "failed start must not install a server"
+        );
     }
 
     #[test]
@@ -1525,6 +1618,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn managed_stage_resource_resolution_is_sanitized_and_fixed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = fresh_dir("resource-resolution-secret");
+        let hostile = "sk_live_TOKEN_alice@example.com-Bearer BEGIN PRIVATE KEY";
+        let target = root.join(hostile);
+        std::fs::write(&target, b"fixture").expect("write hostile fixture");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod hostile fixture");
+        let link = root.join("surge-link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let root_text = root.to_string_lossy().into_owned();
+        let target_text = target.to_string_lossy().into_owned();
+
+        let error = validate_managed_binary(&link, &root, "surge-link").unwrap_err();
+        assert_managed_stage_code(&error, "Resource", "resource", &[&root_text, &target_text]);
+
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn app_data_dir_creation_is_non_recursive_and_rejects_symlinks() {
         let root = fresh_dir("app-data");
         let child = root.join("child");
@@ -1625,26 +1740,62 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn startup_failure_releases_claim_without_spawning() {
-        let root = fresh_dir("startup-failure");
+    async fn managed_stage_process_launch_failure_is_sanitized_and_fails_closed() {
+        let root = fresh_dir("process-launch-failure");
         let home = root.join("home");
         std::fs::create_dir(&home).expect("create home");
-        let binary = root.join("missing-managed-daemon");
+        let binary = root.join("missing-managed-daemon-sk_live_TOKEN_alice@example.com");
         let state_dir = root.join("state");
+        let binary_text = binary.to_string_lossy().into_owned();
+        let root_text = root.to_string_lossy().into_owned();
 
         let manager = ConnectionManager::default();
         let error = start_managed_at(&manager, &binary, &state_dir, &home)
             .await
             .unwrap_err();
-        assert_eq!(error, ManagedError::Startup);
+        assert_managed_stage_code(&error, "Process", "process", &[&binary_text, &root_text]);
 
         let retry = claim(&manager);
         manager.abort_managed_start(retry);
+        assert_managed_failure_closed(&manager);
 
-        let state = manager.state.lock().unwrap();
-        assert!(!state.starting);
-        assert!(state.managed.is_none());
-        drop(state);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_stage_state_preparation_failure_is_sanitized_and_fails_closed() {
+        let root = fresh_dir("state-preparation-failure");
+        let home = root.join("home");
+        std::fs::create_dir(&home).expect("create home");
+        let binary = root.join("missing-managed-daemon-sk_live_TOKEN_alice@example.com");
+        let state_dir = root.join("state-sk_live_TOKEN_alice@example.com");
+        std::fs::write(&state_dir, b"not a directory").expect("write hostile state fixture");
+        let binary_text = binary.to_string_lossy().into_owned();
+        let state_text = state_dir.to_string_lossy().into_owned();
+        let root_text = root.to_string_lossy().into_owned();
+
+        let manager = ConnectionManager::default();
+        let error = start_managed_at_with_owner(
+            &manager,
+            &binary,
+            &state_dir,
+            &home,
+            Duration::from_millis(200),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_managed_stage_code(
+            &error,
+            "Paths",
+            "paths",
+            &[&binary_text, &state_text, &root_text],
+        );
+
+        let retry = claim(&manager);
+        manager.abort_managed_start(retry);
+        assert_managed_failure_closed(&manager);
 
         remove_all_best_effort(&root);
     }
@@ -1935,6 +2086,47 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_stage_readiness_failure_is_sanitized_and_reaps_owned_child() {
+        let _guard = port_lock().lock().await;
+        let root = fresh_dir("readiness-failure");
+        let home = root.join("home");
+        std::fs::create_dir(&home).expect("create home");
+        let state_dir = root.join("state");
+        let pidfile = root.join("child.pid");
+        let script = write_sleeping_fixture(&root, &pidfile);
+        let script_text = script.to_string_lossy().into_owned();
+        let root_text = root.to_string_lossy().into_owned();
+
+        let manager = ConnectionManager::default();
+        let error = start_managed_at_with_owner(
+            &manager,
+            &script,
+            &state_dir,
+            &home,
+            std::time::Duration::from_millis(250),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_managed_stage_code(
+            &error,
+            "Readiness",
+            "readiness",
+            &[&script_text, &root_text],
+        );
+
+        let pid = read_pidfile(&pidfile).expect("fixture child must have spawned");
+        assert!(
+            wait_pid_dead(pid, std::time::Duration::from_secs(10)).await,
+            "failed readiness must reap only the owned child"
+        );
+        assert_managed_failure_closed(&manager);
+
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_start_blocks_restart_and_app_drain_until_owner_reaped() {
         let _guard = port_lock().lock().await;
@@ -1961,7 +2153,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error, ManagedError::Startup);
+        assert_managed_stage_code(&error, "Readiness", "readiness", &[]);
         wait_for_retirement(&manager, 1).await;
         let old_pid = std::fs::read_to_string(&pidfile)
             .ok()

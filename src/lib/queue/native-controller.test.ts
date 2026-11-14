@@ -858,6 +858,41 @@ describe("NativeQueueController managed start", () => {
     }
   });
 
+  it("startManaged maps fixed camelCase rejection codes to exact Code suffix and sanitizes unknown secret", async () => {
+    const fixedCodes = ["resource", "paths", "identity", "process", "readiness", "invalidInput", "unsupportedPlatform"];
+    for (const code of fixedCodes) {
+      const { invoke } = makeInvoke((command) => {
+        if (command === "start_managed_surge") throw code;
+        throw new Error(`unexpected command: ${command}`);
+      });
+      const c = new NativeQueueController(invoke, () => {}, 60_000);
+      try {
+        const ok = await c.startManaged();
+        assert.equal(ok, false);
+        assert.equal(c.state.phase, "error");
+        assert.equal(c.state.error, `Could not start the bundled daemon. Code: ${code}.`);
+      } finally {
+        c.dispose();
+      }
+    }
+    const rawSecret = "raw-managed-secret-unknown-7f3a-/secret/xyz-9f3a";
+    const { invoke: unknownInvoke } = makeInvoke((command) => {
+      if (command === "start_managed_surge") throw rawSecret;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const cu = new NativeQueueController(unknownInvoke, () => {}, 60_000);
+    try {
+      const ok = await cu.startManaged();
+      assert.equal(ok, false);
+      assert.equal(cu.state.phase, "error");
+      assert.equal(cu.state.error, "Could not start the bundled daemon. Try again.");
+      assert.ok(!cu.state.error.includes(rawSecret), "error must not echo raw secret");
+      assert.ok(!JSON.stringify(cu.state).includes(rawSecret), "state must not echo raw secret");
+    } finally {
+      cu.dispose();
+    }
+  });
+
   it("same-epoch duplicate startManaged issues exactly one IPC and second reports false", async () => {
     let releaseStart = null;
     let startCount = 0;

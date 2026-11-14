@@ -200,10 +200,51 @@ impl fmt::Display for ManagedServerError {
     }
 }
 
+/// Fixed, sanitized classification of the startup stage that was observed to
+/// fail. It carries only the stage label, never paths, environment values,
+/// identity material, or operating-system text, so callers can map it to an
+/// external code without exposing raw data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedStartupStage {
+    InvalidInput,
+    UnsupportedPlatform,
+    Paths,
+    Identity,
+    Process,
+    Readiness,
+}
+
+impl ManagedStartupStage {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "InvalidInput",
+            Self::UnsupportedPlatform => "UnsupportedPlatform",
+            Self::Paths => "Paths",
+            Self::Identity => "Identity",
+            Self::Process => "Process",
+            Self::Readiness => "Readiness",
+        }
+    }
+}
+
+impl ManagedServerError {
+    /// Observed startup stage only; the underlying cause is intentionally not
+    /// retained or claimed.
+    pub(crate) fn stage(&self) -> ManagedStartupStage {
+        match self.kind {
+            ErrorKind::InvalidInput => ManagedStartupStage::InvalidInput,
+            ErrorKind::UnsupportedPlatform => ManagedStartupStage::UnsupportedPlatform,
+            ErrorKind::State => ManagedStartupStage::Paths,
+            ErrorKind::Identity => ManagedStartupStage::Identity,
+            ErrorKind::Spawn => ManagedStartupStage::Process,
+            ErrorKind::Startup => ManagedStartupStage::Readiness,
+        }
+    }
+}
+
 impl fmt::Debug for ManagedServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = self.kind;
-        f.write_str("ManagedServerError { ..redacted.. }")
+        f.write_str(self.stage().code())
     }
 }
 
@@ -1560,9 +1601,13 @@ mod tests {
     use std::ffi::OsStr;
     #[cfg(target_os = "linux")]
     use std::sync::atomic::AtomicU64;
+    #[cfg(windows)]
+    use std::sync::atomic::AtomicU64;
 
     #[cfg(target_os = "linux")]
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    #[cfg(windows)]
+    static WINDOWS_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(target_os = "linux")]
     fn port_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1657,6 +1702,103 @@ mod tests {
         !pid_alive(pid)
     }
 
+    const HOSTILE_INPUT_MARKERS: &[&str] = &[
+        "sk_live_",
+        "Bearer ",
+        "BEGIN PRIVATE KEY",
+        "BEGIN CERTIFICATE",
+        "alice@example.com",
+        "alice",
+        "SURGUI_AUTH_TOKEN",
+        "SURGUI_TLS_KEY_PEM",
+        "--token",
+        "surgui-managed-server",
+        "Permission denied",
+        "os error",
+    ];
+
+    fn assert_stage_code(error: &ManagedServerError, expected: &str) {
+        let display = format!("{error}");
+        let debug = format!("{error:?}");
+        assert_eq!(debug, expected, "stage code must be fixed and specific");
+        for marker in HOSTILE_INPUT_MARKERS {
+            let marker = *marker;
+            assert!(
+                !display.contains(marker),
+                "Display leaked {marker:?}: {display}"
+            );
+            assert!(!debug.contains(marker), "Debug leaked {marker:?}: {debug}");
+        }
+        for text in [&display, &debug] {
+            assert!(!text.contains('/'), "error text leaked a path: {text}");
+            assert!(!text.contains('\\'), "error text leaked a path: {text}");
+        }
+    }
+
+    #[test]
+    fn managed_stage_errors_expose_distinct_sanitized_fixed_codes() {
+        let cases = [
+            (ErrorKind::InvalidInput, "InvalidInput"),
+            (ErrorKind::UnsupportedPlatform, "UnsupportedPlatform"),
+            (ErrorKind::State, "Paths"),
+            (ErrorKind::Identity, "Identity"),
+            (ErrorKind::Spawn, "Process"),
+            (ErrorKind::Startup, "Readiness"),
+        ];
+        let mut codes = std::collections::BTreeSet::new();
+        for (kind, code) in cases {
+            let error = startup_err(kind);
+            assert_stage_code(&error, code);
+            assert!(codes.insert(code), "duplicate stage code {code}");
+        }
+        assert_eq!(codes.len(), 6, "every startup stage needs its own code");
+        assert!(
+            !codes.contains("Startup"),
+            "readiness/auth failures must not collapse to the generic Startup code"
+        );
+    }
+
+    #[test]
+    fn managed_stage_codes_do_not_embed_hostile_input() {
+        let hostile = "sk_live_TOKEN_alice@example.com";
+        let relative = PathBuf::from(format!(
+            "{hostile}/--token=Bearer SURGUI_AUTH_TOKEN/../../BEGIN PRIVATE KEY"
+        ));
+        let absolute = sandbox_base().join(hostile);
+        let error = validate_absolute(&relative, &absolute, &absolute).unwrap_err();
+        assert_stage_code(&error, "InvalidInput");
+
+        let request = SpawnRequest {
+            binary: absolute.join(hostile),
+            args: vec![OsString::from(format!("--token={hostile}"))],
+            env: vec![
+                (OsString::from("SURGUI_AUTH_TOKEN"), OsString::from(hostile)),
+                (
+                    OsString::from("SURGUI_TLS_KEY_PEM"),
+                    OsString::from("-----BEGIN PRIVATE KEY-----"),
+                ),
+            ],
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("redacted"));
+        for marker in HOSTILE_INPUT_MARKERS {
+            let marker = *marker;
+            assert!(
+                !debug.contains(marker),
+                "SpawnRequest Debug leaked {marker:?}: {debug}"
+            );
+        }
+
+        for (kind, code) in [
+            (ErrorKind::State, "Paths"),
+            (ErrorKind::Identity, "Identity"),
+            (ErrorKind::Spawn, "Process"),
+            (ErrorKind::Startup, "Readiness"),
+        ] {
+            assert_stage_code(&startup_err(kind), code);
+        }
+    }
+
     #[test]
     fn rejects_non_absolute_inputs_without_spawn() {
         // Must not touch the network or spawn; validation only.
@@ -1668,18 +1810,18 @@ mod tests {
         // Error values are redacted and carry no input.
         let e = invalid_input();
         assert_eq!(format!("{e}"), "managed server invalid input");
-        assert!(format!("{e:?}").contains("redacted"));
+        assert_eq!(format!("{e:?}"), "InvalidInput");
         let u = unsupported();
         assert_eq!(
             format!("{u}"),
             "managed server unavailable on this platform"
         );
-        assert!(format!("{u:?}").contains("redacted"));
+        assert_eq!(format!("{u:?}"), "UnsupportedPlatform");
         let s = ManagedServerError {
             kind: ErrorKind::Startup,
         };
         assert_eq!(format!("{s}"), "managed server startup failed");
-        assert!(format!("{s:?}").contains("redacted"));
+        assert_eq!(format!("{s:?}"), "Readiness");
         let _ = (rel, abs_state, abs_home);
     }
 
@@ -1802,14 +1944,14 @@ mod tests {
     }
 
     #[test]
-    fn spawn_request_debug_is_redacted() {
+    fn spawn_error_debug_is_fixed_and_sanitized() {
         let e = ManagedServerError {
             kind: ErrorKind::Spawn,
         };
         let s = format!("{e}");
         let d = format!("{e:?}");
         assert_eq!(s, "managed server startup failed");
-        assert!(d.contains("redacted"));
+        assert_eq!(d, "Process");
         assert!(!d.contains("1700"));
     }
 
@@ -2264,7 +2406,7 @@ mod tests {
         let err = res.unwrap_err();
         let msg = format!("{err}");
         assert_eq!(msg, "managed server startup failed");
-        assert!(format!("{err:?}").contains("redacted"));
+        assert_eq!(format!("{err:?}"), "Readiness");
         // If a server was somehow returned (must not happen), drop it now.
         // Token confidentiality: impostor must never have seen a bearer.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2459,5 +2601,175 @@ mod tests {
                 assert!(start.elapsed() < Duration::from_secs(10));
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn windows_unique_tag(tag: &str) -> String {
+        use std::sync::atomic::Ordering;
+        let id = WINDOWS_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("{}-{}-{}", tag, std::process::id(), id)
+    }
+
+    #[cfg(windows)]
+    fn windows_real_daemon_binary() -> PathBuf {
+        let is_ci =
+            std::env::var_os("CI").is_some() || std::env::var_os("GITHUB_ACTIONS").is_some();
+        match std::env::var_os("SURGUI_TEST_DAEMON") {
+            None => {
+                if is_ci {
+                    panic!("CI requires SURGUI_TEST_DAEMON set to absolute staged daemon path; cannot silently skip windows_real_managed_daemon_authenticated_lifecycle");
+                } else {
+                    panic!("SURGUI_TEST_DAEMON must be set to an absolute staged daemon path; cannot silently skip");
+                }
+            }
+            Some(value) => {
+                let path = PathBuf::from(value);
+                assert!(
+                    path.is_absolute(),
+                    "SURGUI_TEST_DAEMON must be an absolute path"
+                );
+                assert!(
+                    path.is_file(),
+                    "SURGUI_TEST_DAEMON must point to an existing staged daemon file"
+                );
+                path
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_assert_missing(path: &Path) {
+        match path.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => panic!("scratch final path must be missing (NotFound)"),
+            Ok(_) => panic!("scratch final path must be missing to exercise secure creation"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_remove_owned_after_confirmed_reap(path: &Path) {
+        match path.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => panic!("confirmed cleanup found unreadable scratch metadata"),
+            Ok(_) => {}
+        }
+        if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(path).expect("confirmed cleanup must remove owned dir");
+        } else {
+            std::fs::remove_file(path).expect("confirmed cleanup must remove owned file");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_real_managed_daemon_coordinator_shutdown_reaps() {
+        // Serialize fixed-port 1700 tests in this binary; held across startup
+        // through verified shutdown.
+        let _guard = test_port_lock().lock().await;
+        // Explicit staged fixture; fail loudly if missing/invalid so CI can
+        // never silently skip this real-daemon regression. Ordinary
+        // `cargo test` on Windows also requires this fixture.
+        let binary = windows_real_daemon_binary();
+        assert!(binary.is_absolute(), "fixture must be absolute");
+        assert!(binary.is_file(), "fixture must exist");
+        // Only the shared sandbox base is pre-created. The unique parent and
+        // home final components stay missing so `ManagedStateDir::prepare`
+        // creates them with production secure ACLs (never pre-create with
+        // inherited ACLs, which `prepare` would only validate/reject).
+        std::fs::create_dir_all(sandbox_base()).expect("create sandbox base");
+        let parent = sandbox_base().join(windows_unique_tag("win-managed-coord"));
+        windows_assert_missing(&parent);
+        let _parent_dir = crate::managed_state::ManagedStateDir::prepare(&parent)
+            .expect("prepare private parent with production ACL");
+        let home = parent.join(windows_unique_tag("home"));
+        windows_assert_missing(&home);
+        let _home_dir = crate::managed_state::ManagedStateDir::prepare(&home)
+            .expect("prepare private home with production ACL");
+        let state = parent.join(windows_unique_tag("state"));
+        windows_assert_missing(&state);
+        // Retain the owner lifetime across the start future so a
+        // cancelled/failed start stays fenced until the real owner has
+        // finished. Never signal a bare PID.
+        let owner = OwnerLifetime::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server = match ManagedServer::start_cancellable_tracked(
+            &binary,
+            &state,
+            &home,
+            Duration::from_secs(20),
+            Arc::clone(&cancel),
+            owner.clone(),
+        )
+        .await
+        {
+            Ok(server) => server,
+            Err(error) => {
+                // Startup failed: keep the port lock while waiting bounded for
+                // the real owner to finish. Pre-spawn failures are already
+                // marked finished/reaped by the start guard; post-spawn
+                // failures need the owner thread to reap the owned handle.
+                let finished = owner.wait_finished(Duration::from_secs(10));
+                let reaped = finished && owner.was_reaped();
+                if !reaped {
+                    panic!(
+                        "managed daemon must start on Windows: {}; owner cleanup unconfirmed, scratch preserved",
+                        error.stage().code()
+                    );
+                }
+                panic!(
+                    "managed daemon must start on Windows: {}",
+                    error.stage().code()
+                );
+            }
+        };
+        // Record owner pending state without asserting while the owned child
+        // is live; asserted only after shutdown/cleanup below.
+        let owner_was_pending = !owner.is_finished();
+        let coordinator_owner = server.owner_lifetime();
+        // Gather post-start observations without panicking while the owned
+        // child is live; never signal a bare PID. Never call `client.shutdown`
+        // before the coordinator shutdown below: doing so would let the child
+        // exit first and make the coordinator shutdown assertion a false
+        // positive.
+        let pid = server.pid();
+        let client = server.client();
+        let list_is_empty = client.list_downloads().is_empty();
+        let refresh_result = client.refresh().await;
+        let still_running_before_shutdown = !server.has_exited();
+        // Retire ONLY via the owned coordinator and confirm the owner
+        // finished/reaped before any assertions or cleanup. `_guard` is still
+        // held here, serializing the fixed port through verified shutdown.
+        // A `true` reap alone cannot prove graceful HTTP rather than force;
+        // it only proves the owned handle was reaped.
+        let reaped = server.shutdown().await;
+        let owner_finished = coordinator_owner.is_finished();
+        let owner_reaped = coordinator_owner.was_reaped();
+        let reap_confirmed = reaped && owner_finished && owner_reaped;
+        // Remove only uniquely owned test paths, surfacing remove errors once
+        // termination was confirmed. Preserve scratch when unconfirmed.
+        if reap_confirmed {
+            windows_remove_owned_after_confirmed_reap(&state);
+            windows_remove_owned_after_confirmed_reap(&home);
+            windows_remove_owned_after_confirmed_reap(&parent);
+        }
+        // Assertions only after owned shutdown/reap confirmation.
+        assert!(
+            owner_was_pending,
+            "owner must have been pending after successful start"
+        );
+        assert!(pid != 0, "owned daemon pid must be nonzero");
+        assert!(list_is_empty, "fresh isolated daemon must have empty list");
+        let fresh = refresh_result.expect("real pinned TLS refresh must succeed");
+        assert!(
+            fresh.is_empty(),
+            "fresh isolated daemon refresh must be empty"
+        );
+        assert!(
+            still_running_before_shutdown,
+            "daemon must still run before shutdown"
+        );
+        assert!(reaped, "coordinator shutdown must report owned reap");
+        assert!(owner_finished, "owner must be finished");
+        assert!(owner_reaped, "owner must confirm owned child reaped");
     }
 }

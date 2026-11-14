@@ -59,7 +59,24 @@ jobs:
 
       - name: Test Rust
         working-directory: src-tauri
-        run: cargo test
+        env:
+          SURGUI_TEST_DAEMON: ${{ github.workspace }}/src-tauri/resources/surge-x86_64-pc-windows-msvc.exe
+        run: |
+          if (-not (Test-Path $env:SURGUI_TEST_DAEMON)) { throw "missing staged daemon fixture" }
+          cargo test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $Targets = @(
+            "managed_server::tests::windows_real_managed_daemon_coordinator_shutdown_reaps"
+          )
+          $Listed = cargo test --lib -- --list 2>&1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($Target in $Targets) {
+            if (-not ($Listed -contains "${Target}: test")) { throw "targeted test not listed" }
+          }
+          foreach ($Target in $Targets) {
+            cargo test --lib $Target -- --exact --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
       - name: Clippy
         working-directory: src-tauri

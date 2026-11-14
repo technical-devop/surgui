@@ -103,6 +103,23 @@ const REFRESH_FALLBACK = "Refresh failed. Check the connection and retry.";
 const ADD_FALLBACK = "Could not add download. Check the URL and try again.";
 const MANAGED_FALLBACK = "Could not start the bundled daemon. Try again.";
 
+const MANAGED_START_CODES: ReadonlySet<string> = new Set([
+  "resource",
+  "paths",
+  "identity",
+  "process",
+  "readiness",
+  "invalidInput",
+  "unsupportedPlatform",
+]);
+
+function mapManagedStartError(err: unknown): string {
+  if (typeof err === "string" && MANAGED_START_CODES.has(err)) {
+    return `Could not start the bundled daemon. Code: ${err}.`;
+  }
+  return MANAGED_FALLBACK;
+}
+
 const KNOWN_ADD_OUTCOMES: ReadonlySet<string> = new Set(["queued", "pendingApproval", "duplicate"]);
 
 /**
@@ -269,7 +286,7 @@ export class NativeQueueController {
         if (this.managedEpoch !== epoch) return false;
         this.state.phase = "error";
         this.state.items = [];
-        this.state.error = mapToSafeMessage(err, MANAGED_FALLBACK) ?? MANAGED_FALLBACK;
+        this.state.error = mapManagedStartError(err);
         this.state.refreshing = false;
         this.state.controllingId = null;
         this.state.adding = false;
@@ -287,7 +304,7 @@ export class NativeQueueController {
         if (this.managedEpoch !== epoch) return false;
         this.state.phase = "error";
         this.state.items = [];
-        this.state.error = mapToSafeMessage(err, MANAGED_FALLBACK) ?? MANAGED_FALLBACK;
+        this.state.error = mapManagedStartError(err);
         this.state.refreshing = false;
         this.state.controllingId = null;
         this.state.adding = false;
