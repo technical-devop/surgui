@@ -1,1 +1,2 @@
 src-tauri/resources/Surge-LICENSE text eol=lf
+third-party/surge/surge-bind-loopback.patch text eol=lf
