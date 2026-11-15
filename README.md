@@ -13,6 +13,15 @@ affiliated with it. It targets the Surge v0.12.4 API. The app bundles a patched 
 - Remote endpoints must use HTTPS. Plain HTTP is loopback-only (e.g. `localhost`, or
   an SSH tunnel to the daemon host).
 - Browser preview is sample-only and never connects to a daemon.
+- **Open a completed download's containing folder**: only on the owned bundled
+  (managed) daemon connection. The daemon-reported destination is validated
+  locally and rejected when it is unsupported, non-local, or unsafe, then the
+  containing folder opens in the platform file manager. The check is best-effort
+  and fail-closed; it does not guarantee the path is physically local.
+- **Global download speed limit**: entered in decimal MB/s (1 MB = 1,000,000
+  bytes), where `0` means unlimited. Managed bundled-daemon connection only; if a
+  write's outcome cannot be confirmed, speed control stays disabled until the
+  app restarts.
 
 ## Advanced: Running the daemon (Windows)
 
@@ -97,6 +106,17 @@ connection before starting a broadly-listening server.
   Removing may delete the incomplete working file of a transfer still in progress;
   a completed final file is left on disk.
 - **Disconnect**: stops the bundled managed daemon and clears the connection. An externally managed daemon is not stopped.
+- **Open download location**: offered on completed rows. Sends only the row id;
+  the backend refreshes `/list` on the owned bundled daemon, requires exactly one
+  completed, non-moving, present file, validates the reported destination
+  (unsupported, non-local, or unsafe locations fail closed), then opens the
+  containing folder in the platform file manager. Manual/external connections are
+  refused; the destination path is not returned to the app interface or logged by the app.
+- **Global download speed limit**: reads `network.global_rate_limit` from
+  `/settings` and saves a decimal MB/s value (`0` = unlimited) through
+  `/rate-limit/global`, confirming the readback. Only the bundled managed daemon
+  can be written; an unconfirmed write disables speed control until the app
+  restarts.
 
 ### Where files land
 
