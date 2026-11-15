@@ -1452,6 +1452,7 @@ mod tests {
         ticket
     }
 
+    #[cfg(unix)]
     const HOSTILE_INPUT_MARKERS: &[&str] = &[
         "sk_live_",
         "Bearer ",
@@ -1467,6 +1468,7 @@ mod tests {
         "os error",
     ];
 
+    #[cfg(unix)]
     fn assert_managed_stage_code(
         error: &ManagedError,
         expected_debug: &str,
@@ -1503,6 +1505,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_managed_failure_closed(manager: &ConnectionManager) {
         let state = manager.state.lock().unwrap();
         assert!(!state.starting, "failed start must release the claim");
