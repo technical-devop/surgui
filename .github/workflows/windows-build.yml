@@ -66,6 +66,38 @@ jobs:
         working-directory: src-tauri
         run: cargo fmt --check
 
+      - name: Targeted Windows SystemRoot comparison (test-only)
+        # Controlled comparison: this separate cargo process opts in to
+        # copying the real parent SystemRoot into the managed child env. The
+        # opt-in is scoped to this step only, so the normal Rust test step
+        # below keeps its original environment. Test output is discarded;
+        # only fixed markers are printed, and no environment values are ever
+        # echoed. Failures terminate the job (no later steps run) because
+        # process-tree cleanup is unverified; the comparison is a separate
+        # cargo process, not an in-process A/B comparison.
+        working-directory: src-tauri
+        timeout-minutes: 15
+        env:
+          SURGUI_TEST_WINDOWS_SYSTEMROOT: '1'
+        run: |
+          if ([string]::IsNullOrEmpty($env:SystemRoot) -or $env:GITHUB_ACTIONS -cne 'true' -or $env:SURGUI_TEST_WINDOWS_SYSTEMROOT -cne '1') {
+            Write-Output "CI_DIAG:rust_with_systemroot_unknown"
+            exit 1
+          }
+          $env:SURGUI_TEST_DAEMON = Join-Path $env:GITHUB_WORKSPACE "src-tauri/resources/surge-x86_64-pc-windows-msvc.exe"
+          $Target = "managed_server::tests::windows_real_managed_daemon_coordinator_shutdown_reaps"
+          if (-not (Test-Path $env:SURGUI_TEST_DAEMON)) { throw "missing staged daemon fixture" }
+          $Listed = cargo test --lib -- --list 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "targeted test listing failed" }
+          if (-not ($Listed -contains "${Target}: test")) { throw "targeted test not listed" }
+          cargo test --lib managed_server::tests::windows_real_managed_daemon_coordinator_shutdown_reaps -- --exact --test-threads=1 *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "CI_DIAG:rust_with_systemroot_ok"
+          } else {
+            Write-Output "CI_DIAG:rust_with_systemroot_failed"
+            exit $LASTEXITCODE
+          }
+
       - name: Test Rust
         working-directory: src-tauri
         env:

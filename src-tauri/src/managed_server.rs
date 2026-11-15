@@ -109,9 +109,11 @@
 //! Keys/token never appear in argv, UI, logs, filesystem, or `Debug`.
 //! `Debug`/`Display` for [`ManagedServer`] and [`ManagedServerError`] are
 //! redacted and emit no paths, env contents, PEM, or token material.
-//! This module never reads process environment and never performs telemetry
-//! or runtime downloads. Network is only loopback TLS to `127.0.0.1:1700`
-//! via the pinned client.
+//! In production this module never reads process environment and never
+//! performs telemetry or runtime downloads. The sole test-only exception is an
+//! explicitly gated Windows `SystemRoot` comparison copy that is never logged
+//! or retained. Network is only loopback TLS to `127.0.0.1:1700` via the pinned
+//! client.
 //!
 //! # Platforms
 //!
@@ -941,9 +943,25 @@ fn build_linux_env(
     ]
 }
 
-/// Build the strict Windows child env. No process environment is read.
-/// `APPDATA`/`TEMP`/`TMP` point at the isolated state; `USERPROFILE` keeps
-/// the real home so download-location resolution is preserved.
+/// Test-only opt-in gate for the controlled Windows `SystemRoot` comparison.
+/// Both the dedicated variable must be exactly `1` and the GitHub Actions
+/// marker must be exactly `true`; otherwise ordinary test/production behavior
+/// is unchanged. No value is logged or retained.
+#[cfg(all(test, windows))]
+fn windows_systemroot_test_opt_in() -> bool {
+    let opted_in = std::env::var_os("SURGUI_TEST_WINDOWS_SYSTEMROOT")
+        .and_then(|value| value.to_str().map(|value| value == "1"))
+        .unwrap_or(false);
+    let github_actions = std::env::var_os("GITHUB_ACTIONS")
+        .and_then(|value| value.to_str().map(|value| value == "true"))
+        .unwrap_or(false);
+    opted_in && github_actions
+}
+
+/// Build the strict Windows child env. No process environment is read for
+/// production builds. `APPDATA`/`TEMP`/`TMP` point at the isolated state;
+/// `USERPROFILE` keeps the real home so download-location resolution is
+/// preserved.
 #[cfg(windows)]
 fn build_windows_env(
     state_dir: &Path,
@@ -952,7 +970,10 @@ fn build_windows_env(
 ) -> Vec<(OsString, OsString)> {
     let state_os = state_dir.as_os_str().to_os_string();
     let home_os = home_dir.as_os_str().to_os_string();
-    vec![
+    // Mutation is test-only (see the opt-in block below); ordinary production
+    // builds must not warn about the unused `mut`.
+    #[allow(unused_mut)]
+    let mut env = vec![
         (OsString::from("SURGUI_PORT"), port_value()),
         (
             OsString::from("SURGUI_TLS_CERT_PEM"),
@@ -970,7 +991,22 @@ fn build_windows_env(
         (OsString::from("USERPROFILE"), home_os),
         (OsString::from("TEMP"), state_os.clone()),
         (OsString::from("TMP"), state_os),
-    ]
+    ];
+    // Controlled comparison only: with the explicit CI opt-in, copy the real
+    // parent `SystemRoot` into the otherwise-cleared child env. This block is
+    // compiled out of ordinary non-test builds and inert without the opt-in,
+    // so the no-SystemRoot behavior above is preserved by default.
+    #[cfg(test)]
+    {
+        if windows_systemroot_test_opt_in() {
+            if let Some(system_root) = std::env::var_os("SystemRoot") {
+                if !system_root.is_empty() {
+                    env.push((OsString::from("SystemRoot"), system_root));
+                }
+            }
+        }
+    }
+    env
 }
 
 /// Shared validation: all three paths must be absolute.
