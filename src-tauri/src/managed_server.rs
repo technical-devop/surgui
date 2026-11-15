@@ -50,7 +50,9 @@
 //! Windows:
 //! `SURGUI_PORT`, `SURGUI_TLS_CERT_PEM`, `SURGUI_TLS_KEY_PEM`,
 //! `SURGUI_AUTH_TOKEN`, `APPDATA` (isolated state), `USERPROFILE` (real
-//! home), `TEMP`/`TMP` (isolated state).
+//! home), `TEMP`/`TMP` (isolated state), and exactly one `SystemRoot` from the
+//! trusted Win32 `GetSystemWindowsDirectoryW` lookup (shared system Windows
+//! directory, not the parent environment).
 //!
 //! # Owner-thread design (Windows `HANDLE`s are not `Send`)
 //!
@@ -109,11 +111,13 @@
 //! Keys/token never appear in argv, UI, logs, filesystem, or `Debug`.
 //! `Debug`/`Display` for [`ManagedServer`] and [`ManagedServerError`] are
 //! redacted and emit no paths, env contents, PEM, or token material.
-//! In production this module never reads process environment and never
-//! performs telemetry or runtime downloads. The sole test-only exception is an
-//! explicitly gated Windows `SystemRoot` comparison copy that is never logged
-//! or retained. Network is only loopback TLS to `127.0.0.1:1700` via the pinned
-//! client.
+//! In production this module never reads process environment and never performs
+//! telemetry or runtime downloads. On Windows the child `SystemRoot` is obtained from the
+//! trusted Win32 `GetSystemWindowsDirectoryW` lookup (the shared system Windows
+//! directory even on Terminal Services), never from the parent environment and
+//! never from a hardcoded drive; the value is not logged or retained beyond the
+//! child environment. Network is only loopback TLS to `127.0.0.1:1700` via the
+//! pinned client.
 //!
 //! # Platforms
 //!
@@ -943,37 +947,80 @@ fn build_linux_env(
     ]
 }
 
-/// Test-only opt-in gate for the controlled Windows `SystemRoot` comparison.
-/// Both the dedicated variable must be exactly `1` and the GitHub Actions
-/// marker must be exactly `true`; otherwise ordinary test/production behavior
-/// is unchanged. No value is logged or retained.
-#[cfg(all(test, windows))]
-fn windows_systemroot_test_opt_in() -> bool {
-    let opted_in = std::env::var_os("SURGUI_TEST_WINDOWS_SYSTEMROOT")
-        .and_then(|value| value.to_str().map(|value| value == "1"))
-        .unwrap_or(false);
-    let github_actions = std::env::var_os("GITHUB_ACTIONS")
-        .and_then(|value| value.to_str().map(|value| value == "true"))
-        .unwrap_or(false);
-    opted_in && github_actions
+/// Bounded capacity for the trusted Win32 system Windows directory. The API
+/// writes at most this many UTF-16 units, including the terminating NUL.
+#[cfg(windows)]
+const WINDOWS_SYSTEM_ROOT_BUFFER: usize = 32_768;
+
+/// Pure validation of one `GetSystemWindowsDirectoryW` result; no environment
+/// or filesystem access.
+///
+/// On success `returned_len` excludes the terminating NUL. When the buffer is
+/// too small, Win32 instead returns the required size including the NUL, so any
+/// length without room for a terminator is rejected as truncation. The accepted
+/// value must be nonempty, NUL-free, terminated, and an absolute path.
+#[cfg(windows)]
+fn validate_windows_system_root(returned_len: u32, buffer: &[u16]) -> Option<OsString> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let len = returned_len as usize;
+    if len == 0 || len >= buffer.len() {
+        return None;
+    }
+    if buffer.get(len).copied() != Some(0) {
+        return None;
+    }
+    let value = &buffer[..len];
+    if value.is_empty() || value.contains(&0) {
+        return None;
+    }
+    let system_root = OsString::from_wide(value);
+    if !Path::new(&system_root).is_absolute() {
+        return None;
+    }
+    Some(system_root)
 }
 
-/// Build the strict Windows child env. No process environment is read for
-/// production builds. `APPDATA`/`TEMP`/`TMP` point at the isolated state;
-/// `USERPROFILE` keeps the real home so download-location resolution is
-/// preserved.
+/// Map a raw Win32 lookup result to the existing fixed safe spawn stage. Kept
+/// injectable/pure so failure mapping is testable without calling Win32, and so
+/// no raw API error, path, or environment value escapes on failure.
+#[cfg(windows)]
+fn windows_system_root_from_result(
+    returned_len: u32,
+    buffer: &[u16],
+) -> Result<OsString, ManagedServerError> {
+    validate_windows_system_root(returned_len, buffer).ok_or_else(|| startup_err(ErrorKind::Spawn))
+}
+
+/// Read the shared system Windows directory from trusted Win32. Unlike the
+/// per-session API and the parent environment, this returns the system Windows
+/// directory even on Terminal Services. No drive is hardcoded.
+#[cfg(windows)]
+fn windows_system_root() -> Result<OsString, ManagedServerError> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut buffer = vec![0u16; WINDOWS_SYSTEM_ROOT_BUFFER];
+    // SAFETY: `buffer` is valid for writes of its full length. Win32 receives
+    // that capacity and writes at most the returned UTF-16 length.
+    let returned_len =
+        unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    windows_system_root_from_result(returned_len, &buffer)
+}
+
+/// Build the strict Windows child env. The shared system Windows directory is
+/// obtained from trusted Win32, never the parent environment.
+/// `APPDATA`/`TEMP`/`TMP` point at the isolated state; `USERPROFILE` keeps the
+/// real home so download-location resolution is preserved.
 #[cfg(windows)]
 fn build_windows_env(
     state_dir: &Path,
     home_dir: &Path,
     identity: &ManagedIdentity,
-) -> Vec<(OsString, OsString)> {
+) -> Result<Vec<(OsString, OsString)>, ManagedServerError> {
     let state_os = state_dir.as_os_str().to_os_string();
     let home_os = home_dir.as_os_str().to_os_string();
-    // Mutation is test-only (see the opt-in block below); ordinary production
-    // builds must not warn about the unused `mut`.
-    #[allow(unused_mut)]
-    let mut env = vec![
+    let system_root = windows_system_root()?;
+    Ok(vec![
         (OsString::from("SURGUI_PORT"), port_value()),
         (
             OsString::from("SURGUI_TLS_CERT_PEM"),
@@ -991,22 +1038,8 @@ fn build_windows_env(
         (OsString::from("USERPROFILE"), home_os),
         (OsString::from("TEMP"), state_os.clone()),
         (OsString::from("TMP"), state_os),
-    ];
-    // Controlled comparison only: with the explicit CI opt-in, copy the real
-    // parent `SystemRoot` into the otherwise-cleared child env. This block is
-    // compiled out of ordinary non-test builds and inert without the opt-in,
-    // so the no-SystemRoot behavior above is preserved by default.
-    #[cfg(test)]
-    {
-        if windows_systemroot_test_opt_in() {
-            if let Some(system_root) = std::env::var_os("SystemRoot") {
-                if !system_root.is_empty() {
-                    env.push((OsString::from("SystemRoot"), system_root));
-                }
-            }
-        }
-    }
-    env
+        (OsString::from("SystemRoot"), system_root),
+    ])
 }
 
 /// Shared validation: all three paths must be absolute.
@@ -1171,7 +1204,7 @@ impl ManagedServer {
         #[cfg(target_os = "linux")]
         let env = build_linux_env(&verified_state, home_dir, &identity);
         #[cfg(windows)]
-        let env = build_windows_env(&verified_state, home_dir, &identity);
+        let env = build_windows_env(&verified_state, home_dir, &identity)?;
 
         let req = SpawnRequest {
             binary: binary.to_path_buf(),
@@ -2031,10 +2064,12 @@ mod tests {
             "USERPROFILE",
             "TEMP",
             "TMP",
+            "SystemRoot",
         ];
-        assert_eq!(expected.len(), 8);
+        assert_eq!(expected.len(), 9);
         assert!(expected.contains(&"SURGUI_AUTH_TOKEN"));
         assert!(expected.contains(&"APPDATA"));
+        assert!(expected.contains(&"SystemRoot"));
         // The Windows stub child must fail closed on non-Windows without spawn.
         #[cfg(not(windows))]
         {
@@ -2718,6 +2753,78 @@ mod tests {
         } else {
             std::fs::remove_file(path).expect("confirmed cleanup must remove owned file");
         }
+    }
+
+    #[cfg(windows)]
+    fn windows_env_has_key_ignore_ascii_case(env: &[(OsString, OsString)], key: &str) -> bool {
+        env.iter()
+            .any(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case(key))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_build_env_derives_single_trusted_system_root() {
+        let identity = ManagedIdentity::generate().expect("identity");
+        let state = Path::new(r"C:\surge-managed-env-test\state");
+        let home = Path::new(r"C:\surge-managed-env-test\home");
+        let env = build_windows_env(state, home, &identity).expect("windows env");
+
+        let mut roots = env
+            .iter()
+            .filter(|(name, _)| name.as_os_str() == std::ffi::OsStr::new("SystemRoot"));
+        let (_, system_root) = roots.next().expect("SystemRoot must be present");
+        assert!(roots.next().is_none(), "SystemRoot must be unique");
+        assert!(!system_root.is_empty(), "SystemRoot must be nonempty");
+        {
+            use std::os::windows::ffi::OsStrExt;
+            assert!(
+                !system_root.encode_wide().any(|unit| unit == 0),
+                "SystemRoot must be NUL-free"
+            );
+        }
+        assert!(
+            Path::new(system_root).is_absolute(),
+            "SystemRoot must be an absolute path"
+        );
+        let trusted = windows_system_root().expect("trusted windows system root");
+        assert!(
+            system_root.as_os_str() == trusted.as_os_str(),
+            "child SystemRoot must match the trusted Win32 lookup"
+        );
+        for inherited in ["PATH", "windir"] {
+            assert!(
+                !windows_env_has_key_ignore_ascii_case(&env, inherited),
+                "child env must not inherit parent values"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_root_invalid_results_fail_closed() {
+        let invalid = [
+            (0u32, vec![0u16]),
+            (4, vec![b'C' as u16, b':' as u16, b'\\' as u16, 0]),
+            (2, vec![b'C' as u16, b':' as u16, b'\\' as u16]),
+            (3, vec![b'C' as u16, 0, b'\\' as u16, 0]),
+            (2, vec![b'C' as u16, b':' as u16, 0]),
+        ];
+        for (returned_len, buffer) in invalid {
+            assert!(
+                validate_windows_system_root(returned_len, &buffer).is_none(),
+                "invalid Win32 SystemRoot result must be rejected"
+            );
+            let error = windows_system_root_from_result(returned_len, &buffer).unwrap_err();
+            assert_stage_code(&error, "Process");
+        }
+
+        let valid_buffer = [b'C' as u16, b':' as u16, b'\\' as u16, 0];
+        let system_root = validate_windows_system_root(3, &valid_buffer)
+            .expect("valid absolute Win32 result must be accepted");
+        assert!(
+            system_root.as_os_str() == std::ffi::OsStr::new("C:\\"),
+            "valid absolute result must be accepted"
+        );
     }
 
     #[cfg(windows)]
