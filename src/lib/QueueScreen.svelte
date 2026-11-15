@@ -5,11 +5,28 @@
   import { untrack } from "svelte";
   import logoUrl from "../assets/surge-logo.webp";
 
-  let { items, mode, controllingId = null, onControl = undefined }: {
+  let {
+    items,
+    mode,
+    controllingId = null,
+    onControl = undefined,
+    isManaged = false,
+    openingId = null,
+    locationError = null,
+    locationErrorId = null,
+    onOpenLocation = undefined,
+    onClearLocationError = undefined,
+  }: {
     items: QueueItem[];
     mode: "offline" | "sample" | "native";
     controllingId?: string | null;
     onControl?: (action: "pause" | "resume" | "removeRecord", id: string) => void;
+    isManaged?: boolean;
+    openingId?: string | null;
+    locationError?: string | null;
+    locationErrorId?: string | null;
+    onOpenLocation?: (id: string) => void;
+    onClearLocationError?: () => void;
   } = $props();
 
   let rows = $state<QueueItem[]>(items.map((i) => ({ ...i })));
@@ -54,6 +71,25 @@
       if (!ids.includes(pending)) {
         pendingRemoveId = null;
       }
+    });
+  });
+
+  // A location error belongs to its origin id; it renders only when the
+  // current selection equals that origin, so a stale message never reads as
+  // the new row's state. Moving away from the origin clears the stale error;
+  // returning to the origin preserves it for display. No paths ever enter.
+  $effect(() => {
+    const _sel = selectedId;
+    untrack(() => {
+      if (_sel === undefined || _sel === null) return;
+      const origin = locationErrorId ?? null;
+      const msg = locationError ?? null;
+      if (msg === null || origin === null) {
+        // Generic (non-row) errors clear on any move to avoid stale text.
+        if (msg !== null) onClearLocationError?.();
+        return;
+      }
+      if (origin !== _sel) onClearLocationError?.();
     });
   });
 
@@ -308,6 +344,9 @@
             {@const nativePrimary = sel.status === "active" ? "pause" : sel.status === "paused" ? "resume" : null}
             {@const isBusy = controllingId !== null && controllingId !== undefined}
             {@const isSelfBusy = controllingId === sel.id}
+            {@const isOpening = openingId !== null && openingId !== undefined}
+            {@const isSelfOpening = openingId === sel.id}
+            {@const locationBlocked = !isManaged || isBusy || isOpening}
             {#if nativePrimary !== null}
               <button
                 type="button"
@@ -323,6 +362,29 @@
               >
                 {isSelfBusy ? (nativePrimary === "pause" ? "Pausing…" : "Resuming…") : nativePrimary === "pause" ? "Pause" : "Resume"}
               </button>
+            {/if}
+            {#if sel.status === "completed"}
+              <button
+                type="button"
+                class="btn"
+                disabled={locationBlocked}
+                aria-busy={isSelfOpening ? "true" : undefined}
+                aria-label={`Open download location for ${sel.name}`}
+                onclick={() => {
+                  if (locationBlocked || onOpenLocation === undefined) return;
+                  onOpenLocation(sel.id);
+                }}
+              >
+                {isSelfOpening ? "Opening…" : "Open download location"}
+              </button>
+              {#if !isManaged}
+                <p class="control-pending" role="note">Open location needs the bundled daemon connection.</p>
+              {:else if isOpening && !isSelfOpening}
+                <p class="control-pending" role="status">Opening another download… try again shortly.</p>
+              {/if}
+              {#if locationError && (locationErrorId == null || locationErrorId === sel.id)}
+                <p class="control-pending" role="alert">{locationError}</p>
+              {/if}
             {/if}
             {#if pendingRemoveId === sel.id}
               <div class="remove-confirm" role="group" aria-label={`Confirm removal of ${sel.name}`}>

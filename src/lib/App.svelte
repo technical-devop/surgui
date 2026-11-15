@@ -4,7 +4,9 @@
   import type { QueueItem } from "./queue/types";
   import { NativeQueueController } from "./queue/native-controller";
   import type { NativeState } from "./queue/native-controller";
+  import { formatRateBpsToMb, parseRateMbToBps, rateInputErrorMessage } from "./queue/queue";
   import { onDestroy, onMount } from "svelte";
+  import { untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import logoUrl from "../assets/surge-logo.webp";
 
@@ -23,7 +25,10 @@
   let endpoint = $state("");
   let token = $state("");
   let addUrl = $state("");
-  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null });
+  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, locationOpeningId: null, locationError: null, locationErrorId: null });
+  let rateDraft = $state("");
+  let rateDirty = $state(false);
+  let rateTouched = $state(false);
 
   let controller: NativeQueueController | null = null;
   if (isTauri) {
@@ -56,6 +61,117 @@
   const isConnecting = $derived(snapshot.phase === "connecting");
   const isConnected = $derived(snapshot.phase === "connected");
   const isAdding = $derived(snapshot.adding === true);
+  const isManaged = $derived(snapshot.managed === true);
+  const rateLimitBps = $derived(snapshot.rateLimitBps ?? null);
+  const rateLoading = $derived(snapshot.rateLoading === true);
+  const rateSaving = $derived(snapshot.rateSaving === true);
+  const rateError = $derived(snapshot.rateError ?? null);
+  const rateUnconfirmed = $derived(snapshot.rateUnconfirmed === true);
+  const locationOpeningId = $derived(snapshot.locationOpeningId ?? null);
+  const locationError = $derived(snapshot.locationError ?? null);
+  const locationErrorId = $derived(snapshot.locationErrorId ?? null);
+
+  // Load the managed limit once per connection epoch. The draft lives in the
+  // UI so list polls never overwrite an in-progress edit. tryClaim gates the
+  // auto attempt so a failed read never loops; manual Retry calls loadRate()
+  // directly and reconnect (epoch bump) allows exactly one new auto attempt.
+  $effect(() => {
+    const phase = snapshot.phase;
+    const managed = snapshot.managed === true;
+    const known = snapshot.rateLimitBps;
+    const loading = snapshot.rateLoading === true;
+    const poisoned = snapshot.rateUnconfirmed === true;
+    untrack(() => {
+      if (!isTauri || !controller) return;
+      if (phase !== "connected" || !managed) return;
+      if (known !== null || loading || poisoned) return;
+      if (rateDirty) return;
+      if (!controller.tryClaimRateAutoLoad()) return;
+      void controller.loadRate();
+    });
+  });
+
+  // Mirror the confirmed value into the draft only while the user has no
+  // unsaved edit, so background loads never clobber typing.
+  $effect(() => {
+    const known = snapshot.rateLimitBps;
+    untrack(() => {
+      if (rateDirty) return;
+      if (known === null || known === undefined) return;
+      rateDraft = formatRateBpsToMb(known);
+      rateTouched = false;
+    });
+  });
+
+  // Reset the rate draft when the connection leaves managed/connected so a
+  // stale value never looks like the new daemon's limit.
+  $effect(() => {
+    const phase = snapshot.phase;
+    const managed = snapshot.managed === true;
+    untrack(() => {
+      if (phase !== "connected" || !managed) {
+        rateDraft = "";
+        rateDirty = false;
+        rateTouched = false;
+      }
+    });
+  });
+
+  const rateParsed = $derived(parseRateMbToBps(rateDraft));
+  const rateLocalError = $derived(
+    rateDirty && !rateParsed.ok ? rateInputErrorMessage(rateParsed.reason) : null,
+  );
+  const rateInvalid = $derived(!!(rateLocalError || rateError));
+  const rateErrorVisible = $derived(!rateLoading && !!(rateLocalError || rateError));
+  const rateDescribedBy = $derived(rateErrorVisible ? "global-rate-help global-rate-error" : "global-rate-help");
+  const rateCanSave = $derived(
+    isManaged &&
+      isConnected &&
+      !rateLoading &&
+      !rateSaving &&
+      !rateUnconfirmed &&
+      rateDirty &&
+      rateParsed.ok,
+  );
+  const rateInputDisabled = $derived(!isManaged || !isConnected || rateLoading || rateSaving || rateUnconfirmed);
+  const rateCurrentLabel = $derived(
+    rateLimitBps === null || rateLimitBps === undefined
+      ? null
+      : rateLimitBps === 0
+        ? "Current: Unlimited (0)"
+        : `Current: ${formatRateBpsToMb(rateLimitBps)} MB/s`,
+  );
+
+  async function handleRateSave(event: SubmitEvent) {
+    event.preventDefault();
+    if (!isTauri || !controller) return;
+    if (!isManaged || !isConnected || rateSaving || rateLoading || rateUnconfirmed) return;
+    rateTouched = true;
+    const parsed = parseRateMbToBps(rateDraft);
+    if (!parsed.ok) return;
+    rateDirty = false;
+    const ok = await controller.setRateLimit(parsed.bytes);
+    if (ok) {
+      untrack(() => {
+        rateDraft = formatRateBpsToMb(parsed.bytes);
+        rateDirty = false;
+        rateTouched = false;
+      });
+    } else {
+      untrack(() => {
+        rateDirty = true;
+      });
+    }
+  }
+
+  function handleOpenLocation(id: string) {
+    if (!isTauri) return;
+    void controller?.openLocation(id);
+  }
+
+  function handleClearLocationError() {
+    controller?.clearLocationError();
+  }
 
   // One honest connection label for the branded header — no daemon is ever
   // implied beyond the four real phases. Never colour-only: the dot always
@@ -97,12 +213,21 @@
 
   function handleDisconnect() {
     addUrl = "";
+    rateDraft = "";
+    rateDirty = false;
+    rateTouched = false;
     void controller?.disconnect();
   }
 
   function handleManagedRetry() {
     if (!controller || isConnecting) return;
     void controller.startManaged();
+  }
+
+  function handleRateRetry() {
+    if (!controller) return;
+    if (!isManaged || !isConnected || rateLoading || rateSaving || rateUnconfirmed) return;
+    void controller.loadRate();
   }
 
   const showManagedRetry = $derived(
@@ -260,8 +385,70 @@
           <p class="add-feedback" role="status">Duplicate — daemon already tracks this URL; not queued.</p>
         {/if}
       </section>
+      <section class="add-panel" aria-label="Global download speed">
+        <form class="add-form" onsubmit={handleRateSave}>
+          <div class="field add-field">
+            <label class="field-label" for="global-rate">Global download limit (MB/s)</label>
+            <input
+              id="global-rate"
+              class="field-input"
+              type="text"
+              inputmode="decimal"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="e.g. 2.5, 0 unlimited"
+              bind:value={rateDraft}
+              oninput={() => { rateDirty = true; rateTouched = true; }}
+              onblur={() => { rateTouched = true; }}
+              disabled={rateInputDisabled}
+              aria-describedby={rateDescribedBy}
+              aria-invalid={rateInvalid ? "true" : "false"}
+            />
+            <p class="field-help" id="global-rate-help">Decimal MB/s; 0 means unlimited. Managed daemon only; polls never overwrite your edit.</p>
+          </div>
+          <div class="add-actions">
+            <button
+              type="submit"
+              class="btn"
+              disabled={!rateCanSave}
+              aria-busy={rateSaving ? "true" : undefined}
+            >
+              {rateSaving ? "Saving…" : "Save limit"}
+            </button>
+          </div>
+        </form>
+        {#if rateLoading}
+          <p class="add-feedback" role="status">Loading limit…</p>
+        {:else if rateUnconfirmed}
+          <p class="conn-error" id="global-rate-error" role="alert">Speed limit state could not be confirmed. Speed control is disabled until the app restarts to avoid unsafe writes.</p>
+        {:else if rateError}
+          <p class="conn-error" id="global-rate-error" role="alert">{rateError}</p>
+          <div class="add-actions">
+            <button type="button" class="btn" onclick={handleRateRetry} disabled={rateLoading}>
+              Retry loading limit
+            </button>
+          </div>
+        {:else if rateLocalError}
+          <p class="conn-error" id="global-rate-error" role="alert">{rateLocalError}</p>
+        {:else if !isManaged}
+          <p class="add-feedback" role="note">Available only on the bundled daemon connection.</p>
+        {:else if rateCurrentLabel}
+          <p class="add-feedback" role="status">{rateCurrentLabel}</p>
+        {/if}
+      </section>
     {/if}
-    <QueueScreen items={snapshot.items} mode={queueMode} controllingId={snapshot.controllingId ?? null} onControl={handleNativeControl} />
+    <QueueScreen
+      items={snapshot.items}
+      mode={queueMode}
+      controllingId={snapshot.controllingId ?? null}
+      onControl={handleNativeControl}
+      isManaged={isManaged}
+      openingId={locationOpeningId}
+      locationError={locationError}
+      locationErrorId={locationErrorId}
+      onOpenLocation={handleOpenLocation}
+      onClearLocationError={handleClearLocationError}
+    />
   {/if}
 </main>
 

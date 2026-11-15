@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -1506,4 +1507,835 @@ async fn add_download_rejects_unexpected_conflict_without_leaking_body() {
         !display.contains(SENTINEL),
         "error Display must not echo response body"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Global download rate limit (pinned `/settings` + `/rate-limit/global`).
+// ---------------------------------------------------------------------------
+
+fn write_json_response(stream: &mut TcpStream, status_line: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        status_line,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn spawn_scripted_server(
+    responses: Vec<(&'static str, String)>,
+) -> (String, JoinHandle<Vec<Captured>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let mut captured = Vec::with_capacity(responses.len());
+        for (status_line, body) in responses {
+            let mut stream = accept_one(&listener);
+            stream
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .expect("set read timeout");
+            captured.push(parse_head(&read_head(&mut stream)));
+            write_json_response(&mut stream, status_line, &body);
+        }
+        captured
+    });
+    (format!("http://{}", addr), server)
+}
+
+/// Serve LIST, answer the POST ambiguously, then watch briefly for any readback.
+/// The watcher proves the client does not trust a later matching readback.
+fn spawn_ambiguous_post_server(
+    status_line: &'static str,
+    body: String,
+    tempting_readback: String,
+) -> (String, JoinHandle<Vec<Captured>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let mut captured = Vec::with_capacity(3);
+        let mut first = accept_one(&listener);
+        first
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        captured.push(parse_head(&read_head(&mut first)));
+        write_json_response(&mut first, "200 OK", LIST_BODY);
+
+        let mut second = accept_one(&listener);
+        second
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        captured.push(parse_head(&read_head(&mut second)));
+        write_json_response(&mut second, status_line, &body);
+
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    stream
+                        .set_read_timeout(Some(READ_TIMEOUT))
+                        .expect("set read timeout");
+                    captured.push(parse_head(&read_head(&mut stream)));
+                    write_json_response(&mut stream, "200 OK", &tempting_readback);
+                    break;
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        captured
+    });
+    (format!("http://{}", addr), server)
+}
+
+fn settings_direct_rate(rate: &str) -> String {
+    format!(r#"{{"network":{{"global_rate_limit":"{rate}"}}}}"#)
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_reads_authenticated_settings() {
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", settings_direct_rate("1048576 B/s")),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let rate = client
+        .get_global_rate_limit()
+        .await
+        .expect("global rate readback must succeed");
+    let captured = server.join().expect("server thread panicked");
+    assert_eq!(rate, 1_048_576);
+    assert!(captured[0].request_line.starts_with("GET /list "));
+    assert!(captured[1].request_line.starts_with("GET /settings "));
+    for request in &captured {
+        assert!(
+            request.authorization.as_deref() == Some("Bearer test-token"),
+            "every settings request must carry the expected Bearer credential (value withheld)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_accepts_zero_value() {
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", settings_direct_rate("0")),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let rate = client
+        .get_global_rate_limit()
+        .await
+        .expect("zero setting must parse");
+    let _ = server.join().expect("server thread panicked");
+    assert_eq!(rate, 0, "zero means unlimited");
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_matches_pinned_null_and_float_rounding() {
+    for (value, expected) in [
+        ("null", 0_i64),
+        ("0", 0),
+        ("0.4", 0),
+        ("0.5", 1),
+        ("1.4", 1),
+        ("1.5", 2),
+        ("2.5", 3),
+        ("1048576.49", 1_048_576),
+        ("1048576.5", 1_048_577),
+    ] {
+        let body = format!(r#"{{"network":{{"global_rate_limit":{value}}}}}"#);
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let rate = client
+            .get_global_rate_limit()
+            .await
+            .expect("pinned primitive value must parse");
+        let _ = server.join().expect("server thread panicked");
+        assert_eq!(rate, expected, "unexpected parsed rate for {value}");
+    }
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_rejects_unsafe_large_float_without_false_unlimited() {
+    use surge_desktop_lib::surge_client::MAX_RATE_LIMIT_BPS;
+
+    // Close boundary: exact integer and canonical string forms at the
+    // JavaScript-safe maximum must still round-trip exactly.
+    for (value, expected) in [
+        ("9007199254740990", 9_007_199_254_740_990_i64),
+        ("9007199254740991", MAX_RATE_LIMIT_BPS),
+        (r#""9007199254740991 B/s""#, MAX_RATE_LIMIT_BPS),
+    ] {
+        let body = format!(r#"{{"network":{{"global_rate_limit":{value}}}}}"#);
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let rate = client
+            .get_global_rate_limit()
+            .await
+            .expect("exact boundary value must parse");
+        let _ = server.join().expect("server thread panicked");
+        assert_eq!(rate, expected, "unexpected parsed rate for {value}");
+    }
+
+    // Numerically unsafe float forms cannot be recovered exactly from
+    // `serde_json::Value` (`"9007199254740991.0"` parses as
+    // `9007199254740990.0`): fail closed as `InvalidResponse`, never as
+    // `Ok(0)` (false unlimited) nor as a silently wrong byte rate.
+    for value in [
+        "9007199254740991.0",
+        "9007199254740990.0",
+        "4503599627370496.0",
+    ] {
+        let body = format!(r#"{{"network":{{"global_rate_limit":{value}}}}}"#);
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let err = client
+            .get_global_rate_limit()
+            .await
+            .expect_err("unsafe large float must fail closed");
+        let _ = server.join().expect("server thread panicked");
+        assert!(
+            matches!(err, ConnectError::InvalidResponse),
+            "unsafe float {value} must map to InvalidResponse, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_parses_exact_numeric_and_iec_values() {
+    use surge_desktop_lib::surge_client::MAX_RATE_LIMIT_BPS;
+
+    for (value, expected) in [
+        ("1048576", 1_048_576_i64),
+        (r#""1 MiB/s""#, 1_048_576),
+        (r#""1.5 MiB/s""#, 1_572_864),
+        (r#""1 B/s""#, 1),
+        (r#""1.5 B/s""#, 2),
+        ("9007199254740991", MAX_RATE_LIMIT_BPS),
+        (r#""9007199254740991 B/s""#, MAX_RATE_LIMIT_BPS),
+    ] {
+        let body = format!(r#"{{"network":{{"global_rate_limit":{value}}}}}"#);
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let rate = client
+            .get_global_rate_limit()
+            .await
+            .expect("valid rate value must parse");
+        let _ = server.join().expect("server thread panicked");
+        assert_eq!(rate, expected, "unexpected parsed rate for {value}");
+    }
+}
+
+/// Pinned Go `ParseRateLimit` uses `strconv.ParseFloat` (`float64`) then
+/// `math.Round`: `0.49999999999999999 B/s` rounds to `0.5` in `float64` and
+/// then to `1`, while a long all-zero fraction parses to zero without
+/// denominator overflow.
+#[tokio::test]
+async fn get_global_rate_limit_matches_go_float64_edge_strings() {
+    for (value, expected) in [
+        (r#""0.49999999999999999 B/s""#, 1_i64),
+        (
+            r#""0.00000000000000000000000000000000000000000000000000 B/s""#,
+            0,
+        ),
+    ] {
+        let body = format!(r#"{{"network":{{"global_rate_limit":{value}}}}}"#);
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let rate = client
+            .get_global_rate_limit()
+            .await
+            .expect("pinned float64 edge string must parse");
+        let _ = server.join().expect("server thread panicked");
+        assert_eq!(rate, expected, "unexpected parsed rate for {value}");
+    }
+}
+
+/// Negative and malformed daemon strings must fail closed as `InvalidResponse`,
+/// never as `Ok(0)` (false unlimited).
+#[tokio::test]
+async fn get_global_rate_limit_rejects_negative_and_malformed_strings() {
+    let bodies = [
+        r#"{"network":{"global_rate_limit":"-1 B/s"}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":"-.5 B/s"}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":"1.2.3 B/s"}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":". B/s"}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":"abc"}}"#.to_string(),
+    ];
+    for body in bodies {
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let err = client
+            .get_global_rate_limit()
+            .await
+            .expect_err("negative/malformed string must fail");
+        let _ = server.join().expect("server thread panicked");
+        assert!(
+            matches!(err, ConnectError::InvalidResponse),
+            "negative/malformed string must map to InvalidResponse, got {:?}",
+            err
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_rejects_out_of_range_and_nonfinite_values() {
+    let bodies = [
+        r#"{"network":{"global_rate_limit":-1}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":-0.5}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":9007199254740992}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":9007199254740991.5}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":1e309}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":"9007199254740992 B/s"}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":"-1 B/s"}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":"0.1 B/s"}}"#.to_string(),
+    ];
+    for body in bodies {
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let err = client
+            .get_global_rate_limit()
+            .await
+            .expect_err("out-of-range settings must fail");
+        let _ = server.join().expect("server thread panicked");
+        assert!(
+            matches!(err, ConnectError::InvalidResponse),
+            "out-of-range settings must map to InvalidResponse, got {:?}",
+            err
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_rejects_malformed_settings_without_leaking_body() {
+    const SENTINEL: &str = "settings-sentinel-c41f8a-private-detail";
+    let bodies = [
+        "{}".to_string(),
+        r#"{"network":{}}"#.to_string(),
+        format!(r#"{{"network":{{"global_rate_limit":"{SENTINEL}"}}}}"#),
+        r#"{"network":{"global_rate_limit":{"value":0}}}"#.to_string(),
+        r#"{"network":{"global_rate_limit":true}}"#.to_string(),
+    ];
+    for body in bodies {
+        let (base, server) =
+            spawn_scripted_server(vec![("200 OK", LIST_BODY.to_string()), ("200 OK", body)]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let err = client
+            .get_global_rate_limit()
+            .await
+            .expect_err("malformed settings must fail");
+        let _ = server.join().expect("server thread panicked");
+        assert!(
+            matches!(err, ConnectError::InvalidResponse),
+            "malformed settings must map to InvalidResponse, got {:?}",
+            err
+        );
+        let debug = format!("{:?}", err);
+        let display = format!("{}", err);
+        assert!(
+            !debug.contains(SENTINEL),
+            "error Debug leaked settings body"
+        );
+        assert!(
+            !display.contains(SENTINEL),
+            "error Display leaked settings body"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_rejects_unauthorized_without_leaking_body() {
+    const SENTINEL: &str = "settings-auth-sentinel-b81d9e-raw-detail";
+    let body = format!(r#"{{"error":"unauthorized","message":"{SENTINEL}"}}"#);
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("401 Unauthorized", body),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .get_global_rate_limit()
+        .await
+        .expect_err("unauthorized settings must fail");
+    let _ = server.join().expect("server thread panicked");
+    assert!(matches!(err, ConnectError::Unauthorized));
+    let debug = format!("{:?}", err);
+    let display = format!("{}", err);
+    assert!(
+        !debug.contains(SENTINEL),
+        "error Debug leaked settings body"
+    );
+    assert!(
+        !display.contains(SENTINEL),
+        "error Display leaked settings body"
+    );
+}
+
+#[tokio::test]
+async fn get_global_rate_limit_rejects_oversized_settings_body() {
+    let (base, server) = spawn_two_step_server(LIST_BODY, 1024 * 1024 + 1);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .get_global_rate_limit()
+        .await
+        .expect_err("oversized settings body must fail");
+    let _ = server.join().expect("server thread panicked");
+    assert!(matches!(err, ConnectError::BodyTooLarge));
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_posts_exact_request_and_confirms_readback() {
+    const RATE: i64 = 1_048_576;
+    let ack = format!(r#"{{"status":"global_rate_limited","rate":"{RATE}"}}"#);
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", ack),
+        ("200 OK", settings_direct_rate("1048576 B/s")),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let confirmed = client
+        .set_global_rate_limit(RATE)
+        .await
+        .expect("confirmed write must succeed");
+    let captured = server.join().expect("server thread panicked");
+    assert_eq!(confirmed, RATE);
+    assert!(captured[0].request_line.starts_with("GET /list "));
+    assert_eq!(
+        captured[1]
+            .request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default(),
+        "/rate-limit/global?rate=1048576"
+    );
+    assert!(captured[2].request_line.starts_with("GET /settings "));
+    for request in &captured[1..] {
+        assert!(
+            request.authorization.as_deref() == Some("Bearer test-token"),
+            "write and readback must carry the expected Bearer credential (value withheld)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_preserves_max_safe_integer_exactly() {
+    use surge_desktop_lib::surge_client::MAX_RATE_LIMIT_BPS;
+
+    let ack = format!(r#"{{"status":"global_rate_limited","rate":"{MAX_RATE_LIMIT_BPS}"}}"#);
+    let readback = settings_direct_rate(&format!("{MAX_RATE_LIMIT_BPS} B/s"));
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", ack),
+        ("200 OK", readback),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let confirmed = client
+        .set_global_rate_limit(MAX_RATE_LIMIT_BPS)
+        .await
+        .expect("max safe integer must round-trip");
+    let captured = server.join().expect("server thread panicked");
+    assert_eq!(confirmed, MAX_RATE_LIMIT_BPS);
+    assert_eq!(
+        captured[1]
+            .request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default(),
+        format!("/rate-limit/global?rate={MAX_RATE_LIMIT_BPS}")
+    );
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_zero_confirms_unlimited() {
+    let ack = r#"{"status":"global_rate_unlimited","rate":"0"}"#.to_string();
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", ack),
+        ("200 OK", settings_direct_rate("0")),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let confirmed = client
+        .set_global_rate_limit(0)
+        .await
+        .expect("zero must confirm as unlimited");
+    let captured = server.join().expect("server thread panicked");
+    assert_eq!(confirmed, 0);
+    assert_eq!(
+        captured[1]
+            .request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default(),
+        "/rate-limit/global?rate=0"
+    );
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_ambiguous_write_error_never_uses_late_readback() {
+    const RATE: i64 = 2_097_152;
+    const SENTINEL: &str = "write-error-sentinel-77ac40-raw-detail";
+    let body = format!(r#"{{"error":"{SENTINEL}"}}"#);
+    let (base, server) = spawn_ambiguous_post_server(
+        "500 Internal Server Error",
+        body,
+        settings_direct_rate("2097152 B/s"),
+    );
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .set_global_rate_limit(RATE)
+        .await
+        .expect_err("ambiguous write must not claim success");
+    let captured = server.join().expect("server thread panicked");
+    assert!(
+        matches!(err, ConnectError::RateUnconfirmed),
+        "ambiguous write must be explicitly unconfirmed, got {:?}",
+        err
+    );
+    assert_eq!(
+        captured.len(),
+        2,
+        "an ambiguous POST must not be followed by a readback"
+    );
+    let debug = format!("{:?}", err);
+    let display = format!("{}", err);
+    assert!(!debug.contains(SENTINEL), "error Debug leaked server body");
+    assert!(
+        !display.contains(SENTINEL),
+        "error Display leaked server body"
+    );
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_malformed_ack_is_ambiguous_even_with_matching_readback() {
+    const RATE: i64 = 4_194_304;
+    const SENTINEL: &str = "ack-sentinel-9d2e61-raw-detail";
+    let ack = format!(r#"{{"status":"{SENTINEL}","rate":"{RATE}"}}"#);
+    let (base, server) =
+        spawn_ambiguous_post_server("200 OK", ack, settings_direct_rate("4194304 B/s"));
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .set_global_rate_limit(RATE)
+        .await
+        .expect_err("malformed ack must not claim success");
+    let captured = server.join().expect("server thread panicked");
+    assert!(matches!(err, ConnectError::RateUnconfirmed));
+    assert_eq!(captured.len(), 2, "malformed ack must not be read back");
+    let debug = format!("{:?}", err);
+    let display = format!("{}", err);
+    assert!(!debug.contains(SENTINEL), "error Debug leaked ack body");
+    assert!(!display.contains(SENTINEL), "error Display leaked ack body");
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_rejects_readback_mismatch() {
+    const RATE: i64 = 8_388_608;
+    let ack = format!(r#"{{"status":"global_rate_limited","rate":"{RATE}"}}"#);
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", ack),
+        ("200 OK", settings_direct_rate("1048576 B/s")),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .set_global_rate_limit(RATE)
+        .await
+        .expect_err("mismatched readback must fail");
+    let _ = server.join().expect("server thread panicked");
+    assert!(
+        matches!(err, ConnectError::InvalidResponse),
+        "ack without matching readback must not claim success, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_reports_unknown_when_readback_fails() {
+    const RATE: i64 = 33_554_432;
+    const SENTINEL: &str = "readback-sentinel-e5a170-raw-detail";
+    let ack = format!(r#"{{"status":"global_rate_limited","rate":"{RATE}"}}"#);
+    let body = format!(r#"{{"error":"{SENTINEL}"}}"#);
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", ack),
+        ("500 Internal Server Error", body),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .set_global_rate_limit(RATE)
+        .await
+        .expect_err("unreadable readback must not report success");
+    let _ = server.join().expect("server thread panicked");
+    assert!(
+        matches!(err, ConnectError::RateUnconfirmed),
+        "unavailable readback must be explicitly unknown, got {:?}",
+        err
+    );
+    let debug = format!("{:?}", err);
+    let display = format!("{}", err);
+    assert!(!debug.contains(SENTINEL), "error Debug leaked server body");
+    assert!(
+        !display.contains(SENTINEL),
+        "error Display leaked server body"
+    );
+}
+
+#[tokio::test]
+async fn set_global_rate_limit_rejects_invalid_input_without_network() {
+    use surge_desktop_lib::surge_client::MAX_RATE_LIMIT_BPS;
+
+    let (base, server) = spawn_server("200 OK", LIST_BODY);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    for rate in [-1, MAX_RATE_LIMIT_BPS + 1] {
+        let err = client
+            .set_global_rate_limit(rate)
+            .await
+            .expect_err("invalid rate must be rejected locally");
+        assert!(
+            matches!(err, ConnectError::InvalidResponse),
+            "invalid rate must map to InvalidResponse, got {:?}",
+            err
+        );
+    }
+    let captured = server.join().expect("server thread panicked");
+    assert!(
+        captured.request_line.starts_with("GET /list "),
+        "invalid rates must never reach the daemon"
+    );
+}
+
+#[tokio::test]
+async fn connection_manager_rate_limit_requires_connection_and_validates_input() {
+    use surge_desktop_lib::commands::{BridgeError, ConnectionManager};
+    use surge_desktop_lib::surge_client::MAX_RATE_LIMIT_BPS;
+
+    let manager = ConnectionManager::default();
+    assert!(matches!(
+        manager.get_global_rate_limit().await,
+        Err(BridgeError::NotConnected)
+    ));
+    assert!(matches!(
+        manager.set_global_rate_limit(0).await,
+        Err(BridgeError::NotConnected)
+    ));
+    for rate in [-1, MAX_RATE_LIMIT_BPS + 1] {
+        assert!(matches!(
+            manager.set_global_rate_limit(rate).await,
+            Err(BridgeError::InvalidResponse)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn connection_manager_reads_manual_rate_but_refuses_manual_write() {
+    use surge_desktop_lib::commands::{BridgeError, ConnectionManager};
+
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", settings_direct_rate("2048 B/s")),
+    ]);
+    let manager = ConnectionManager::default();
+    manager.connect(&base, "test-token").await.expect("connect");
+    assert_eq!(
+        manager
+            .get_global_rate_limit()
+            .await
+            .expect("manager readback"),
+        2048
+    );
+    assert!(
+        matches!(
+            manager.set_global_rate_limit(4096).await,
+            Err(BridgeError::NotConnected)
+        ),
+        "manual connections cannot be fenced for writes"
+    );
+    let captured = server.join().expect("server thread panicked");
+    assert_eq!(
+        captured.len(),
+        2,
+        "refused manual write must not reach the daemon"
+    );
+    assert!(captured[1].request_line.starts_with("GET /settings "));
+}
+
+fn spawn_gated_settings_server(
+    status_line: &'static str,
+    body: String,
+) -> (
+    String,
+    JoinHandle<Vec<Captured>>,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+    let addr = listener.local_addr().expect("local addr");
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut captured = Vec::with_capacity(2);
+
+        let mut first = accept_one(&listener);
+        first
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        captured.push(parse_head(&read_head(&mut first)));
+        write_json_response(&mut first, "200 OK", LIST_BODY);
+
+        let mut second = accept_one(&listener);
+        second
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        captured.push(parse_head(&read_head(&mut second)));
+        let _ = started_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        write_json_response(&mut second, status_line, &body);
+        captured
+    });
+    (format!("http://{}", addr), server, started_rx, release_tx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_get_rate_limit_is_superseded_without_touching_replacement() {
+    use surge_desktop_lib::commands::{BridgeError, ConnectionManager};
+
+    let (base_a, server_a, started, release) =
+        spawn_gated_settings_server("200 OK", settings_direct_rate("7000 B/s"));
+    let manager = std::sync::Arc::new(ConnectionManager::default());
+    manager
+        .connect(&base_a, "test-token-a")
+        .await
+        .expect("initial connect");
+
+    let get_manager = std::sync::Arc::clone(&manager);
+    let get_task = tokio::spawn(async move { get_manager.get_global_rate_limit().await });
+    started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("settings request must reach the gated server");
+
+    manager.disconnect();
+    let (base_b, server_b) = spawn_server("200 OK", LIST_BODY);
+    manager
+        .connect(&base_b, "test-token-b")
+        .await
+        .expect("replacement connect");
+    let _ = release.send(());
+
+    let result = get_task.await.expect("get task must finish");
+    assert!(
+        matches!(result, Err(BridgeError::Superseded)),
+        "stale read must be superseded, got {:?}",
+        result
+    );
+
+    let captured_a = server_a.join().expect("gated server thread panicked");
+    assert!(
+        captured_a[1].request_line.starts_with("GET /settings "),
+        "stale request must use the old client only"
+    );
+    assert!(
+        captured_a[1].authorization.as_deref() == Some("Bearer test-token-a"),
+        "stale request must keep its original credential (value withheld)"
+    );
+
+    let captured_b = server_b.join().expect("replacement server thread panicked");
+    assert!(
+        captured_b.request_line.starts_with("GET /list "),
+        "replacement connection must only see its own connect probe"
+    );
+    assert!(
+        captured_b.authorization.as_deref() == Some("Bearer test-token-b"),
+        "replacement request must use only its own credential (value withheld)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_get_error_is_superseded_not_leaked_as_new_state() {
+    use surge_desktop_lib::commands::{BridgeError, ConnectionManager};
+
+    let (base_a, server_a, started, release) =
+        spawn_gated_settings_server("500 Internal Server Error", "{}".to_string());
+    let manager = std::sync::Arc::new(ConnectionManager::default());
+    manager
+        .connect(&base_a, "test-token-a")
+        .await
+        .expect("initial connect");
+
+    let get_manager = std::sync::Arc::clone(&manager);
+    let get_task = tokio::spawn(async move { get_manager.get_global_rate_limit().await });
+    started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("settings request must reach the gated server");
+
+    manager.disconnect();
+    let (base_b, server_b) = spawn_server("200 OK", LIST_BODY);
+    manager
+        .connect(&base_b, "test-token-b")
+        .await
+        .expect("replacement connect");
+    let _ = release.send(());
+
+    let result = get_task.await.expect("get task must finish");
+    assert!(
+        matches!(result, Err(BridgeError::Superseded)),
+        "an old connection's error must not surface as the new state, got {:?}",
+        result
+    );
+    let _ = server_a.join().expect("gated server thread panicked");
+    let _ = server_b.join().expect("replacement server thread panicked");
 }

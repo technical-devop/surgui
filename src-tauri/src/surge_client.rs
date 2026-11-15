@@ -15,6 +15,12 @@ const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// hostile or malformed URL from being relayed to the daemon.
 const MAX_URL_BYTES: usize = 8 * 1024;
 
+/// Largest integer exactly representable as a JavaScript `Number`.
+///
+/// Rate values are kept within `[0, MAX_RATE_LIMIT_BPS]` so a global limit can
+/// cross the Tauri/JS boundary without precision loss.
+pub const MAX_RATE_LIMIT_BPS: i64 = 9_007_199_254_740_991;
+
 /// Exact duplicate-rejection message emitted by released Surge v0.12.4 when
 /// headless mode refuses an already-queued download (`cmd/root_downloads.go`,
 /// unchanged from v0.12.2). The 409 status alone does not prove a duplicate,
@@ -50,6 +56,8 @@ const MAX_CA_PEM_BYTES: usize = 64 * 1024;
 /// (`phase`, `max_connections`, `artifact`, `error_code`, `moving`,
 /// `file_missing`, `category_override`, timestamps); unknown fields are
 /// ignored so a server-side schema addition stays forward compatible.
+/// `moving` and `file_missing` are Go `omitempty` booleans, so absent means
+/// false.
 #[derive(Clone, Deserialize)]
 pub struct Download {
     pub id: String,
@@ -61,6 +69,10 @@ pub struct Download {
     pub speed: f64,
     pub status: String,
     pub eta: i64,
+    #[serde(default)]
+    pub moving: bool,
+    #[serde(default)]
+    pub file_missing: bool,
     #[serde(default)]
     pub connections: i64,
     #[serde(default)]
@@ -91,6 +103,8 @@ impl fmt::Debug for Download {
             .field("progress", &self.progress)
             .field("speed", &self.speed)
             .field("eta", &self.eta)
+            .field("moving", &self.moving)
+            .field("file_missing", &self.file_missing)
             .field("connections", &self.connections)
             .field("added_at", &self.added_at)
             .field("time_taken", &self.time_taken)
@@ -134,6 +148,7 @@ pub enum ConnectError {
     Timeout,
     BodyTooLarge,
     InvalidResponse,
+    RateUnconfirmed,
 }
 
 impl fmt::Debug for ConnectError {
@@ -148,6 +163,7 @@ impl fmt::Debug for ConnectError {
             Self::Timeout => write!(f, "Timeout"),
             Self::BodyTooLarge => write!(f, "BodyTooLarge"),
             Self::InvalidResponse => write!(f, "InvalidResponse"),
+            Self::RateUnconfirmed => write!(f, "RateUnconfirmed"),
         }
     }
 }
@@ -162,6 +178,7 @@ impl fmt::Display for ConnectError {
             Self::Timeout => write!(f, "connection timed out"),
             Self::BodyTooLarge => write!(f, "response body too large"),
             Self::InvalidResponse => write!(f, "invalid response from server"),
+            Self::RateUnconfirmed => write!(f, "rate limit state could not be confirmed"),
         }
     }
 }
@@ -355,6 +372,226 @@ fn validate_download_url(url: &str) -> Result<(), ConnectError> {
 /// True only for a present, non-empty queue identifier.
 fn has_nonempty_id(id: &Option<String>) -> bool {
     id.as_deref().is_some_and(|value| !value.is_empty())
+}
+
+/// Parse a Surge rate string with the pinned `utils.ParseRateLimit` `float64`
+/// semantics.
+///
+/// Go does `strconv.ParseFloat(num, 64)` then `value * multiplier` (`/ 8` for
+/// bits) then `math.Round`. That behavior is matched for daemon strings in the
+/// JavaScript-safe range: e.g. `0.49999999999999999 B/s` parses to `0.5` in
+/// `float64` and rounds to `1`, while long all-zero fractions parse to zero
+/// without denominator overflow. The canonical daemon persistence `"<N> B/s"`
+/// keeps an exact integer fast path so every safe integer round-trips without
+/// `float64` loss. Invalid, non-finite, overflowing, and sub-byte inputs
+/// (`0 < bytes < 0.5` rounding to zero, matching Go's "too small" error)
+/// return `None`.
+fn parse_rate_limit_string(input: &str) -> Option<i64> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty() || lower == "0" || lower == "\u{221e}" || lower == "unlimited" {
+        return Some(0);
+    }
+
+    let compact: String = trimmed.chars().filter(|ch| *ch != ' ').collect();
+    let numeric_end = compact
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit() || *byte == b'.')
+        .count();
+    if numeric_end == 0 {
+        return None;
+    }
+    let numeric = &compact[..numeric_end];
+    let supplied_unit = &compact[numeric_end..];
+    let unit = if supplied_unit.is_empty() {
+        "MB"
+    } else {
+        supplied_unit
+    };
+    let (multiplier, is_bits) = parse_rate_limit_unit(unit)?;
+
+    // Exact integer fast path for the canonical daemon output `"<N> B/s"`.
+    // `fmt.Sprintf("%d B/s", rate)` never emits a fraction, so every
+    // JavaScript-safe integer round-trips without `float64` loss. Longer digit
+    // strings that overflow `u128` fall through to the `float64` path below so
+    // Go's `ParseFloat` overflow (`+Inf` with `ErrRange`) still maps to `None`.
+    if supplied_unit == "B/s"
+        && !numeric.contains('.')
+        && !numeric.is_empty()
+        && numeric.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        if let Ok(exact) = numeric.parse::<u128>() {
+            if exact == 0 {
+                return Some(0);
+            }
+            if exact > MAX_RATE_LIMIT_BPS as u128 {
+                return None;
+            }
+            return Some(exact as i64);
+        }
+        // Overflowed `u128`: fall through to `float64` handling.
+    }
+
+    let value: f64 = numeric.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    // Every supported multiplier is below 2^53, so the `u128 as f64` cast is
+    // exact.
+    let mut bytes = value * (multiplier as f64);
+    if !bytes.is_finite() {
+        return None;
+    }
+    if is_bits {
+        bytes /= 8.0;
+        if !bytes.is_finite() {
+            return None;
+        }
+    }
+    if bytes <= 0.0 {
+        return Some(0);
+    }
+    if bytes > MAX_RATE_LIMIT_BPS as f64 {
+        return None;
+    }
+    let rounded = bytes.round();
+    if rounded == 0.0 {
+        return None;
+    }
+    if rounded > MAX_RATE_LIMIT_BPS as f64 {
+        return None;
+    }
+    Some(rounded as i64)
+}
+
+fn parse_rate_limit_unit(unit: &str) -> Option<(u128, bool)> {
+    let lower = unit.to_ascii_lowercase();
+    let key = lower.strip_suffix("/s").unwrap_or(lower.as_str());
+    let (multiplier, mut is_bits) = match key {
+        "b" | "byte" | "bytes" => (1, false),
+        "kb" => (1_000, false),
+        "mb" => (1_000_000, false),
+        "gb" => (1_000_000_000, false),
+        "tb" => (1_000_000_000_000, false),
+        "kib" => (1024, false),
+        "mib" => (1024 * 1024, false),
+        "gib" => (1024 * 1024 * 1024, false),
+        "tib" => (1024 * 1024 * 1024 * 1024, false),
+        "bps" => (1, true),
+        "kbps" => (1_000, true),
+        "mbps" => (1_000_000, true),
+        "gbps" => (1_000_000_000, true),
+        "tbps" => (1_000_000_000_000, true),
+        "kbit" => (1_000, true),
+        "mbit" => (1_000_000, true),
+        "gbit" => (1_000_000_000, true),
+        "tbit" => (1_000_000_000_000, true),
+        _ => return None,
+    };
+
+    if unit.ends_with("Bps") && !unit.contains('/') {
+        is_bits = false;
+    }
+    if unit.ends_with("bit/s")
+        || unit.ends_with("bits/s")
+        || (unit.ends_with("b/s") && !unit.ends_with("B/s"))
+        || (lower == "b/s" && !unit.starts_with('B'))
+    {
+        is_bits = true;
+    }
+
+    Some((multiplier, is_bits))
+}
+
+/// Convert the JSON value exposed at `network.global_rate_limit` into bytes/s.
+///
+/// The pinned `Setting.MarshalJSON` emits only the primitive value. Matching
+/// `utils.ParseRateLimitValue`, JSON `null` is unlimited (`0`), a nonnegative
+/// float is rounded half away from zero, strings use the string parser, and
+/// any other type is rejected. Nonfinite values and results outside the
+/// JavaScript-safe integer range are rejected rather than clamped.
+fn parse_rate_limit_json(value: &serde_json::Value) -> Result<i64, ConnectError> {
+    use serde_json::Value;
+
+    let rate = match value {
+        Value::Null => return Ok(0),
+        Value::String(text) => {
+            parse_rate_limit_string(text).ok_or(ConnectError::InvalidResponse)?
+        }
+        Value::Number(number) => {
+            if number.is_f64() {
+                let float = number.as_f64().ok_or(ConnectError::InvalidResponse)?;
+                if !float.is_finite() || float < 0.0 {
+                    return Err(ConnectError::InvalidResponse);
+                }
+                // Fail closed for large JSON floats whose decimal text cannot
+                // be recovered from `serde_json::Value` (stores only `f64`).
+                // Observed `serde_json` parses `"9007199254740991.0"` as
+                // `9007199254740990.0`, while the pinned Go `float64` decoder
+                // keeps the exact value; returning the rounded `f64` would
+                // silently report a wrong byte rate. At magnitudes `>= 2^52`
+                // the `f64` spacing is `>= 1`, so integer `.0` and fractional
+                // forms at `MAX_RATE_LIMIT_BPS` cannot be distinguished
+                // exactly. Reject rather than report a wrong value; exact
+                // integers and canonical `"N B/s"` strings still round-trip
+                // via the integer/string paths.
+                if float >= 4_503_599_627_370_496.0 {
+                    return Err(ConnectError::InvalidResponse);
+                }
+                // `f64::round` rounds half away from zero, matching Go's
+                // `math.Round`. The safe-range check below also covers values
+                // beyond `i64::MAX`, so the cast is always in range.
+                let rounded = float.round();
+                if rounded > MAX_RATE_LIMIT_BPS as f64 {
+                    return Err(ConnectError::InvalidResponse);
+                }
+                rounded as i64
+            } else if let Some(integer) = number.as_i64() {
+                integer
+            } else if let Some(unsigned) = number.as_u64() {
+                if unsigned > MAX_RATE_LIMIT_BPS as u64 {
+                    return Err(ConnectError::InvalidResponse);
+                }
+                unsigned as i64
+            } else {
+                return Err(ConnectError::InvalidResponse);
+            }
+        }
+        _ => return Err(ConnectError::InvalidResponse),
+    };
+
+    if !(0..=MAX_RATE_LIMIT_BPS).contains(&rate) {
+        return Err(ConnectError::InvalidResponse);
+    }
+    Ok(rate)
+}
+
+async fn get_settings_rate_limit(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+) -> Result<i64, ConnectError> {
+    let response = client
+        .get(format!("{}/settings", base_url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(map_send_error)?;
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(ConnectError::Unauthorized);
+    }
+    if status != StatusCode::OK {
+        return Err(ConnectError::InvalidResponse);
+    }
+    let bytes = read_bounded_body(response).await?;
+    let settings: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ConnectError::InvalidResponse)?;
+    let value = settings
+        .get("network")
+        .and_then(|network| network.get("global_rate_limit"))
+        .ok_or(ConnectError::InvalidResponse)?;
+    parse_rate_limit_json(value)
 }
 
 /// Case-insensitive match against the exact released duplicate-rejection
@@ -604,6 +841,77 @@ impl SurgeClient {
                     Err(ConnectError::InvalidResponse)
                 }
             }
+        }
+    }
+
+    /// Read the live global download limit from the pinned `/settings` route.
+    ///
+    /// Only the authenticated origin is contacted, the response body is
+    /// bounded, and the returned value is the nonnegative integer bytes/sec in
+    /// `[0, MAX_RATE_LIMIT_BPS]`. No response body, path, or credential is
+    /// included in an error.
+    pub async fn get_global_rate_limit(&self) -> Result<i64, ConnectError> {
+        get_settings_rate_limit(&self.client, &self.base_url, &self.token).await
+    }
+
+    /// POST the exact integer rate. Every failure after the request is handed
+    /// to the HTTP stack is ambiguous: the daemon may already have applied the
+    /// setting even when the response is an error, malformed, or missing.
+    async fn post_global_rate_limit(&self, rate: i64) -> Result<(), ConnectError> {
+        let mut url = Url::parse(&self.base_url).map_err(|_| ConnectError::InvalidResponse)?;
+        url.set_path("/rate-limit/global");
+        url.query_pairs_mut().append_pair("rate", &rate.to_string());
+        let response = match self.client.post(url).bearer_auth(&self.token).send().await {
+            Ok(response) => response,
+            Err(_) => return Err(ConnectError::RateUnconfirmed),
+        };
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Err(ConnectError::RateUnconfirmed);
+        }
+        let bytes = match read_bounded_body(response).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(ConnectError::RateUnconfirmed),
+        };
+        let ack: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(ack) => ack,
+            Err(_) => return Err(ConnectError::RateUnconfirmed),
+        };
+        let expected_status = if rate == 0 {
+            "global_rate_unlimited"
+        } else {
+            "global_rate_limited"
+        };
+        let expected_rate = rate.to_string();
+        if ack.get("status").and_then(serde_json::Value::as_str) != Some(expected_status)
+            || ack.get("rate").and_then(serde_json::Value::as_str) != Some(expected_rate.as_str())
+        {
+            return Err(ConnectError::RateUnconfirmed);
+        }
+        Ok(())
+    }
+
+    /// Apply a global download limit and reconcile it with a fresh readback.
+    ///
+    /// Validation is local and bounded. Any `POST` failure after the request
+    /// starts is reported as [`ConnectError::RateUnconfirmed`] immediately,
+    /// without trusting a readback: a delayed request may still apply later.
+    /// The connection manager must permanently fence its writer afterwards.
+    /// Only a definitive success acknowledgement is read back; success is
+    /// returned only when the live `/settings` value exactly matches `rate`.
+    /// An unreadable/unparseable readback is also `RateUnconfirmed`; a
+    /// definitively different value is `InvalidResponse`. Returns the
+    /// confirmed bytes/sec.
+    pub async fn set_global_rate_limit(&self, rate: i64) -> Result<i64, ConnectError> {
+        if !(0..=MAX_RATE_LIMIT_BPS).contains(&rate) {
+            return Err(ConnectError::InvalidResponse);
+        }
+
+        self.post_global_rate_limit(rate).await?;
+        match get_settings_rate_limit(&self.client, &self.base_url, &self.token).await {
+            Ok(confirmed) if confirmed == rate => Ok(confirmed),
+            Ok(_) => Err(ConnectError::InvalidResponse),
+            Err(_) => Err(ConnectError::RateUnconfirmed),
         }
     }
 }

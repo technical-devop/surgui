@@ -4,6 +4,7 @@ pub mod managed_process;
 pub mod managed_server;
 pub mod managed_state;
 pub mod managed_windows;
+pub mod open_location;
 pub mod surge_client;
 
 use commands::ConnectionManager;
@@ -17,6 +18,9 @@ pub fn run() {
             commands::start_managed_surge,
             commands::connect_surge,
             commands::list_downloads,
+            commands::open_download_location,
+            commands::get_global_rate_limit,
+            commands::set_global_rate_limit,
             commands::disconnect_surge,
             commands::control_download,
             commands::add_download

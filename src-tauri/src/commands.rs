@@ -11,7 +11,12 @@ use tauri::path::BaseDirectory;
 use tauri::Manager as _;
 
 use crate::managed_server::{ManagedServer, OwnerLifetime, DEFAULT_STARTUP_TIMEOUT};
-use crate::surge_client::{AddOutcome, ConnectError, ControlAction, Download, SurgeClient};
+use crate::open_location::{
+    self, LocationError, LocationLaunch, LocationLauncher, SystemLocationLauncher,
+};
+use crate::surge_client::{
+    AddOutcome, ConnectError, ControlAction, Download, SurgeClient, MAX_RATE_LIMIT_BPS,
+};
 
 /// How often an async lifecycle operation checks the app-shutdown flag.
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -29,7 +34,10 @@ const RETIREMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(9);
 /// Largest integer exactly representable as a JavaScript `Number`. Byte counts
 /// and timestamps from Surge are signed `int64`; values outside this range are
 /// clamped so they survive the JSON/JS boundary without precision loss.
-const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+const JS_MAX_SAFE_INTEGER: i64 = MAX_RATE_LIMIT_BPS;
+
+/// Upper bound for a download id accepted by the location command.
+const MAX_DOWNLOAD_ID_BYTES: usize = 4 * 1024;
 
 /// Sanitized queue row sent to the frontend.
 ///
@@ -76,9 +84,20 @@ pub enum BridgeError {
     Timeout,
     BodyTooLarge,
     InvalidResponse,
+    RateUnconfirmed,
     NotConnected,
     Superseded,
     State,
+    InvalidDownloadId,
+    DownloadNotFound,
+    DownloadAmbiguous,
+    DownloadNotCompleted,
+    DownloadMoving,
+    DownloadFileMissing,
+    ManagedConnectionRequired,
+    LocationUnavailable,
+    LocationUnsupported,
+    LocationLaunchFailed,
 }
 
 impl fmt::Debug for BridgeError {
@@ -91,9 +110,20 @@ impl fmt::Debug for BridgeError {
             Self::Timeout => "Timeout",
             Self::BodyTooLarge => "BodyTooLarge",
             Self::InvalidResponse => "InvalidResponse",
+            Self::RateUnconfirmed => "RateUnconfirmed",
             Self::NotConnected => "NotConnected",
             Self::Superseded => "Superseded",
             Self::State => "State",
+            Self::InvalidDownloadId => "InvalidDownloadId",
+            Self::DownloadNotFound => "DownloadNotFound",
+            Self::DownloadAmbiguous => "DownloadAmbiguous",
+            Self::DownloadNotCompleted => "DownloadNotCompleted",
+            Self::DownloadMoving => "DownloadMoving",
+            Self::DownloadFileMissing => "DownloadFileMissing",
+            Self::ManagedConnectionRequired => "ManagedConnectionRequired",
+            Self::LocationUnavailable => "LocationUnavailable",
+            Self::LocationUnsupported => "LocationUnsupported",
+            Self::LocationLaunchFailed => "LocationLaunchFailed",
         };
         f.write_str(code)
     }
@@ -109,9 +139,20 @@ impl fmt::Display for BridgeError {
             Self::Timeout => "connection timed out",
             Self::BodyTooLarge => "response body too large",
             Self::InvalidResponse => "invalid response from server",
+            Self::RateUnconfirmed => "rate limit state could not be confirmed",
             Self::NotConnected => "not connected to a Surge instance",
             Self::Superseded => "connection attempt was superseded",
             Self::State => "connection state unavailable",
+            Self::InvalidDownloadId => "invalid download id",
+            Self::DownloadNotFound => "download not found",
+            Self::DownloadAmbiguous => "download id is ambiguous",
+            Self::DownloadNotCompleted => "download is not completed",
+            Self::DownloadMoving => "download file is moving",
+            Self::DownloadFileMissing => "download file is missing",
+            Self::ManagedConnectionRequired => "managed connection required",
+            Self::LocationUnavailable => "download location is unavailable",
+            Self::LocationUnsupported => "download location is unsupported",
+            Self::LocationLaunchFailed => "download location could not be opened",
         };
         f.write_str(message)
     }
@@ -205,6 +246,23 @@ impl From<crate::managed_server::ManagedStartupStage> for ManagedError {
     }
 }
 
+impl From<LocationError> for BridgeError {
+    fn from(err: LocationError) -> Self {
+        // LocationError never carries path or OS detail; map only the stable
+        // class so no private filesystem information can cross IPC or logs.
+        match err {
+            LocationError::Missing => Self::DownloadFileMissing,
+            #[cfg(not(any(target_os = "linux", windows)))]
+            LocationError::UnsupportedPlatform => Self::LocationUnsupported,
+            LocationError::LaunchFailed => Self::LocationLaunchFailed,
+            LocationError::InvalidPath
+            | LocationError::NonLocal
+            | LocationError::Symlink
+            | LocationError::Unavailable => Self::LocationUnavailable,
+        }
+    }
+}
+
 impl From<ConnectError> for BridgeError {
     fn from(err: ConnectError) -> Self {
         // Map known codes only; the `InvalidEndpoint` reason string is dropped
@@ -217,6 +275,7 @@ impl From<ConnectError> for BridgeError {
             ConnectError::Timeout => Self::Timeout,
             ConnectError::BodyTooLarge => Self::BodyTooLarge,
             ConnectError::InvalidResponse => Self::InvalidResponse,
+            ConnectError::RateUnconfirmed => Self::RateUnconfirmed,
         }
     }
 }
@@ -318,6 +377,12 @@ struct LifecycleOperation {
     lifecycle: Arc<ManagedLifecycle>,
 }
 
+impl LifecycleOperation {
+    fn is_shutting_down(&self) -> bool {
+        self.lifecycle.is_shutting_down()
+    }
+}
+
 impl Drop for LifecycleOperation {
     fn drop(&mut self) {
         let mut state = self.lifecycle.lock();
@@ -385,6 +450,140 @@ impl Drop for RetirementGuard {
     }
 }
 
+/// Serializes every global-rate mutation for this app lifetime.
+///
+/// The async gate is acquired before the HTTP operation starts and moved into
+/// a managed background task, so dropping the Tauri command future cannot
+/// release it while a write is in flight. `poisoned` is deliberately never
+/// cleared by disconnect/reconnect or daemon retirement: an ambiguous write
+/// may still land later, so only a process restart (which also retires the
+/// daemon) may re-enable writes.
+#[derive(Default)]
+struct RateWriter {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    poisoned: AtomicBool,
+}
+
+/// Atomically captured managed writer target. The epoch and pid must still
+/// match when the operation finishes (success or failure) before any result is
+/// allowed to surface as current.
+struct ManagedRateSnapshot {
+    client: Arc<SurgeClient>,
+    epoch: u64,
+    pid: u32,
+}
+
+/// Fail-closed guard for one in-flight rate write.
+///
+/// Disarmed only for a definitive result (confirmed success or a definitive
+/// pre-request/local rejection). Any panic, abort, or ambiguous outcome drops
+/// the guard while armed and permanently poisons the writer.
+struct RateWritePoison {
+    writer: Arc<RateWriter>,
+    armed: bool,
+}
+
+impl RateWritePoison {
+    fn new(writer: Arc<RateWriter>) -> Self {
+        Self {
+            writer,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn poison_now(&mut self) {
+        self.writer.poisoned.store(true, Ordering::SeqCst);
+        self.armed = false;
+    }
+}
+
+impl Drop for RateWritePoison {
+    fn drop(&mut self) {
+        if self.armed {
+            self.writer.poisoned.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Serializes synchronous location validation for this manager.
+///
+/// The permit is acquired before dispatch and moved into the blocking closure,
+/// so a cancelled caller cannot release it while the filesystem walk is still
+/// running. A busy permit fails immediately rather than dispatching another
+/// blocking worker, which bounds worker use when a filesystem call hangs.
+#[derive(Default)]
+struct LocationValidationGate {
+    busy: AtomicBool,
+}
+
+struct LocationValidationPermit {
+    gate: Arc<LocationValidationGate>,
+}
+
+impl LocationValidationGate {
+    fn try_acquire(self: &Arc<Self>) -> Option<LocationValidationPermit> {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| LocationValidationPermit {
+                gate: Arc::clone(self),
+            })
+    }
+}
+
+impl Drop for LocationValidationPermit {
+    fn drop(&mut self) {
+        self.gate.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Serializes the actually blocking file-manager launch for this manager.
+///
+/// The permit is acquired with the final shutdown/ownership reservation and
+/// moved into the blocking worker, so a cancelled caller cannot release it
+/// while a filesystem or process creation call is still running. A busy permit
+/// rejects immediately instead of dispatching another blocking worker.
+#[derive(Default)]
+struct LocationLaunchGate {
+    busy: AtomicBool,
+}
+
+struct LocationLaunchPermit {
+    gate: Arc<LocationLaunchGate>,
+}
+
+struct LocationLaunchReservation {
+    _permit: LocationLaunchPermit,
+}
+
+impl LocationLaunchGate {
+    fn try_acquire(self: &Arc<Self>) -> Option<LocationLaunchPermit> {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| LocationLaunchPermit {
+                gate: Arc::clone(self),
+            })
+    }
+}
+
+impl Drop for LocationLaunchPermit {
+    fn drop(&mut self) {
+        self.gate.busy.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestManagedConnection {
+    client: Arc<SurgeClient>,
+    pid: u32,
+}
+
 #[derive(Default)]
 struct ConnectionState {
     epoch: u64,
@@ -394,10 +593,85 @@ struct ConnectionState {
     retiring: usize,
     manual: Option<Arc<SurgeClient>>,
     managed: Option<ManagedServer>,
+    #[cfg(test)]
+    test_managed: Option<TestManagedConnection>,
     active: ActiveConnection,
 }
 
 impl ConnectionState {
+    fn active_snapshot(&self) -> Result<(Arc<SurgeClient>, u64), BridgeError> {
+        match self.active {
+            ActiveConnection::None => Err(BridgeError::NotConnected),
+            ActiveConnection::Manual => {
+                let client = self.manual.clone().ok_or(BridgeError::NotConnected)?;
+                Ok((client, self.epoch))
+            }
+            ActiveConnection::Managed => {
+                #[cfg(test)]
+                if let Some(test) = self.test_managed.as_ref() {
+                    return Ok((Arc::clone(&test.client), self.epoch));
+                }
+                let server = self.managed.as_ref().ok_or(BridgeError::NotConnected)?;
+                if server.has_exited() {
+                    return Err(BridgeError::NotConnected);
+                }
+                Ok((server.client(), self.epoch))
+            }
+        }
+    }
+
+    fn managed_rate_snapshot(&self) -> Result<ManagedRateSnapshot, BridgeError> {
+        if self.active != ActiveConnection::Managed {
+            return Err(BridgeError::NotConnected);
+        }
+        #[cfg(test)]
+        if let Some(test) = self.test_managed.as_ref() {
+            return Ok(ManagedRateSnapshot {
+                client: Arc::clone(&test.client),
+                epoch: self.epoch,
+                pid: test.pid,
+            });
+        }
+        let server = self.managed.as_ref().ok_or(BridgeError::NotConnected)?;
+        if server.has_exited() {
+            return Err(BridgeError::NotConnected);
+        }
+        Ok(ManagedRateSnapshot {
+            client: server.client(),
+            epoch: self.epoch,
+            pid: server.pid(),
+        })
+    }
+
+    fn managed_location_snapshot(&self) -> Result<ManagedRateSnapshot, BridgeError> {
+        if self.active == ActiveConnection::Manual {
+            return Err(BridgeError::ManagedConnectionRequired);
+        }
+        self.managed_rate_snapshot()
+    }
+
+    fn rate_write_is_current(&self, snapshot: &ManagedRateSnapshot) -> bool {
+        if self.epoch != snapshot.epoch || self.active != ActiveConnection::Managed {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(test) = self.test_managed.as_ref() {
+            return test.pid == snapshot.pid;
+        }
+        self.managed
+            .as_ref()
+            .is_some_and(|server| !server.has_exited() && server.pid() == snapshot.pid)
+    }
+
+    fn clear_active(&mut self) {
+        self.manual = None;
+        self.active = ActiveConnection::None;
+        #[cfg(test)]
+        {
+            self.test_managed = None;
+        }
+    }
+
     fn mark_retirement(&mut self) {
         self.retiring = self.retiring.saturating_add(1);
     }
@@ -432,8 +706,7 @@ impl ConnectionState {
         self.start_generation = self.start_generation.wrapping_add(1);
         self.starting = true;
         self.epoch = self.epoch.wrapping_add(1);
-        self.manual = None;
-        self.active = ActiveConnection::None;
+        self.clear_active();
         Ok((
             ManagedStartTicket {
                 generation: self.start_generation,
@@ -543,6 +816,9 @@ impl Drop for ManagedStartGuard {
 pub struct ConnectionManager {
     state: Arc<Mutex<ConnectionState>>,
     lifecycle: Arc<ManagedLifecycle>,
+    rate_writer: Arc<RateWriter>,
+    location_validation: Arc<LocationValidationGate>,
+    location_launch: Arc<LocationLaunchGate>,
 }
 
 impl fmt::Debug for ConnectionManager {
@@ -582,8 +858,7 @@ impl ConnectionManager {
         let (epoch, retired, retirement_registered) = {
             let mut state = self.state.lock().map_err(|_| BridgeError::State)?;
             state.epoch = state.epoch.wrapping_add(1);
-            state.manual = None;
-            state.active = ActiveConnection::None;
+            state.clear_active();
             let retired = state.managed.take();
             let registered = if retired.is_some() {
                 state.mark_retirement();
@@ -754,6 +1029,10 @@ impl ConnectionManager {
         }
         state.managed = Some(server);
         state.manual = None;
+        #[cfg(test)]
+        {
+            state.test_managed = None;
+        }
         state.active = ActiveConnection::Managed;
         drop(state);
         Ok(cached)
@@ -764,7 +1043,11 @@ impl ConnectionManager {
     /// In-flight operations hold only an `Arc<SurgeClient>` clone, so taking
     /// the owned server out here is safe and never strands a lease. Detached
     /// starts and retirements are cancelled through the lifecycle flag and
-    /// waited for within a fixed bound before this returns.
+    /// waited for within a fixed bound before this returns. A location launch
+    /// that already reserved before the fence is accepted and may finish after
+    /// shutdown begins; shutdown waits for it only up to the same bound and
+    /// does not promise that an accepted launch cannot physically spawn a
+    /// process after shutdown starts.
     pub fn shutdown_managed(&self) -> bool {
         // Fence new lifecycle work first, then invalidate the connection state.
         // This ordering means an operation that already claimed a slot either
@@ -778,8 +1061,7 @@ impl ConnectionManager {
         state.starting = false;
         state.start_generation = state.start_generation.wrapping_add(1);
         state.epoch = state.epoch.wrapping_add(1);
-        state.manual = None;
-        state.active = ActiveConnection::None;
+        state.clear_active();
         let server = state.managed.take();
         drop(state);
         if let Some(server) = server {
@@ -808,20 +1090,7 @@ impl ConnectionManager {
     /// polling/control calls with `NotConnected`.
     fn acquire_active(&self) -> Result<(Arc<SurgeClient>, u64), BridgeError> {
         let state = self.state.lock().map_err(|_| BridgeError::State)?;
-        match state.active {
-            ActiveConnection::None => Err(BridgeError::NotConnected),
-            ActiveConnection::Manual => {
-                let client = state.manual.clone().ok_or(BridgeError::NotConnected)?;
-                Ok((client, state.epoch))
-            }
-            ActiveConnection::Managed => {
-                let server = state.managed.as_ref().ok_or(BridgeError::NotConnected)?;
-                if server.has_exited() {
-                    return Err(BridgeError::NotConnected);
-                }
-                Ok((server.client(), state.epoch))
-            }
-        }
+        state.active_snapshot()
     }
 
     /// Re-query `/list` on the active connection.
@@ -847,6 +1116,182 @@ impl ConnectionManager {
     /// no lock is held across the await.
     pub async fn list_downloads(&self) -> Result<Vec<QueueItemDto>, BridgeError> {
         self.refresh().await
+    }
+
+    /// Open the containing folder of a completed download on the owned managed
+    /// daemon.
+    ///
+    /// The IPC caller supplies only an id. This captures the owned daemon's
+    /// client, epoch and pid, performs a fresh authenticated `/list`, requires
+    /// exactly one matching completed item that is neither moving nor already
+    /// reported missing, validates the server-provided destination and its
+    /// actual file, then rechecks the same epoch/pid/active-managed state
+    /// immediately before launching the platform file manager. Manual/remote
+    /// connections, stale daemons, duplicate ids and invalid locations fail
+    /// closed. The destination path is never returned, logged or forwarded.
+    pub async fn open_download_location(&self, id: &str) -> Result<(), BridgeError> {
+        self.open_download_location_with(id, Arc::new(SystemLocationLauncher))
+            .await
+    }
+
+    async fn open_download_location_with<L>(
+        &self,
+        id: &str,
+        launcher: Arc<L>,
+    ) -> Result<(), BridgeError>
+    where
+        L: LocationLauncher + 'static,
+    {
+        if id.is_empty() || id.len() > MAX_DOWNLOAD_ID_BYTES || id.chars().any(char::is_control) {
+            return Err(BridgeError::InvalidDownloadId);
+        }
+
+        let snapshot = {
+            let state = self.state.lock().map_err(|_| BridgeError::State)?;
+            if state.shutting_down {
+                return Err(BridgeError::Superseded);
+            }
+            state.managed_location_snapshot()?
+        };
+
+        // Keep app shutdown from draining while the refresh, validation and
+        // launch are still running; the final state check below also observes
+        // a shutdown that began in the meantime.
+        let operation = self
+            .lifecycle
+            .begin_operation()
+            .ok_or(BridgeError::Superseded)?;
+        if operation.is_shutting_down() {
+            return Err(BridgeError::Superseded);
+        }
+
+        let downloads = snapshot.client.refresh().await.map_err(BridgeError::from)?;
+        let mut matches = downloads.iter().filter(|download| download.id == id);
+        let download = match (matches.next(), matches.next()) {
+            (Some(download), None) => download,
+            (None, _) => return Err(BridgeError::DownloadNotFound),
+            (Some(_), Some(_)) => return Err(BridgeError::DownloadAmbiguous),
+        };
+        if download.status != "completed" {
+            return Err(BridgeError::DownloadNotCompleted);
+        }
+        if download.moving {
+            return Err(BridgeError::DownloadMoving);
+        }
+        if download.file_missing {
+            return Err(BridgeError::DownloadFileMissing);
+        }
+        let destination = download
+            .dest_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .ok_or(BridgeError::LocationUnavailable)?;
+        let destination = destination.to_owned();
+        let directory = self
+            .validate_location_blocking(move || {
+                open_location::containing_directory_for_completed_file(&destination)
+            })
+            .await?;
+
+        if operation.is_shutting_down() {
+            return Err(BridgeError::Superseded);
+        }
+        let (launch, operation) = self
+            .launch_location_if_current(operation, &snapshot, launcher, directory)
+            .await?;
+        // Confirm bounded immediate status off the async worker; the lifecycle
+        // ticket retained by the accepted reservation keeps shutdown waiting
+        // for this bounded step too.
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            launch.wait_bounded(open_location::LAUNCH_STATUS_TIMEOUT)
+        })
+        .await
+        .map_err(|_| BridgeError::LocationLaunchFailed)??;
+        Ok(())
+    }
+
+    /// Run the synchronous filesystem validation on the blocking pool under a
+    /// single manager-wide permit. The permit is acquired before dispatch and
+    /// moved into the closure, so it remains held until validation finishes
+    /// even if this future is cancelled. A busy permit returns a fixed
+    /// sanitized failure without dispatching more blocking work, so a hung
+    /// filesystem cannot accumulate blocked workers.
+    async fn validate_location_blocking<F>(&self, validate: F) -> Result<PathBuf, BridgeError>
+    where
+        F: FnOnce() -> Result<PathBuf, LocationError> + Send + 'static,
+    {
+        let permit = self
+            .location_validation
+            .try_acquire()
+            .ok_or(BridgeError::LocationUnavailable)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            validate()
+        })
+        .await
+        .map_err(|_| BridgeError::LocationUnavailable)?
+        .map_err(BridgeError::from)
+    }
+
+    /// Atomically reserve a launch before shutdown and then run it off the
+    /// async worker.
+    ///
+    /// The state and lifecycle locks are held only for the final ownership
+    /// check and the explicit reservation. A click that reserves before the
+    /// shutdown fence is accepted: it owns the reservation and may finish after
+    /// shutdown begins. The reservation's lifecycle ticket is moved into the
+    /// single-permit `spawn_blocking` worker and retained until that worker
+    /// exits, even if the caller is cancelled. After the fence no new
+    /// reservation is made. Shutdown therefore stays bounded even if the
+    /// blocking launch stalls; this does not promise that an already accepted
+    /// launch cannot physically create a process after shutdown starts.
+    async fn launch_location_if_current<L>(
+        &self,
+        operation: LifecycleOperation,
+        snapshot: &ManagedRateSnapshot,
+        launcher: Arc<L>,
+        directory: PathBuf,
+    ) -> Result<(LocationLaunch, LifecycleOperation), BridgeError>
+    where
+        L: LocationLauncher + 'static,
+    {
+        let reservation = self.reserve_launch_if_current(snapshot)?;
+        // Resolve and spawn only after both locks are released. The reservation
+        // and lifecycle ticket stay with the worker until it exits.
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            let result = launcher.launch_directory(&directory);
+            (result, operation)
+        })
+        .await
+        .map_err(|_| BridgeError::LocationLaunchFailed)
+        .and_then(|(result, operation)| {
+            result
+                .map(|launch| (launch, operation))
+                .map_err(BridgeError::from)
+        })
+    }
+
+    /// Final atomic check and reservation. Locks are released before the
+    /// potentially blocking launch work starts.
+    fn reserve_launch_if_current(
+        &self,
+        snapshot: &ManagedRateSnapshot,
+    ) -> Result<LocationLaunchReservation, BridgeError> {
+        // Preserve the state -> lifecycle lock order. `begin_shutdown` sets the
+        // fence under the lifecycle lock and releases it before taking state.
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        let lifecycle = self.lifecycle.lock();
+        if state.shutting_down || lifecycle.shutting_down || !state.rate_write_is_current(snapshot)
+        {
+            return Err(BridgeError::Superseded);
+        }
+        let permit = self
+            .location_launch
+            .try_acquire()
+            .ok_or(BridgeError::LocationLaunchFailed)?;
+        Ok(LocationLaunchReservation { _permit: permit })
     }
 
     /// Apply a released control action to the active connection.
@@ -893,6 +1338,179 @@ impl ConnectionManager {
         Ok(outcome)
     }
 
+    /// Read the active connection's global download limit in bytes/sec.
+    ///
+    /// Read-only access is allowed for both owned-managed and manual
+    /// connections. The pinned client and epoch are cloned under the lock, the
+    /// network round trip runs without it, and the epoch is re-checked after
+    /// both success and failure so an old connection's error can never surface
+    /// as the replacement connection's state.
+    pub async fn get_global_rate_limit(&self) -> Result<i64, BridgeError> {
+        let (client, epoch) = self.acquire_active()?;
+        let result = client.get_global_rate_limit().await;
+
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        if state.epoch != epoch {
+            return Err(BridgeError::Superseded);
+        }
+        drop(state);
+        result.map_err(BridgeError::from)
+    }
+
+    /// Apply and confirm an owned managed daemon's global download limit.
+    ///
+    /// Only a currently owned managed daemon may be written. A manually
+    /// connected server cannot be fenced against a delayed request, so writes
+    /// to it are refused with [`BridgeError::NotConnected`] (reads still work).
+    ///
+    /// Every setter shares one manager-level async gate, acquired before the
+    /// request starts. The intended managed client and epoch are captured
+    /// before waiting on that gate, so a queued caller can never retarget a
+    /// replacement daemon that becomes active while it waits. After acquiring
+    /// the gate, the same epoch, managed identity, and shutdown state are
+    /// revalidated immediately before dispatch.
+    ///
+    /// A lifecycle operation ticket is registered before the gate wait and
+    /// moved into the background task, so app shutdown cannot finish draining
+    /// while a rate write (or its queued predecessor) is still outstanding.
+    /// The task keeps the gate and ticket until the HTTP request, epoch
+    /// recheck, and poison decision all finish.
+    ///
+    /// Invalid input is rejected locally (definitively pre-request). Any
+    /// ambiguous write outcome returns [`BridgeError::RateUnconfirmed`] and
+    /// permanently poisons this manager's writer for the rest of the process
+    /// lifetime; later writes (including after disconnect/reconnect) return
+    /// `RateUnconfirmed` without sending anything. Only an app restart, which
+    /// also retires the owned daemon, starts fresh.
+    pub async fn set_global_rate_limit(&self, rate: i64) -> Result<i64, BridgeError> {
+        if !(0..=MAX_RATE_LIMIT_BPS).contains(&rate) {
+            return Err(BridgeError::InvalidResponse);
+        }
+
+        if self.rate_writer.poisoned.load(Ordering::SeqCst) {
+            return Err(BridgeError::RateUnconfirmed);
+        }
+
+        // Capture the intended target before waiting on the writer gate. A
+        // queued caller must keep operating on the daemon it observed, not on
+        // a replacement that becomes active while it is queued.
+        let snapshot = {
+            let state = self.state.lock().map_err(|_| BridgeError::State)?;
+            if state.shutting_down {
+                return Err(BridgeError::Superseded);
+            }
+            state.managed_rate_snapshot()?
+        };
+
+        // Register before any async work so app shutdown cannot finish
+        // draining while this write is still queued or in flight.
+        let lifecycle = self
+            .lifecycle
+            .begin_operation()
+            .ok_or(BridgeError::Superseded)?;
+
+        let writer = Arc::clone(&self.rate_writer);
+        let gate = Arc::clone(&writer.gate).lock_owned().await;
+        if writer.poisoned.load(Ordering::SeqCst) {
+            return Err(BridgeError::RateUnconfirmed);
+        }
+
+        let state = Arc::clone(&self.state);
+        let client = Arc::clone(&snapshot.client);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        // The background task owns the gate, lifecycle ticket, and a
+        // fail-closed poison guard. Caller cancellation only drops
+        // `result_rx`; the revalidation, HTTP request, epoch recheck, and
+        // poison decision still finish, and shutdown keeps waiting for the
+        // lifecycle ticket.
+        tokio::spawn(async move {
+            let _gate = gate;
+            let operation_lifecycle = lifecycle;
+            let mut poison = RateWritePoison::new(Arc::clone(&writer));
+
+            // Revalidate immediately before dispatch. The target may have
+            // been retired, replaced, or the app may have begun shutting down
+            // while this caller waited for the gate; in that case this write
+            // must never be sent.
+            let dispatch = if operation_lifecycle.is_shutting_down() {
+                Err(BridgeError::Superseded)
+            } else {
+                match state.lock() {
+                    Ok(state) if !state.shutting_down && state.rate_write_is_current(&snapshot) => {
+                        Ok(())
+                    }
+                    Ok(_) => Err(BridgeError::Superseded),
+                    Err(_) => Err(BridgeError::State),
+                }
+            };
+            if let Err(error) = dispatch {
+                poison.disarm();
+                let _ = result_tx.send(Err(error));
+                return;
+            }
+
+            let operation = client.set_global_rate_limit(rate).await;
+            if matches!(&operation, Err(ConnectError::RateUnconfirmed)) {
+                poison.poison_now();
+            } else {
+                poison.disarm();
+            }
+
+            let result = {
+                let state = match state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        let result = if matches!(&operation, Err(ConnectError::RateUnconfirmed)) {
+                            Err(BridgeError::RateUnconfirmed)
+                        } else {
+                            Err(BridgeError::State)
+                        };
+                        let _ = result_tx.send(result);
+                        return;
+                    }
+                };
+                // Recheck after both Ok and Err. A stale operation must not
+                // leak its old success or old error as the new connection's
+                // state, but its poison decision above still stands. A stale
+                // ambiguous outcome is global current state (the writer is
+                // already poisoned), not a stale connection error, so it
+                // surfaces as RateUnconfirmed without any server detail.
+                if !state.rate_write_is_current(&snapshot) {
+                    if matches!(&operation, Err(ConnectError::RateUnconfirmed)) {
+                        Err(BridgeError::RateUnconfirmed)
+                    } else {
+                        Err(BridgeError::Superseded)
+                    }
+                } else {
+                    operation.map_err(BridgeError::from)
+                }
+            };
+            let _ = result_tx.send(result);
+        });
+
+        match result_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                if self.rate_writer.poisoned.load(Ordering::SeqCst) {
+                    Err(BridgeError::RateUnconfirmed)
+                } else {
+                    Err(BridgeError::State)
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn install_test_managed(&self, client: Arc<SurgeClient>, pid: u32) -> u64 {
+        let mut state = self.state.lock().expect("test state lock");
+        state.epoch = state.epoch.wrapping_add(1);
+        state.manual = None;
+        state.test_managed = Some(TestManagedConnection { client, pid });
+        state.active = ActiveConnection::Managed;
+        state.epoch
+    }
+
     /// Drop the active connection and fence off any in-flight `connect`.
     ///
     /// Any owned managed daemon is retired as well, outside the lock, with the
@@ -915,8 +1533,7 @@ impl ConnectionManager {
             Err(poisoned) => poisoned.into_inner(),
         };
         state.epoch = state.epoch.wrapping_add(1);
-        state.manual = None;
-        state.active = ActiveConnection::None;
+        state.clear_active();
         let server = state.managed.take();
         let registered = if server.is_some() {
             state.mark_retirement();
@@ -1277,6 +1894,36 @@ pub async fn list_downloads(
     state: tauri::State<'_, ConnectionManager>,
 ) -> Result<Vec<QueueItemDto>, BridgeError> {
     state.list_downloads().await
+}
+
+/// Open the containing folder of a completed download on the owned managed
+/// daemon. Accepts only the server-owned download id; no path crosses IPC.
+#[tauri::command]
+pub async fn open_download_location(
+    id: String,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<(), BridgeError> {
+    state.open_download_location(&id).await
+}
+
+/// Read the active global download limit in integer bytes/sec.
+#[tauri::command]
+pub async fn get_global_rate_limit(
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<i64, BridgeError> {
+    state.get_global_rate_limit().await
+}
+
+/// Apply a nonnegative global download limit in integer bytes/sec and return
+/// the confirmed readback. `0` means unlimited. Invalid or unsafe-sized input
+/// is rejected as [`BridgeError::InvalidResponse`]; an unreadable/unparseable
+/// readback is [`BridgeError::RateUnconfirmed`].
+#[tauri::command]
+pub async fn set_global_rate_limit(
+    rate: i64,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<i64, BridgeError> {
+    state.set_global_rate_limit(rate).await
 }
 
 #[tauri::command]
@@ -2822,5 +3469,1259 @@ mod tests {
             .wait_for_prior_retirements(0, std::time::Duration::from_millis(100))
             .await
             .expect("retry succeeds once retirement is complete");
+    }
+
+    // -----------------------------------------------------------------------
+    // Global rate writer ordering/fencing against a loopback managed target.
+    // -----------------------------------------------------------------------
+
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+
+    struct RateTestCaptured {
+        request_line: String,
+    }
+
+    const RATE_TEST_LIST: &str = r#"[{"id":"r-001","url":"https://dl.example.test/rate.bin","filename":"rate.bin","total_size":10,"downloaded":1,"progress":10.0,"speed":0.0,"status":"downloading","eta":1}]"#;
+
+    fn rate_test_write_response(stream: &mut TcpStream, status_line: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            status_line,
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn rate_test_accept(listener: &TcpListener) -> TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    return stream;
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no loopback connection accepted within deadline"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+    }
+
+    fn rate_test_read_head(stream: &mut TcpStream) -> String {
+        let mut buf = [0u8; 4096];
+        let mut head = Vec::new();
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => head.extend_from_slice(&buf[..count]),
+            }
+        }
+        String::from_utf8_lossy(&head).to_string()
+    }
+
+    fn rate_test_capture(stream: &mut TcpStream) -> RateTestCaptured {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set read timeout");
+        let head = rate_test_read_head(stream);
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap_or_default().trim().to_string();
+        RateTestCaptured { request_line }
+    }
+
+    fn rate_test_settings(rate: i64) -> String {
+        format!(r#"{{"network":{{"global_rate_limit":"{rate} B/s"}}}}"#)
+    }
+
+    fn rate_test_ack(rate: i64) -> String {
+        let status = if rate == 0 {
+            "global_rate_unlimited"
+        } else {
+            "global_rate_limited"
+        };
+        format!(r#"{{"status":"{status}","rate":"{rate}"}}"#)
+    }
+
+    fn rate_test_spawn_scripted(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, thread::JoinHandle<Vec<RateTestCaptured>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let mut captured = Vec::with_capacity(responses.len());
+            for (status_line, body) in responses {
+                let mut stream = rate_test_accept(&listener);
+                captured.push(rate_test_capture(&mut stream));
+                rate_test_write_response(&mut stream, status_line, &body);
+            }
+            captured
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    async fn install_rate_test_managed(
+        manager: &ConnectionManager,
+        base: &str,
+        pid: u32,
+    ) -> (Arc<SurgeClient>, u64) {
+        let client = Arc::new(
+            SurgeClient::connect(base, "test-token")
+                .await
+                .expect("loopback managed client"),
+        );
+        let epoch = manager.install_test_managed(Arc::clone(&client), pid);
+        (client, epoch)
+    }
+
+    fn rate_test_spawn_gated_post(
+        status_line: &'static str,
+        body: String,
+        readback: String,
+    ) -> (
+        String,
+        thread::JoinHandle<Vec<RateTestCaptured>>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::with_capacity(3);
+            let mut first = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut first));
+            rate_test_write_response(&mut first, "200 OK", RATE_TEST_LIST);
+
+            let mut second = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut second));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            rate_test_write_response(&mut second, status_line, &body);
+
+            if status_line == "200 OK" {
+                let mut third = rate_test_accept(&listener);
+                captured.push(rate_test_capture(&mut third));
+                rate_test_write_response(&mut third, "200 OK", &readback);
+            }
+
+            // Watch briefly for any request that must have been fenced off.
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        captured.push(rate_test_capture(&mut stream));
+                        rate_test_write_response(&mut stream, "500 Internal Server Error", "{}");
+                    }
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            captured
+        });
+        (format!("http://{addr}"), server, started_rx, release_tx)
+    }
+
+    fn rate_test_spawn_two_writes(
+        first_rate: i64,
+        second_rate: i64,
+    ) -> (
+        String,
+        thread::JoinHandle<Vec<RateTestCaptured>>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::with_capacity(5);
+            let mut first = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut first));
+            rate_test_write_response(&mut first, "200 OK", RATE_TEST_LIST);
+
+            let mut post1 = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut post1));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            rate_test_write_response(&mut post1, "200 OK", &rate_test_ack(first_rate));
+
+            let mut read1 = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut read1));
+            rate_test_write_response(&mut read1, "200 OK", &rate_test_settings(first_rate));
+
+            let mut post2 = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut post2));
+            rate_test_write_response(&mut post2, "200 OK", &rate_test_ack(second_rate));
+
+            let mut read2 = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut read2));
+            rate_test_write_response(&mut read2, "200 OK", &rate_test_settings(second_rate));
+            captured
+        });
+        (format!("http://{addr}"), server, started_rx, release_tx)
+    }
+
+    /// Serve two same-origin managed clients, gate the first write, and watch
+    /// briefly for a queued write that must never be sent to the replacement.
+    fn rate_test_spawn_same_origin_replacement(
+        first_rate: i64,
+        queued_rate: i64,
+    ) -> (
+        String,
+        thread::JoinHandle<Vec<RateTestCaptured>>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::with_capacity(5);
+            for _ in 0..2 {
+                let mut connect = rate_test_accept(&listener);
+                captured.push(rate_test_capture(&mut connect));
+                rate_test_write_response(&mut connect, "200 OK", RATE_TEST_LIST);
+            }
+
+            let mut post1 = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut post1));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            rate_test_write_response(&mut post1, "200 OK", &rate_test_ack(first_rate));
+
+            let mut read1 = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut read1));
+            rate_test_write_response(&mut read1, "200 OK", &rate_test_settings(first_rate));
+
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        captured.push(rate_test_capture(&mut stream));
+                        let is_post = captured
+                            .last()
+                            .is_some_and(|request| request.request_line.starts_with("POST "));
+                        if is_post {
+                            rate_test_write_response(
+                                &mut stream,
+                                "200 OK",
+                                &rate_test_ack(queued_rate),
+                            );
+                        } else {
+                            rate_test_write_response(
+                                &mut stream,
+                                "200 OK",
+                                &rate_test_settings(queued_rate),
+                            );
+                        }
+                    }
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            captured
+        });
+        (format!("http://{addr}"), server, started_rx, release_tx)
+    }
+
+    fn rate_test_path(captured: &RateTestCaptured) -> &str {
+        captured
+            .request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_rate_writes_are_serialized_in_first_acquired_order() {
+        let first_rate = 1_000_000;
+        let second_rate = 2_000_000;
+        let (base, server, started, release) = rate_test_spawn_two_writes(first_rate, second_rate);
+        let manager = Arc::new(ConnectionManager::default());
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+
+        let first_manager = Arc::clone(&manager);
+        let first =
+            tokio::spawn(async move { first_manager.set_global_rate_limit(first_rate).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("first POST must reach the gated server");
+
+        let second_manager = Arc::clone(&manager);
+        let second =
+            tokio::spawn(async move { second_manager.set_global_rate_limit(second_rate).await });
+        let _ = release.send(());
+
+        assert_eq!(first.await.expect("first set task"), Ok(first_rate));
+        assert_eq!(second.await.expect("second set task"), Ok(second_rate));
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 5);
+        assert_eq!(
+            rate_test_path(&captured[1]),
+            format!("/rate-limit/global?rate={first_rate}")
+        );
+        assert!(captured[2].request_line.starts_with("GET /settings "));
+        assert_eq!(
+            rate_test_path(&captured[3]),
+            format!("/rate-limit/global?rate={second_rate}")
+        );
+        assert!(captured[4].request_line.starts_with("GET /settings "));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_rate_writer_cannot_retarget_same_origin_replacement_daemon() {
+        const FIRST_RATE: i64 = 7_000_000;
+        const QUEUED_RATE: i64 = 8_000_000;
+        let (base, server, started, release) =
+            rate_test_spawn_same_origin_replacement(FIRST_RATE, QUEUED_RATE);
+        let manager = Arc::new(ConnectionManager::default());
+        let (_client_a, _epoch) = install_rate_test_managed(&manager, &base, 8101).await;
+        let replacement = Arc::new(
+            SurgeClient::connect(&base, "test-token-b")
+                .await
+                .expect("same-origin replacement client"),
+        );
+
+        let first_manager = Arc::clone(&manager);
+        let first =
+            tokio::spawn(async move { first_manager.set_global_rate_limit(FIRST_RATE).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("first POST must reach the gated server");
+
+        // This caller snapshots the original daemon while the first write
+        // holds the writer gate, then remains queued.
+        let second_manager = Arc::clone(&manager);
+        let queued =
+            tokio::spawn(async move { second_manager.set_global_rate_limit(QUEUED_RATE).await });
+        let queued_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let active = manager.lifecycle.lock().active;
+            if active >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < queued_deadline,
+                "queued caller must snapshot and register before replacement"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Replace the active managed daemon at the same origin while the
+        // queued caller is still waiting for the gate.
+        manager.disconnect();
+        manager.install_test_managed(Arc::clone(&replacement), 8102);
+        let _ = release.send(());
+
+        assert_eq!(
+            first.await.expect("first set task"),
+            Err(BridgeError::Superseded),
+            "the old operation must not surface after replacement"
+        );
+        assert_eq!(
+            queued.await.expect("queued set task"),
+            Err(BridgeError::Superseded),
+            "a queued caller must not mutate the replacement daemon"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            4,
+            "the queued writer must not send any request to the replacement"
+        );
+        assert_eq!(
+            rate_test_path(&captured[2]),
+            format!("/rate-limit/global?rate={FIRST_RATE}")
+        );
+        assert!(captured[3].request_line.starts_with("GET /settings "));
+        let queued_query = format!("rate={QUEUED_RATE}");
+        assert!(
+            captured
+                .iter()
+                .all(|request| !rate_test_path(request).contains(&queued_query)),
+            "the queued rate must never reach the daemon"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ambiguous_managed_write_poisons_writer_across_same_daemon_reconnect() {
+        const RATE: i64 = 3_000_000;
+        let sentinel = "ambiguous-managed-write-sentinel";
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            (
+                "500 Internal Server Error",
+                format!(r#"{{"error":"{sentinel}"}}"#),
+            ),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        let (client, epoch) = install_rate_test_managed(&manager, &base, 9001).await;
+
+        let err = manager
+            .set_global_rate_limit(RATE)
+            .await
+            .expect_err("ambiguous write must fail closed");
+        assert_eq!(err, BridgeError::RateUnconfirmed);
+        assert!(manager.rate_writer.poisoned.load(Ordering::SeqCst));
+
+        manager.disconnect();
+        let replacement_epoch = manager.install_test_managed(Arc::clone(&client), 9001);
+        assert_ne!(replacement_epoch, epoch, "reconnect must change the epoch");
+        assert_eq!(
+            manager.set_global_rate_limit(0).await,
+            Err(BridgeError::RateUnconfirmed),
+            "poison must survive a same-daemon reconnect"
+        );
+        assert!(manager.rate_writer.poisoned.load(Ordering::SeqCst));
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "poisoned writer must not send another request"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_managed_write_is_superseded_after_epoch_change() {
+        const RATE: i64 = 4_000_000;
+        let (base, server, started, release) =
+            rate_test_spawn_gated_post("200 OK", rate_test_ack(RATE), rate_test_settings(RATE));
+        let manager = Arc::new(ConnectionManager::default());
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 7001).await;
+
+        let set_manager = Arc::clone(&manager);
+        let set = tokio::spawn(async move { set_manager.set_global_rate_limit(RATE).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("POST must reach the gated server");
+
+        manager.disconnect();
+        manager.install_test_managed(Arc::clone(&client), 7001);
+        let _ = release.send(());
+
+        assert_eq!(
+            set.await.expect("set task"),
+            Err(BridgeError::Superseded),
+            "an old confirmed write must not surface after reconnect"
+        );
+        assert!(
+            !manager.rate_writer.poisoned.load(Ordering::SeqCst),
+            "a definitive old success must not poison the writer"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 3);
+        assert_eq!(
+            rate_test_path(&captured[1]),
+            format!("/rate-limit/global?rate={RATE}")
+        );
+        assert!(captured[2].request_line.starts_with("GET /settings "));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_ambiguous_write_still_reports_rate_unconfirmed() {
+        const RATE: i64 = 4_100_000;
+        let (base, server, started, release) = rate_test_spawn_gated_post(
+            "500 Internal Server Error",
+            "{}".to_string(),
+            String::new(),
+        );
+        let manager = Arc::new(ConnectionManager::default());
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 7002).await;
+
+        let set_manager = Arc::clone(&manager);
+        let set = tokio::spawn(async move { set_manager.set_global_rate_limit(RATE).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("POST must reach the gated server");
+
+        manager.disconnect();
+        manager.install_test_managed(Arc::clone(&client), 7002);
+        let _ = release.send(());
+
+        assert_eq!(
+            set.await.expect("set task"),
+            Err(BridgeError::RateUnconfirmed),
+            "a stale ambiguous write poisons globally and must stay visible"
+        );
+        assert!(
+            manager.rate_writer.poisoned.load(Ordering::SeqCst),
+            "an ambiguous old response must poison the writer"
+        );
+        assert_eq!(
+            manager.set_global_rate_limit(0).await,
+            Err(BridgeError::RateUnconfirmed),
+            "poison must block any write to the replacement"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "poisoned writer must not send another request to the replacement"
+        );
+        assert_eq!(
+            rate_test_path(&captured[1]),
+            format!("/rate-limit/global?rate={RATE}")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_caller_cannot_release_gate_or_bypass_poison() {
+        const RATE: i64 = 5_000_000;
+        let (base, server, started, release) = rate_test_spawn_gated_post(
+            "500 Internal Server Error",
+            "{}".to_string(),
+            String::new(),
+        );
+        let manager = Arc::new(ConnectionManager::default());
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 6001).await;
+
+        let first_manager = Arc::clone(&manager);
+        let first = tokio::spawn(async move { first_manager.set_global_rate_limit(RATE).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("POST must reach the gated server");
+        first.abort();
+        let _ = first.await;
+        let _ = release.send(());
+
+        // The background task still owns the gate and finishes the ambiguous
+        // write before this second mutation can start.
+        assert_eq!(
+            manager.set_global_rate_limit(0).await,
+            Err(BridgeError::RateUnconfirmed),
+            "cancelling the caller must not bypass the poison"
+        );
+        assert!(manager.rate_writer.poisoned.load(Ordering::SeqCst));
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "the next mutation must be refused before any request"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_cancelled_rate_post_and_fences_queued_write() {
+        const RATE: i64 = 9_000_000;
+        const QUEUED_RATE: i64 = 9_500_000;
+        let (base, server, started, release) =
+            rate_test_spawn_gated_post("200 OK", rate_test_ack(RATE), rate_test_settings(RATE));
+        let manager = Arc::new(ConnectionManager::default());
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 6101).await;
+
+        let first_manager = Arc::clone(&manager);
+        let first = tokio::spawn(async move { first_manager.set_global_rate_limit(RATE).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("POST must reach the gated server");
+
+        let queued_manager = Arc::clone(&manager);
+        let queued =
+            tokio::spawn(async move { queued_manager.set_global_rate_limit(QUEUED_RATE).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let active = manager.lifecycle.lock().active;
+            if active >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued caller must register its lifecycle operation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Cancel the first caller, but its detached task still owns the gate,
+        // lifecycle ticket, and in-flight POST.
+        first.abort();
+        let _ = first.await;
+
+        let shutdown_manager = Arc::clone(&manager);
+        let (drain_tx, drain_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            let drained = shutdown_manager.shutdown_managed();
+            let _ = drain_tx.send(drained);
+        });
+        let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if manager.lifecycle.is_shutting_down() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < shutdown_deadline,
+                "app shutdown did not start in time"
+            );
+            assert!(
+                drain_rx.try_recv().is_err(),
+                "app shutdown must wait for the detached rate POST"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            drain_rx.try_recv().is_err(),
+            "app shutdown must wait for the detached rate POST"
+        );
+
+        let _ = release.send(());
+        assert_eq!(
+            queued.await.expect("queued set task"),
+            Err(BridgeError::Superseded),
+            "shutdown must fence the queued write before dispatch"
+        );
+        let drained = drain_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("shutdown must drain after the detached POST finishes");
+        assert!(drained, "registered rate work must drain on shutdown");
+        shutdown.join().expect("shutdown thread");
+        assert_eq!(
+            manager.set_global_rate_limit(0).await,
+            Err(BridgeError::Superseded),
+            "writes must be rejected after the shutdown fence"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            3,
+            "no queued request may be sent after the shutdown fence"
+        );
+        assert_eq!(
+            rate_test_path(&captured[1]),
+            format!("/rate-limit/global?rate={RATE}")
+        );
+        assert!(captured[2].request_line.starts_with("GET /settings "));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readback_failure_poisons_managed_writer() {
+        const RATE: i64 = 6_000_000;
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", rate_test_ack(RATE)),
+            ("500 Internal Server Error", "{}".to_string()),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 5001).await;
+
+        assert_eq!(
+            manager.set_global_rate_limit(RATE).await,
+            Err(BridgeError::RateUnconfirmed)
+        );
+        assert!(manager.rate_writer.poisoned.load(Ordering::SeqCst));
+        assert_eq!(
+            manager.set_global_rate_limit(0).await,
+            Err(BridgeError::RateUnconfirmed)
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 3, "poison must block a fourth request");
+    }
+
+    // -----------------------------------------------------------------------
+    // Open-containing-folder command: id-only lookup, fresh list, validation
+    // and final ownership fence against a loopback managed target.
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    struct RecordingLocationLauncher {
+        calls: Mutex<Vec<PathBuf>>,
+        result: Result<(), LocationError>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl RecordingLocationLauncher {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                result: Ok(()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                result: Err(LocationError::LaunchFailed),
+            }
+        }
+
+        fn calls(&self) -> Vec<PathBuf> {
+            self.calls.lock().expect("launcher calls lock").clone()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LocationLauncher for RecordingLocationLauncher {
+        fn launch_directory(&self, directory: &Path) -> Result<LocationLaunch, LocationError> {
+            self.calls
+                .lock()
+                .expect("launcher calls lock")
+                .push(directory.to_path_buf());
+            match self.result {
+                Ok(()) => Ok(LocationLaunch::test_result(Ok(()))),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct GatedLocationLauncher {
+        calls: Mutex<Vec<PathBuf>>,
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GatedLocationLauncher {
+        fn calls(&self) -> Vec<PathBuf> {
+            self.calls.lock().expect("gated calls lock").clone()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LocationLauncher for GatedLocationLauncher {
+        fn launch_directory(&self, directory: &Path) -> Result<LocationLaunch, LocationError> {
+            self.calls
+                .lock()
+                .expect("gated calls lock")
+                .push(directory.to_path_buf());
+            let _ = self.entered.lock().expect("gated entered lock").send(());
+            let _ = self
+                .release
+                .lock()
+                .expect("gated release lock")
+                .recv_timeout(std::time::Duration::from_secs(30));
+            Ok(LocationLaunch::test_result(Ok(())))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_location_test_item(
+        id: &str,
+        destination: Option<&str>,
+        status: &str,
+        moving: bool,
+        file_missing: bool,
+    ) -> serde_json::Value {
+        let mut item = serde_json::json!({
+            "id": id,
+            "url": "https://dl.example.test/file.bin",
+            "filename": "file.bin",
+            "total_size": 9,
+            "downloaded": 9,
+            "progress": 100.0,
+            "speed": 0.0,
+            "status": status,
+            "eta": 0,
+            "moving": moving,
+            "file_missing": file_missing,
+        });
+        if let Some(destination) = destination {
+            item["dest_path"] = serde_json::Value::String(destination.to_string());
+        }
+        item
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_location_test_body(
+        id: &str,
+        destination: Option<&str>,
+        status: &str,
+        moving: bool,
+        file_missing: bool,
+    ) -> String {
+        serde_json::json!([open_location_test_item(
+            id,
+            destination,
+            status,
+            moving,
+            file_missing
+        )])
+        .to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_open_location_error(body: String, id: &str, expected: BridgeError) {
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", body),
+        ]);
+        let manager = ConnectionManager::default();
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let launcher = Arc::new(RecordingLocationLauncher::new());
+        let result = manager
+            .open_download_location_with(id, Arc::clone(&launcher))
+            .await;
+        let _captured = server.join().expect("server thread panicked");
+        assert_eq!(result, Err(expected));
+        assert!(
+            launcher.calls().is_empty(),
+            "rejected locations must not launch"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_location_rejects_invalid_ids_without_network() {
+        let manager = ConnectionManager::default();
+        let launcher = Arc::new(RecordingLocationLauncher::new());
+        let long_id = "x".repeat(MAX_DOWNLOAD_ID_BYTES + 1);
+        for id in ["", "\0", long_id.as_str()] {
+            assert_eq!(
+                manager
+                    .open_download_location_with(id, Arc::clone(&launcher))
+                    .await,
+                Err(BridgeError::InvalidDownloadId)
+            );
+        }
+        assert!(launcher.calls().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_location_rejects_manual_connections() {
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let manager = ConnectionManager::default();
+        manager
+            .connect(&base, "test-token")
+            .await
+            .expect("manual connection");
+        let launcher = Arc::new(RecordingLocationLauncher::new());
+        assert_eq!(
+            manager
+                .open_download_location_with("d-1", Arc::clone(&launcher))
+                .await,
+            Err(BridgeError::ManagedConnectionRequired)
+        );
+        assert!(launcher.calls().is_empty());
+        let _captured = server.join().expect("server thread panicked");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_location_launches_valid_completed_download_folder() {
+        let root = fresh_dir("open-location-valid");
+        let parent = root.join("dir ; $(echo pwn) `id` & 'quote'");
+        std::fs::create_dir_all(&parent).expect("create parent fixture");
+        let file = parent.join("-file \"double\" 'single' ; $HOME `touch pwned` & !.bin");
+        std::fs::write(&file, b"completed").expect("write file fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let body = open_location_test_body("d-1", Some(&destination), "completed", false, false);
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", body),
+        ]);
+        let manager = ConnectionManager::default();
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let launcher = Arc::new(RecordingLocationLauncher::new());
+        assert_eq!(
+            manager
+                .open_download_location_with("d-1", Arc::clone(&launcher))
+                .await,
+            Ok(())
+        );
+        assert_eq!(launcher.calls(), vec![parent.clone()]);
+        assert!(
+            !parent.join("pwned").exists(),
+            "metacharacters must stay literal"
+        );
+        let _captured = server.join().expect("server thread panicked");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_location_rejects_non_unique_and_incomplete_items() {
+        let duplicate = serde_json::json!([
+            open_location_test_item("d-1", Some("/no/such/file.bin"), "completed", false, false),
+            open_location_test_item("d-1", Some("/no/such/file.bin"), "completed", false, false),
+        ])
+        .to_string();
+        assert_open_location_error(duplicate, "d-1", BridgeError::DownloadAmbiguous).await;
+        assert_open_location_error(
+            open_location_test_body(
+                "other",
+                Some("/no/such/file.bin"),
+                "completed",
+                false,
+                false,
+            ),
+            "d-1",
+            BridgeError::DownloadNotFound,
+        )
+        .await;
+        assert_open_location_error(
+            open_location_test_body(
+                "d-1",
+                Some("/no/such/file.bin"),
+                "downloading",
+                false,
+                false,
+            ),
+            "d-1",
+            BridgeError::DownloadNotCompleted,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_location_rejects_moving_missing_and_invalid_destinations() {
+        assert_open_location_error(
+            open_location_test_body("d-1", Some("/no/such/file.bin"), "completed", true, false),
+            "d-1",
+            BridgeError::DownloadMoving,
+        )
+        .await;
+        assert_open_location_error(
+            open_location_test_body("d-1", Some("/no/such/file.bin"), "completed", false, true),
+            "d-1",
+            BridgeError::DownloadFileMissing,
+        )
+        .await;
+        assert_open_location_error(
+            open_location_test_body("d-1", Some("relative/file.bin"), "completed", false, false),
+            "d-1",
+            BridgeError::LocationUnavailable,
+        )
+        .await;
+        assert_open_location_error(
+            open_location_test_body("d-1", None, "completed", false, false),
+            "d-1",
+            BridgeError::LocationUnavailable,
+        )
+        .await;
+
+        let root = fresh_dir("open-location-vanished");
+        let missing = root.join("vanished.bin");
+        let destination = missing.to_string_lossy().into_owned();
+        assert_open_location_error(
+            open_location_test_body("d-1", Some(&destination), "completed", false, false),
+            "d-1",
+            BridgeError::DownloadFileMissing,
+        )
+        .await;
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_location_reports_sanitized_launch_failure() {
+        let root = fresh_dir("open-location-launch-failure");
+        let file = root.join("completed.bin");
+        std::fs::write(&file, b"completed").expect("write file fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let body = open_location_test_body("d-1", Some(&destination), "completed", false, false);
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", body),
+        ]);
+        let manager = ConnectionManager::default();
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let launcher = Arc::new(RecordingLocationLauncher::failing());
+        assert_eq!(
+            manager
+                .open_download_location_with("d-1", Arc::clone(&launcher))
+                .await,
+            Err(BridgeError::LocationLaunchFailed)
+        );
+        assert_eq!(launcher.calls(), vec![root.clone()]);
+        let _captured = server.join().expect("server thread panicked");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_location_test_spawn_gated_refresh(
+        body: String,
+    ) -> (
+        String,
+        thread::JoinHandle<Vec<RateTestCaptured>>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::with_capacity(2);
+            let mut first = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut first));
+            rate_test_write_response(&mut first, "200 OK", RATE_TEST_LIST);
+
+            let mut second = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut second));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            rate_test_write_response(&mut second, "200 OK", &body);
+            captured
+        });
+        (format!("http://{addr}"), server, started_rx, release_tx)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_location_rejects_daemon_replacement_during_refresh() {
+        let root = fresh_dir("open-location-stale");
+        let file = root.join("completed.bin");
+        std::fs::write(&file, b"completed").expect("write file fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let body = open_location_test_body("d-1", Some(&destination), "completed", false, false);
+        let (base, server, started_rx, release_tx) = open_location_test_spawn_gated_refresh(body);
+        let manager = Arc::new(ConnectionManager::default());
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let launcher = Arc::new(RecordingLocationLauncher::new());
+
+        let manager_task = Arc::clone(&manager);
+        let launcher_task = Arc::clone(&launcher);
+        let task = tokio::spawn(async move {
+            manager_task
+                .open_download_location_with("d-1", Arc::clone(&launcher_task))
+                .await
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("refresh must start");
+        manager.install_test_managed(Arc::clone(&client), 9999);
+        release_tx.send(()).expect("release refresh");
+
+        assert_eq!(task.await.expect("open task"), Err(BridgeError::Superseded));
+        assert!(
+            launcher.calls().is_empty(),
+            "a replaced daemon must never launch"
+        );
+        let _captured = server.join().expect("server thread panicked");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn open_location_rejects_launch_after_shutdown_fence() {
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let manager = ConnectionManager::default();
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+
+        let operation = manager
+            .lifecycle
+            .begin_operation()
+            .expect("reserve before shutdown");
+        let snapshot = {
+            let state = manager.state.lock().expect("state lock");
+            state
+                .managed_location_snapshot()
+                .expect("managed location snapshot")
+        };
+
+        // Interleaving under test: the lifecycle fence is set, but shutdown has
+        // not yet acquired the state lock to publish `state.shutting_down`.
+        manager.lifecycle.begin_shutdown();
+        assert!(!manager.state.lock().expect("state lock").shutting_down);
+
+        let launcher = Arc::new(RecordingLocationLauncher::new());
+        let result = manager
+            .launch_location_if_current(
+                operation,
+                &snapshot,
+                Arc::clone(&launcher),
+                PathBuf::from("/tmp"),
+            )
+            .await;
+        assert_eq!(result.err(), Some(BridgeError::Superseded));
+        assert!(
+            launcher.calls().is_empty(),
+            "a launch after the shutdown fence must not start"
+        );
+        assert!(
+            manager.lifecycle.begin_operation().is_none(),
+            "no action may be reserved after the shutdown fence"
+        );
+
+        manager.shutdown_managed();
+        let _captured = server.join().expect("server thread panicked");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_location_gated_launch_keeps_shutdown_bounded() {
+        let root = fresh_dir("open-location-gated-stall");
+        let file = root.join("completed.bin");
+        std::fs::write(&file, b"completed").expect("write file fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let body = open_location_test_body("d-1", Some(&destination), "completed", false, false);
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", body),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let launcher = Arc::new(GatedLocationLauncher {
+            calls: Mutex::new(Vec::new()),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        });
+        let task_manager = Arc::clone(&manager);
+        let task_launcher = Arc::clone(&launcher);
+        let task = tokio::spawn(async move {
+            task_manager
+                .open_download_location_with("d-1", task_launcher)
+                .await
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the launch worker must enter the gated spawn");
+
+        let shutdown_manager = Arc::clone(&manager);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            let started = Instant::now();
+            let drained = shutdown_manager.shutdown_managed();
+            let _ = shutdown_tx.send((drained, started.elapsed()));
+        });
+        let (drained, elapsed) = shutdown_rx
+            .recv_timeout(LIFECYCLE_DRAIN_TIMEOUT + std::time::Duration::from_secs(5))
+            .expect("shutdown must return within its fixed drain bound");
+        assert!(
+            !drained,
+            "a stalled accepted launch must not be reported as drained"
+        );
+        assert!(
+            elapsed <= LIFECYCLE_DRAIN_TIMEOUT + std::time::Duration::from_secs(3),
+            "shutdown must not wait indefinitely for the blocking launch"
+        );
+        shutdown.join().expect("shutdown thread");
+
+        // The reservation was accepted before the fence, so the launch is
+        // allowed to finish after shutdown began.
+        release_tx.send(()).expect("release the gated launcher");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("an accepted launch must finish after release")
+            .expect("launch task");
+        assert_eq!(result, Ok(()));
+        assert_eq!(launcher.calls().len(), 1);
+        assert!(
+            manager.lifecycle.begin_operation().is_none(),
+            "no action may be reserved after the shutdown fence"
+        );
+
+        let _captured = server.join().expect("server thread panicked");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn location_validation_permit_caps_blocking_work() {
+        let manager = ConnectionManager::default();
+        let gate = Arc::clone(&manager.location_validation);
+        let held = gate.try_acquire().expect("hold the validation permit");
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_closure = Arc::clone(&called);
+        let result = manager
+            .validate_location_blocking(move || {
+                called_in_closure.store(true, Ordering::SeqCst);
+                Ok(PathBuf::from("/tmp"))
+            })
+            .await;
+        assert_eq!(result.err(), Some(BridgeError::LocationUnavailable));
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "a busy permit must reject without running more validation work"
+        );
+
+        drop(held);
+        assert_eq!(
+            manager
+                .validate_location_blocking(|| Ok(PathBuf::from("/tmp")))
+                .await,
+            Ok(PathBuf::from("/tmp"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn location_validation_permit_survives_cancelled_caller() {
+        let manager = Arc::new(ConnectionManager::default());
+        let gate = Arc::clone(&manager.location_validation);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let task_manager = Arc::clone(&manager);
+        let task = tokio::spawn(async move {
+            task_manager
+                .validate_location_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                    Ok(PathBuf::from("/tmp"))
+                })
+                .await
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("validation must start");
+        assert!(
+            gate.try_acquire().is_none(),
+            "the running closure must hold the permit"
+        );
+
+        task.abort();
+        let _ = task.await;
+        assert!(
+            gate.try_acquire().is_none(),
+            "cancelling the caller must not release the validation permit"
+        );
+
+        release_tx.send(()).expect("release validation");
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(permit) = gate.try_acquire() {
+                drop(permit);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the permit must be released after validation completes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }
