@@ -199,7 +199,7 @@ impl LocationLaunch {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn test_result(result: Result<(), LocationError>) -> Self {
         Self {
             child: None,
