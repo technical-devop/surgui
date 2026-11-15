@@ -577,6 +577,16 @@ if ($DiagnosticEnabled) {
       $v = [string]$DiagnosticEnv[$k]
       if ($UseEnvironmentDict) { $psi.Environment[$k] = $v } else { $psi.EnvironmentVariables[$k] = $v }
     }
+    # Diagnostic-only SystemRoot restore: TestMain replaces SystemRoot with a
+    # temporary directory, and this test needs the correct Windows system root
+    # for comparison. Populate the isolated child env from the actual
+    # parent-process value via the .NET process env getter. The value is never
+    # logged. If empty, the key stays unset and the Go test returns without a
+    # marker, so the wrapper reports the fixed unknown literals below.
+    $DiagnosticSystemRootValue = [System.Environment]::GetEnvironmentVariable('SystemRoot', [System.EnvironmentVariableTarget]::Process)
+    if (-not [string]::IsNullOrEmpty($DiagnosticSystemRootValue)) {
+      if ($UseEnvironmentDict) { $psi.Environment['SURGUI_DIAGNOSTIC_SYSTEM_ROOT'] = $DiagnosticSystemRootValue } else { $psi.EnvironmentVariables['SURGUI_DIAGNOSTIC_SYSTEM_ROOT'] = $DiagnosticSystemRootValue }
+    }
 
     $proc = [System.Diagnostics.Process]::Start($psi)
     # Discard output without buffering: never retain or log raw bytes.

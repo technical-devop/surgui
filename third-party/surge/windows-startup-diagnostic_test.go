@@ -33,6 +33,13 @@ const (
 // Set by the PowerShell wrapper to a unique per-run file under $RunDir.
 const surguiDiagnosticMarkerFileEnv = "SURGUI_WINDOWS_DIAGNOSTIC_MARKER_FILE"
 
+// Diagnostic-only saved real SystemRoot supplied by the PowerShell wrapper.
+// TestMain replaces SystemRoot with a temporary directory, and this test
+// needs the correct Windows system root for comparison. Restoring here keeps
+// the production Go patch and Rust untouched and isolates state as before;
+// it is not an exact launcher.
+const surguiDiagnosticSystemRootEnv = "SURGUI_DIAGNOSTIC_SYSTEM_ROOT"
+
 // Fixed suffix for the separate preflight marker, derived from the diagnostic
 // marker path. It is exclusively created before the managed engine starts.
 const surguiDiagnosticPreflightMarkerSuffix = ".preflight"
@@ -453,6 +460,15 @@ func surguiWindowsDiagnosticHealthy(client *http.Client, token string) bool {
 // CI_DIAG:go_unknown and a missing preflight marker becomes
 // CI_DIAG:go_preflight_unknown.
 func TestWindowsStartupDiagnostic(t *testing.T) {
+	// Diagnostic-only SystemRoot restore before any net.Listen or managed
+	// startup. If the saved root is absent, return without dynamic output;
+	// the outer wrapper then reports the fixed unknown.
+	savedSystemRoot := os.Getenv(surguiDiagnosticSystemRootEnv)
+	if savedSystemRoot == "" {
+		return
+	}
+	t.Setenv("SystemRoot", savedSystemRoot)
+
 	// Baseline evidence: probe the fixed fixture port BEFORE any engine
 	// initialization. On success the listener is closed immediately.
 	runSurguiWindowsStartupPreflight()
