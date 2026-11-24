@@ -351,7 +351,8 @@
       {:else}
         <ul class="rows">
           {#each filtered as item (item.id)}
-            {@const pct = Math.round(progressRatio(item) * 100)}
+            {@const ratio = progressRatio(item)}
+            {@const pct = Math.round(ratio * 100)}
             <li class="row" data-status={item.status} data-selected={selectedId === item.id}>
               <button
                 type="button"
@@ -374,7 +375,7 @@
                   aria-valuemax={100}
                   aria-valuenow={pct}
                 >
-                  <span class="progress-fill" data-status={item.status} style={`width: ${pct}%`}></span>
+                  <span class="progress-fill" data-status={item.status} style={`width: ${ratio * 100}%`}></span>
                 </span>
                 <span class="row-meta">
                   <span>{formatSpeed(item.speedBps)}</span>
@@ -424,7 +425,8 @@
         </div>
       {:else}
         {@const sel = selected}
-        {@const pct = Math.round(progressRatio(sel) * 100)}
+        {@const ratio = progressRatio(sel)}
+        {@const pct = Math.round(ratio * 100)}
         <h2 class="detail-name">{sel.name}</h2>
         <p class="detail-status">
           <span class="status" data-status={sel.status}>
@@ -439,7 +441,7 @@
           aria-valuemax={100}
           aria-valuenow={pct}
         >
-          <span class="progress-fill" data-status={sel.status} style={`width: ${pct}%`}></span>
+          <span class="progress-fill" data-status={sel.status} style={`width: ${ratio * 100}%`}></span>
         </span>
         <dl class="facts">
           <div><dt>Progress</dt><dd>{pct}%</dd></div>
