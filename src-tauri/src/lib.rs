@@ -21,6 +21,8 @@ pub fn run() {
             commands::open_download_location,
             commands::get_global_rate_limit,
             commands::set_global_rate_limit,
+            commands::get_max_concurrent_downloads,
+            commands::set_max_concurrent_downloads,
             commands::disconnect_surge,
             commands::control_download,
             commands::add_download

@@ -1201,6 +1201,335 @@ fn spawn_connect_then_download_with_status(
     (format!("http://{}", addr), server)
 }
 
+/// Sequential loopback helper for the pinned `PATCH /settings` route.
+/// Serves `GET /list`, then one body-captured settings patch.
+fn spawn_connect_then_settings_patch(
+    patch_status: &'static str,
+    patch_body: String,
+) -> (String, JoinHandle<(Captured, CapturedDownload)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let mut first_stream = accept_one(&listener);
+        first_stream
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        let first = parse_head(&read_head(&mut first_stream));
+        write_json_response(&mut first_stream, "200 OK", LIST_BODY);
+        drop(first_stream);
+
+        let mut second_stream = accept_one(&listener);
+        second_stream
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        let second = read_request_with_body(&mut second_stream);
+        write_json_response(&mut second_stream, patch_status, &patch_body);
+        (first, second)
+    });
+    (format!("http://{}", addr), server)
+}
+
+/// Sequential loopback helper that accepts the settings PATCH and closes the
+/// connection without a response, simulating an ambiguous network failure.
+fn spawn_connect_then_settings_patch_without_response(
+) -> (String, JoinHandle<(Captured, CapturedDownload)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let mut first_stream = accept_one(&listener);
+        first_stream
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        let first = parse_head(&read_head(&mut first_stream));
+        write_json_response(&mut first_stream, "200 OK", LIST_BODY);
+        drop(first_stream);
+
+        let mut second_stream = accept_one(&listener);
+        second_stream
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("set read timeout");
+        let second = read_request_with_body(&mut second_stream);
+        drop(second_stream);
+        (first, second)
+    });
+    (format!("http://{}", addr), server)
+}
+
+fn settings_direct_max_concurrent(value: &str) -> String {
+    format!(r#"{{"network":{{"max_concurrent_downloads":{value}}}}}"#)
+}
+
+#[tokio::test]
+async fn get_max_concurrent_downloads_reads_authenticated_settings() {
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", settings_direct_max_concurrent("7")),
+    ]);
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let value = client
+        .get_max_concurrent_downloads()
+        .await
+        .expect("max concurrent readback must succeed");
+    assert_eq!(value, 7);
+    let captured = server.join().expect("server thread panicked");
+    assert!(captured[0].request_line.starts_with("GET /list "));
+    assert!(captured[1].request_line.starts_with("GET /settings "));
+    assert!(
+        captured[1].authorization.as_deref() == Some("Bearer test-token"),
+        "settings read must use the bearer token (value withheld)"
+    );
+}
+
+#[tokio::test]
+async fn get_max_concurrent_downloads_accepts_contract_boundaries() {
+    for value in ["1", "3", "10"] {
+        let (base, server) = spawn_scripted_server(vec![
+            ("200 OK", LIST_BODY.to_string()),
+            ("200 OK", settings_direct_max_concurrent(value)),
+        ]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let parsed = client
+            .get_max_concurrent_downloads()
+            .await
+            .expect("boundary value must parse");
+        assert_eq!(parsed, value.parse::<i64>().expect("fixture integer"));
+        let _ = server.join().expect("server thread panicked");
+    }
+}
+
+#[tokio::test]
+async fn get_max_concurrent_downloads_rejects_out_of_range_values() {
+    for value in ["0", "11", "-1", "2.5", "\"3\"", "null"] {
+        let (base, server) = spawn_scripted_server(vec![
+            ("200 OK", LIST_BODY.to_string()),
+            ("200 OK", settings_direct_max_concurrent(value)),
+        ]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        assert!(
+            client.get_max_concurrent_downloads().await.is_err(),
+            "out-of-contract value {value} must be rejected"
+        );
+        let _ = server.join().expect("server thread panicked");
+    }
+}
+
+#[tokio::test]
+async fn set_max_concurrent_downloads_posts_conflict_safe_patch() {
+    let (base, server) =
+        spawn_connect_then_settings_patch("200 OK", settings_direct_max_concurrent("5"));
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let confirmed = client
+        .set_max_concurrent_downloads(3, 5)
+        .await
+        .expect("settings patch must succeed");
+    assert_eq!(confirmed, 5);
+    let (first, second) = server.join().expect("server thread panicked");
+    assert!(first.request_line.starts_with("GET /list "));
+    assert!(
+        second.request_line.starts_with("PATCH /settings "),
+        "settings write must use the conflict-safe PATCH route"
+    );
+    assert!(
+        second.authorization.as_deref() == Some("Bearer test-token"),
+        "settings write authorization header did not match (value withheld)"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&second.body).expect("settings patch body must be JSON");
+    let changes = body
+        .get("changes")
+        .and_then(|value| value.as_array())
+        .expect("settings patch must carry a changes array");
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(
+        change.get("category").and_then(|value| value.as_str()),
+        Some("Network")
+    );
+    assert_eq!(
+        change.get("key").and_then(|value| value.as_str()),
+        Some("max_concurrent_downloads")
+    );
+    assert_eq!(
+        change.get("before").and_then(|value| value.as_i64()),
+        Some(3)
+    );
+    assert_eq!(
+        change.get("value").and_then(|value| value.as_i64()),
+        Some(5)
+    );
+    assert!(
+        body.get("network").is_none(),
+        "the patch must not overwrite unrelated settings"
+    );
+}
+
+#[tokio::test]
+async fn set_max_concurrent_downloads_maps_conflict_definitively() {
+    let (base, server) = spawn_connect_then_settings_patch("409 Conflict", "{}".to_string());
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .set_max_concurrent_downloads(3, 5)
+        .await
+        .expect_err("conflict must fail");
+    assert!(matches!(err, ConnectError::SettingsConflict));
+    let (_, second) = server.join().expect("server thread panicked");
+    assert!(second.request_line.starts_with("PATCH /settings "));
+}
+
+#[tokio::test]
+async fn set_max_concurrent_downloads_treats_500_and_bad_200_as_unconfirmed() {
+    for (status, body) in [
+        ("500 Internal Server Error", "{}".to_string()),
+        ("200 OK", "not-json".to_string()),
+        ("200 OK", settings_direct_max_concurrent("4")),
+    ] {
+        let (base, server) = spawn_connect_then_settings_patch(status, body);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let err = client
+            .set_max_concurrent_downloads(3, 5)
+            .await
+            .expect_err("ambiguous outcome must fail closed");
+        assert!(
+            matches!(err, ConnectError::SettingsUnconfirmed),
+            "status {status} must be unconfirmed, got {:?}",
+            err
+        );
+        let _ = server.join().expect("server thread panicked");
+    }
+}
+
+#[tokio::test]
+async fn set_max_concurrent_downloads_rejects_out_of_range_without_network() {
+    for (before, value) in [(0, 5), (3, 11), (11, 1)] {
+        let (base, server) = spawn_server("200 OK", LIST_BODY);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        assert!(
+            matches!(
+                client.set_max_concurrent_downloads(before, value).await,
+                Err(ConnectError::InvalidResponse)
+            ),
+            "out-of-range values must be rejected locally"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert!(
+            captured.request_line.starts_with("GET /list "),
+            "invalid values must not send a settings request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn set_max_concurrent_downloads_same_value_confirms_unchanged_daemon() {
+    let (base, server) =
+        spawn_connect_then_settings_patch("200 OK", settings_direct_max_concurrent("3"));
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let confirmed = client
+        .set_max_concurrent_downloads(3, 3)
+        .await
+        .expect("unchanged same-value write must be confirmed");
+    assert_eq!(confirmed, 3);
+    let (_, second) = server.join().expect("server thread panicked");
+    assert!(
+        second.request_line.starts_with("PATCH /settings "),
+        "same-value writes must still check the daemon via PATCH"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&second.body).expect("settings patch body must be JSON");
+    let change = &body["changes"][0];
+    assert_eq!(change["before"].as_i64(), Some(3));
+    assert_eq!(change["value"].as_i64(), Some(3));
+}
+
+#[tokio::test]
+async fn set_max_concurrent_downloads_same_value_rejects_external_change() {
+    let (base, server) = spawn_connect_then_settings_patch("409 Conflict", "{}".to_string());
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .set_max_concurrent_downloads(3, 3)
+        .await
+        .expect_err("an externally changed daemon value must conflict");
+    assert!(matches!(err, ConnectError::SettingsConflict));
+    let (_, second) = server.join().expect("server thread panicked");
+    assert!(
+        second.request_line.starts_with("PATCH /settings "),
+        "same-value writes must not bypass the daemon conflict check"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&second.body).expect("settings patch body must be JSON");
+    let change = &body["changes"][0];
+    assert_eq!(change["before"].as_i64(), Some(3));
+    assert_eq!(change["value"].as_i64(), Some(3));
+}
+
+#[tokio::test]
+async fn set_max_concurrent_downloads_same_value_treats_network_failure_as_unconfirmed() {
+    let (base, server) = spawn_connect_then_settings_patch_without_response();
+    let client = SurgeClient::connect(&base, "test-token")
+        .await
+        .expect("connect");
+    let err = client
+        .set_max_concurrent_downloads(3, 3)
+        .await
+        .expect_err("a dropped same-value write must fail closed");
+    assert!(matches!(err, ConnectError::SettingsUnconfirmed));
+    let (_, second) = server.join().expect("server thread panicked");
+    assert!(
+        second.request_line.starts_with("PATCH /settings "),
+        "same-value writes must still reach the daemon"
+    );
+}
+
+#[tokio::test]
+async fn connection_manager_reads_manual_max_concurrent_but_refuses_manual_write() {
+    use surge_desktop_lib::commands::{BridgeError, ConnectionManager};
+
+    let (base, server) = spawn_scripted_server(vec![
+        ("200 OK", LIST_BODY.to_string()),
+        ("200 OK", settings_direct_max_concurrent("4")),
+    ]);
+    let manager = ConnectionManager::default();
+    manager.connect(&base, "test-token").await.expect("connect");
+    assert_eq!(
+        manager
+            .get_max_concurrent_downloads()
+            .await
+            .expect("manager readback"),
+        4
+    );
+    assert!(
+        matches!(
+            manager.set_max_concurrent_downloads(3, 5).await,
+            Err(BridgeError::ManagedConnectionRequired)
+        ),
+        "manual connections cannot be written"
+    );
+    let captured = server.join().expect("server thread panicked");
+    assert_eq!(
+        captured.len(),
+        2,
+        "refused manual write must not reach the daemon"
+    );
+    assert!(captured[1].request_line.starts_with("GET /settings "));
+}
+
 #[tokio::test]
 async fn add_download_posts_exact_authenticated_json() {
     use surge_desktop_lib::surge_client::AddOutcome;

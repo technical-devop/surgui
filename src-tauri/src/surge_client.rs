@@ -21,6 +21,11 @@ const MAX_URL_BYTES: usize = 8 * 1024;
 /// cross the Tauri/JS boundary without precision loss.
 pub const MAX_RATE_LIMIT_BPS: i64 = 9_007_199_254_740_991;
 
+/// Pinned `network.max_concurrent_downloads` contract from Surge v0.12.4.
+pub const MAX_CONCURRENT_DOWNLOADS_MIN: i64 = 1;
+pub const MAX_CONCURRENT_DOWNLOADS_MAX: i64 = 10;
+pub const MAX_CONCURRENT_DOWNLOADS_DEFAULT: i64 = 3;
+
 /// Exact duplicate-rejection message emitted by released Surge v0.12.4 when
 /// headless mode refuses an already-queued download (`cmd/root_downloads.go`,
 /// unchanged from v0.12.2). The 409 status alone does not prove a duplicate,
@@ -149,6 +154,8 @@ pub enum ConnectError {
     BodyTooLarge,
     InvalidResponse,
     RateUnconfirmed,
+    SettingsConflict,
+    SettingsUnconfirmed,
 }
 
 impl fmt::Debug for ConnectError {
@@ -164,6 +171,8 @@ impl fmt::Debug for ConnectError {
             Self::BodyTooLarge => write!(f, "BodyTooLarge"),
             Self::InvalidResponse => write!(f, "InvalidResponse"),
             Self::RateUnconfirmed => write!(f, "RateUnconfirmed"),
+            Self::SettingsConflict => write!(f, "SettingsConflict"),
+            Self::SettingsUnconfirmed => write!(f, "SettingsUnconfirmed"),
         }
     }
 }
@@ -179,6 +188,8 @@ impl fmt::Display for ConnectError {
             Self::BodyTooLarge => write!(f, "response body too large"),
             Self::InvalidResponse => write!(f, "invalid response from server"),
             Self::RateUnconfirmed => write!(f, "rate limit state could not be confirmed"),
+            Self::SettingsConflict => write!(f, "settings changed since editing began"),
+            Self::SettingsUnconfirmed => write!(f, "settings change could not be confirmed"),
         }
     }
 }
@@ -262,6 +273,21 @@ pub enum AddOutcome {
 struct AddRequest<'a> {
     url: &'a str,
     skip_approval: bool,
+}
+
+/// One conflict-safe `/settings` edit. `before` is the value the UI loaded;
+/// the daemon rejects the patch with 409 if the current value differs.
+#[derive(Serialize)]
+struct SettingsPatchBody<'a> {
+    changes: Vec<SettingsChangeBody<'a>>,
+}
+
+#[derive(Serialize)]
+struct SettingsChangeBody<'a> {
+    category: &'a str,
+    key: &'a str,
+    before: i64,
+    value: i64,
 }
 
 /// Released Surge v0.12.4 `POST /download` response body (unchanged from
@@ -564,6 +590,63 @@ fn parse_rate_limit_json(value: &serde_json::Value) -> Result<i64, ConnectError>
         return Err(ConnectError::InvalidResponse);
     }
     Ok(rate)
+}
+
+/// Parse the primitive `network.max_concurrent_downloads` value. The pinned
+/// `Setting.MarshalJSON` emits only the value, so a number is expected.
+/// Whole-valued floats are accepted for forward compatibility; anything
+/// outside 1–10 is rejected rather than clamped.
+fn parse_max_concurrent_json(value: &serde_json::Value) -> Result<i64, ConnectError> {
+    use serde_json::Value;
+
+    let parsed = match value {
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                integer
+            } else if let Some(unsigned) = number.as_u64() {
+                i64::try_from(unsigned).map_err(|_| ConnectError::InvalidResponse)?
+            } else {
+                let float = number.as_f64().ok_or(ConnectError::InvalidResponse)?;
+                if !float.is_finite() || float.fract() != 0.0 {
+                    return Err(ConnectError::InvalidResponse);
+                }
+                float as i64
+            }
+        }
+        _ => return Err(ConnectError::InvalidResponse),
+    };
+    if !(MAX_CONCURRENT_DOWNLOADS_MIN..=MAX_CONCURRENT_DOWNLOADS_MAX).contains(&parsed) {
+        return Err(ConnectError::InvalidResponse);
+    }
+    Ok(parsed)
+}
+
+async fn get_settings_max_concurrent(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+) -> Result<i64, ConnectError> {
+    let response = client
+        .get(format!("{}/settings", base_url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(map_send_error)?;
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(ConnectError::Unauthorized);
+    }
+    if status != StatusCode::OK {
+        return Err(ConnectError::InvalidResponse);
+    }
+    let bytes = read_bounded_body(response).await?;
+    let settings: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ConnectError::InvalidResponse)?;
+    let value = settings
+        .get("network")
+        .and_then(|network| network.get("max_concurrent_downloads"))
+        .ok_or(ConnectError::InvalidResponse)?;
+    parse_max_concurrent_json(value)
 }
 
 async fn get_settings_rate_limit(
@@ -913,6 +996,92 @@ impl SurgeClient {
             Ok(_) => Err(ConnectError::InvalidResponse),
             Err(_) => Err(ConnectError::RateUnconfirmed),
         }
+    }
+
+    /// Read the saved daemon `network.max_concurrent_downloads` value.
+    ///
+    /// This is the persisted settings value, not a claim about the running
+    /// daemon's active concurrency; Surge applies it only after a restart.
+    pub async fn get_max_concurrent_downloads(&self) -> Result<i64, ConnectError> {
+        get_settings_max_concurrent(&self.client, &self.base_url, &self.token).await
+    }
+
+    /// Save `network.max_concurrent_downloads` through the conflict-safe
+    /// `PATCH /settings` route.
+    ///
+    /// `before` is the value the caller loaded; the daemon returns 409 if its
+    /// current value differs, so a concurrent change is never overwritten.
+    /// Even when `before == value` the patch is sent, so an externally changed
+    /// daemon value is reported as a conflict instead of being assumed
+    /// unchanged. Only a 200 response whose body confirms the requested value is a
+    /// success. A 400/409 is a definitive non-application; auth failures are
+    /// definitive. Every other transport/status/body outcome is ambiguous:
+    /// the daemon may have persisted the change, so returning
+    /// [`ConnectError::SettingsUnconfirmed`] lets the manager fence later
+    /// writes instead of retrying silently. The app never restarts the daemon.
+    pub async fn set_max_concurrent_downloads(
+        &self,
+        before: i64,
+        value: i64,
+    ) -> Result<i64, ConnectError> {
+        let range = MAX_CONCURRENT_DOWNLOADS_MIN..=MAX_CONCURRENT_DOWNLOADS_MAX;
+        if !range.contains(&before) || !range.contains(&value) {
+            return Err(ConnectError::InvalidResponse);
+        }
+
+        let body = serde_json::to_vec(&SettingsPatchBody {
+            changes: vec![SettingsChangeBody {
+                category: "Network",
+                key: "max_concurrent_downloads",
+                before,
+                value,
+            }],
+        })
+        .map_err(|_| ConnectError::InvalidResponse)?;
+        let response = match self
+            .client
+            .patch(format!("{}/settings", self.base_url))
+            .bearer_auth(&self.token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return Err(ConnectError::SettingsUnconfirmed),
+        };
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(ConnectError::Unauthorized);
+        }
+        if status == StatusCode::CONFLICT {
+            return Err(ConnectError::SettingsConflict);
+        }
+        if status == StatusCode::BAD_REQUEST {
+            return Err(ConnectError::InvalidResponse);
+        }
+        if status != StatusCode::OK {
+            return Err(ConnectError::SettingsUnconfirmed);
+        }
+        let bytes = match read_bounded_body(response).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(ConnectError::SettingsUnconfirmed),
+        };
+        let settings: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(settings) => settings,
+            Err(_) => return Err(ConnectError::SettingsUnconfirmed),
+        };
+        let confirmed = settings
+            .get("network")
+            .and_then(|network| network.get("max_concurrent_downloads"))
+            .ok_or(ConnectError::SettingsUnconfirmed)
+            .and_then(|value| {
+                parse_max_concurrent_json(value).map_err(|_| ConnectError::SettingsUnconfirmed)
+            })?;
+        if confirmed != value {
+            return Err(ConnectError::SettingsUnconfirmed);
+        }
+        Ok(confirmed)
     }
 }
 
