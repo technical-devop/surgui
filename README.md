@@ -108,6 +108,32 @@ connection before starting a broadly-listening server.
 
 - **Connect / list**: authenticated `GET /list`, then the queue refreshes on a
   timer.
+- **Live progress (optional)**: authenticated `GET /events` SSE adds
+  near-real-time progress on top of polling. The snapshot cursor is captured
+  before `/list` and every event is sequenced at client receipt, but receipt
+  order cannot prove daemon order: the daemon stream carries no generation id,
+  so the cursor is a conservative heuristic, not absolute ordering. Byte
+  counters are kept monotonic for a download generation as a best-effort
+  guard; a transient stale value can still appear. A
+  snapshot that reports fewer bytes than the displayed value for the same
+  id/addedAt is ambiguous: if a newer progress receipt arrived after the list
+  request started, the live value is kept and a fresh authoritative follow-up
+  read (single-flight, bounded backoff) conservatively confirms whether it was a real reset.
+  Only a read that still reports the lower value after its cursor covers the
+  newer receipt is treated as a likely reset; live events for that row are then
+  quarantined because a delayed sample from the previous generation cannot be
+  distinguished without a daemon generation id. Snapshots alone update the row
+  until its `addedAt` changes, the record disappears, or it becomes
+  `completed`/`failed` (paused/pausing do not release the quarantine). A lower snapshot with no
+  newer in-flight progress is accepted as a reset through reconciliation, without
+  claiming that a stale snapshot can never overwrite newer progress.
+  The `/events` handshake is bounded but an established idle body is never cut,
+  manual mode disables proxies, and repeated malformed or immediately-empty
+  streams back off and fall back to polling. Reconnect backoff resets only after
+  a sustained stream, so one valid frame followed by an immediate EOF keeps
+  backing off instead of retrying forever at 500 ms. Listener registration is
+  bounded, cleaned up on failure/timeout, and retried on the next reconnect; the
+  native stream starts only after all three listeners are ready.
 - **Add URLs**: accepts HTTP(S) URLs one per line. Blank lines are ignored;
   invalid or non-HTTP(S) lines are reported without being sent; up to 100 lines
   are attempted per batch. Valid lines are submitted strictly one at a time
@@ -120,6 +146,29 @@ connection before starting a broadly-listening server.
   to fix or resend deliberately. Nothing is retried automatically. Pending approval still happens in the Surge TUI on the daemon
   host; a duplicate URL is reported and not re-queued.
 - **Pause / resume**: sends `/pause` and `/resume` for the selected record.
+- **Pause all / Resume all**: sends the daemon's bulk `/pause-all` and
+  `/resume-all` routes. These apply to the daemon's whole queue, not just the
+  rows currently filtered in the UI. Pause all targets every item except
+  completed, already-paused, and errored ones (queued and unknown included);
+  Resume all targets every paused item, including individually paused ones.
+  The UI reports accepted and failed counts from the bounded, validated
+  per-item response. Per-item daemon error text is never forwarded: it can
+  contain a token, URL, or local path, so failed rows show a fixed safe
+  message and only the validated item id. The UI acknowledges the request,
+  states that row changes are applied asynchronously, and keeps refreshing
+  periodically. A transport or malformed/unconfirmed outcome is reported as
+  uncertain, triggers a fresh daemon reconciliation, and is **never retried
+  automatically**. If the connection changes while a bulk request is in
+  flight, a persistent warning survives reconnect and clears only on explicit
+  per-warning dismissal. It says the current connection **may be the same
+  daemon**, so the unconfirmed action may still apply; it never claims the new
+  connection is unaffected. A timeout on the connection that is still current
+  says so directly instead of blaming a previous connection. Warnings stay
+  visible while offline/connecting, are bounded in number, and any overflow is
+  reported conservatively; the overflow summary has its own dismissal that
+  leaves the individual warnings in place. A busy/rejected bulk attempt never
+  turns a still-confirmed request into an uncertainty warning. Server ids and
+  raw per-item error strings are never rendered.
 - **Remove**: asks for confirmation, then calls `/delete`. It never calls `/purge`.
   Removing may delete the incomplete working file of a transfer still in progress;
   a completed final file is left on disk.

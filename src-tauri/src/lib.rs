@@ -5,6 +5,7 @@ pub mod managed_server;
 pub mod managed_state;
 pub mod managed_windows;
 pub mod open_location;
+pub mod progress_stream;
 pub mod surge_client;
 
 use commands::ConnectionManager;
@@ -25,7 +26,10 @@ pub fn run() {
             commands::set_max_concurrent_downloads,
             commands::disconnect_surge,
             commands::control_download,
-            commands::add_download
+            commands::bulk_control,
+            commands::add_download,
+            commands::list_downloads_snapshot,
+            commands::start_progress_stream
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

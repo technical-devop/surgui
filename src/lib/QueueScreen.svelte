@@ -1,6 +1,6 @@
 <script lang="ts">
   import { filterQueue, formatEta, formatSizePair, formatSpeed, groupByStatus, progressRatio } from "./queue/queue";
-  import type { QueueItem, StatusFilter } from "./queue/types";
+  import type { BulkAction, BulkSummary, BulkUncertainty, QueueItem, StatusFilter } from "./queue/types";
   import { STATUS_ORDER } from "./queue/types";
   import { untrack } from "svelte";
   import logoUrl from "../assets/surge-logo.webp";
@@ -16,6 +16,13 @@
     locationErrorId = null,
     onOpenLocation = undefined,
     onClearLocationError = undefined,
+    bulkAction = null,
+    bulkSummary = null,
+    onBulkControl = undefined,
+    bulkUncertainties = [],
+    bulkUncertaintyOverflow = 0,
+    onDismissBulkUncertainty = undefined,
+    onDismissBulkUncertaintyOverflow = undefined,
   }: {
     items: QueueItem[];
     mode: "offline" | "sample" | "native";
@@ -27,6 +34,13 @@
     locationErrorId?: string | null;
     onOpenLocation?: (id: string) => void;
     onClearLocationError?: () => void;
+    bulkAction?: BulkAction | null;
+    bulkSummary?: BulkSummary | null;
+    onBulkControl?: (action: BulkAction) => void;
+    bulkUncertainties?: BulkUncertainty[];
+    bulkUncertaintyOverflow?: number;
+    onDismissBulkUncertainty?: (id: number) => void;
+    onDismissBulkUncertaintyOverflow?: () => void;
   } = $props();
 
   let rows = $state<QueueItem[]>(items.map((i) => ({ ...i })));
@@ -97,6 +111,10 @@
   const filtered = $derived(filterQueue(rows, query, statusFilter));
   const selected = $derived(rows.find((r) => r.id === selectedId) ?? null);
   const activeSpeed = $derived(rows.filter((r) => r.status === "active").reduce((n, r) => n + r.speedBps, 0));
+  const bulkBusy = $derived(bulkAction !== null);
+  // One shared exclusion for row and bulk actions: exactly one action from
+  // either surface may be in flight at a time.
+  const controlsBusy = $derived((controllingId !== null && controllingId !== undefined) || bulkBusy);
 
   function setStatus(id: string, status: QueueItem["status"]) {
     rows = rows.map((r) => (r.id === id ? { ...r, status, speedBps: status === "active" ? r.speedBps : 0 } : r));
@@ -204,6 +222,105 @@
       {/each}
     </div>
   </section>
+
+  {#if mode === "native"}
+    <section class="bulk-bar" aria-label="Bulk queue actions">
+      <div class="bulk-actions" role="group" aria-label="Apply to the whole daemon queue">
+        <button
+          type="button"
+          class="btn"
+          disabled={controlsBusy || onBulkControl === undefined}
+          aria-busy={bulkAction === "pauseAll" ? "true" : undefined}
+          aria-label="Pause all downloads on the daemon"
+          aria-describedby="bulk-actions-help"
+          onclick={() => {
+            if (controlsBusy || onBulkControl === undefined) return;
+            onBulkControl("pauseAll");
+          }}
+        >
+          {bulkAction === "pauseAll" ? "Pausing all…" : "Pause all"}
+        </button>
+        <button
+          type="button"
+          class="btn"
+          disabled={controlsBusy || onBulkControl === undefined}
+          aria-busy={bulkAction === "resumeAll" ? "true" : undefined}
+          aria-label="Resume all paused downloads on the daemon"
+          aria-describedby="bulk-actions-help"
+          onclick={() => {
+            if (controlsBusy || onBulkControl === undefined) return;
+            onBulkControl("resumeAll");
+          }}
+        >
+          {bulkAction === "resumeAll" ? "Resuming all…" : "Resume all"}
+        </button>
+      </div>
+      <p class="bulk-hint" id="bulk-actions-help">
+        Applies to every download on the daemon, not just the filtered rows. Pause targets
+        everything except completed, paused, and error rows (queued and unknown included); Resume
+        targets every paused row, including individually paused ones. Surge acknowledges the
+        request; row changes are applied asynchronously and the queue keeps refreshing
+        periodically.
+      </p>
+      {#if bulkSummary}
+        <p class="bulk-feedback" role="status" aria-live="polite">{bulkSummary.message}</p>
+        {#if bulkSummary.status === "done" && (bulkSummary.failed ?? 0) > 0}
+          <details class="bulk-details">
+            <summary>Show failed items ({bulkSummary.failed})</summary>
+            <ul class="bulk-failures">
+              {#each bulkSummary.failures.slice(0, 20) as failure (failure.id)}
+                <li>
+                  <span class="bulk-failure-id">{rows.find((r) => r.id === failure.id)?.name ?? "Unknown download"}</span>
+                  <span class="bulk-failure-note">{failure.error ?? "Daemon reported an error."}</span>
+                </li>
+              {/each}
+            </ul>
+            {#if bulkSummary.failures.length > 20}
+              <p class="bulk-hint">Showing 20 of {bulkSummary.failures.length} failed items.</p>
+            {/if}
+          </details>
+        {/if}
+      {/if}
+    </section>
+  {/if}
+
+  {#if bulkUncertainties.length > 0 || bulkUncertaintyOverflow > 0}
+    <section class="bulk-uncertainty-region" aria-label="Unresolved bulk actions">
+      {#each bulkUncertainties as notice (notice.id)}
+        <div class="bulk-uncertain">
+          <p class="bulk-uncertain-text" role="status" aria-live="polite">{notice.message}</p>
+          {#if onDismissBulkUncertainty}
+            <button
+              type="button"
+              class="btn"
+              aria-label={`Dismiss ${notice.action === "pauseAll" ? "Pause all" : "Resume all"} warning`}
+              onclick={() => onDismissBulkUncertainty(notice.id)}
+            >
+              Dismiss
+            </button>
+          {/if}
+        </div>
+      {/each}
+      {#if bulkUncertaintyOverflow > 0}
+        <div class="bulk-uncertain-overflow-row">
+          <p class="bulk-uncertain-overflow" role="status">
+            {bulkUncertaintyOverflow} additional unresolved bulk {bulkUncertaintyOverflow === 1 ? "action is" : "actions are"}
+            not listed here. They may still apply; none were retried automatically.
+          </p>
+          {#if onDismissBulkUncertaintyOverflow}
+            <button
+              type="button"
+              class="btn"
+              aria-label="Dismiss overflowed bulk warnings"
+              onclick={() => onDismissBulkUncertaintyOverflow()}
+            >
+              Dismiss
+            </button>
+          {/if}
+        </div>
+      {/if}
+    </section>
+  {/if}
 
   <div class="split">
     <section class="pane list-pane" aria-label="Downloads">
@@ -342,7 +459,7 @@
             {/each}
           {:else if mode === "native"}
             {@const nativePrimary = sel.status === "active" ? "pause" : sel.status === "paused" ? "resume" : null}
-            {@const isBusy = controllingId !== null && controllingId !== undefined}
+            {@const isBusy = controlsBusy}
             {@const isSelfBusy = controllingId === sel.id}
             {@const isOpening = openingId !== null && openingId !== undefined}
             {@const isSelfOpening = openingId === sel.id}
@@ -698,6 +815,136 @@
     color: var(--color-accent-ink);
     background: var(--color-ink);
     border-color: var(--color-ink);
+  }
+
+  /* ---- Bulk actions (daemon-wide, not filtered) ---- */
+  .bulk-bar {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    border: 1px solid var(--color-rule);
+    background: var(--color-paper-2);
+    padding: var(--space-sm) var(--space-md);
+    min-width: 0;
+  }
+
+  .bulk-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+    min-width: 0;
+  }
+
+  .bulk-hint {
+    margin: 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--color-muted);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .bulk-uncertainty-region {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding: var(--space-sm) var(--space-md);
+    min-width: 0;
+  }
+
+  .bulk-uncertain-overflow {
+    margin: 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--color-muted);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .bulk-uncertain-overflow-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-xs);
+    min-width: 0;
+  }
+
+  .bulk-uncertain {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-xs);
+    border: 1px solid var(--color-error);
+    background: var(--color-error-wash);
+    padding: var(--space-xs) var(--space-sm);
+    min-width: 0;
+  }
+
+  .bulk-uncertain-text {
+    flex: 1 1 18rem;
+    margin: 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--color-ink);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .bulk-feedback {
+    margin: 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--color-ink);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .bulk-details {
+    min-width: 0;
+    font-size: var(--text-sm);
+    color: var(--color-muted);
+  }
+
+  .bulk-details summary {
+    cursor: pointer;
+    color: var(--color-ink);
+    min-height: var(--control-h);
+    display: flex;
+    align-items: center;
+  }
+
+  .bulk-failures {
+    list-style: none;
+    margin: var(--space-xs) 0 0;
+    padding: 0;
+    border-top: 1px solid var(--color-rule);
+    min-width: 0;
+  }
+
+  .bulk-failures li {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2xs);
+    padding-block: var(--space-xs);
+    border-bottom: 1px solid var(--color-rule);
+    min-width: 0;
+  }
+
+  .bulk-failure-id {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--color-ink);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .bulk-failure-note {
+    font-size: var(--text-sm);
+    color: var(--color-muted);
+    overflow-wrap: anywhere;
+    min-width: 0;
   }
 
   /* ---- Split ---- */
@@ -1229,6 +1476,17 @@
     }
     .brand-divider {
       min-height: 2rem;
+    }
+    .bulk-bar {
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .bulk-hint,
+    .bulk-feedback,
+    .bulk-details,
+    .bulk-uncertain {
+      flex: 1 1 100%;
     }
   }
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import QueueScreen from "./QueueScreen.svelte";
   import { SAMPLE_ITEMS } from "./sampleData";
-  import type { QueueItem } from "./queue/types";
+  import type { BulkAction, QueueItem } from "./queue/types";
   import { NativeQueueController } from "./queue/native-controller";
   import { projectBatchRecovery } from "./queue/native-controller";
   import type { BatchRecoveryView, NativeState } from "./queue/native-controller";
@@ -22,6 +22,7 @@
   import { onDestroy, onMount } from "svelte";
   import { untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import logoUrl from "../assets/surge-logo.webp";
 
   // Tauri runtime starts offline/empty and never pretends to be connected.
@@ -39,7 +40,7 @@
   let endpoint = $state("");
   let token = $state("");
   let addUrl = $state("");
-  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, batch: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, maxConcurrent: null, maxConcurrentLoading: false, maxConcurrentSaving: false, maxConcurrentError: null, maxConcurrentUnconfirmed: false, maxConcurrentRestartPending: false, locationOpeningId: null, locationError: null, locationErrorId: null });
+  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, batch: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, maxConcurrent: null, maxConcurrentLoading: false, maxConcurrentSaving: false, maxConcurrentError: null, maxConcurrentUnconfirmed: false, maxConcurrentRestartPending: false, locationOpeningId: null, locationError: null, locationErrorId: null, bulkAction: null, bulkSummary: null, bulkUncertainties: [], bulkUncertaintyOverflow: 0 });
   let rateDraft = $state("");
   let rateDirty = $state(false);
   let rateTouched = $state(false);
@@ -64,6 +65,7 @@
         snapshot = s;
       },
       5000,
+      (event, handler) => listen(event, handler),
     );
   }
 
@@ -132,6 +134,10 @@
   const locationOpeningId = $derived(snapshot.locationOpeningId ?? null);
   const locationError = $derived(snapshot.locationError ?? null);
   const locationErrorId = $derived(snapshot.locationErrorId ?? null);
+  const bulkAction = $derived(snapshot.bulkAction ?? null);
+  const bulkSummary = $derived(snapshot.bulkSummary ?? null);
+  const bulkUncertainties = $derived(snapshot.bulkUncertainties ?? []);
+  const bulkUncertaintyOverflow = $derived(snapshot.bulkUncertaintyOverflow ?? 0);
 
   // Load the managed limit once per connection epoch. The draft lives in the
   // UI so list polls never overwrite an in-progress edit. tryClaim gates the
@@ -511,6 +517,22 @@
     void controller?.control(action, id);
   }
 
+  function handleBulkControl(action: BulkAction) {
+    // Applies to the daemon's whole queue, not the rows currently shown.
+    if (!isTauri) return;
+    void controller?.bulkControl(action);
+  }
+
+  function handleDismissBulkUncertainty(id: number) {
+    if (!isTauri) return;
+    controller?.dismissBulkUncertainty(id);
+  }
+
+  function handleDismissBulkUncertaintyOverflow() {
+    if (!isTauri) return;
+    controller?.dismissBulkUncertaintyOverflow();
+  }
+
   async function handleAdd(event: SubmitEvent) {
     event.preventDefault();
     if (!isTauri || !controller) return;
@@ -848,6 +870,13 @@
       locationErrorId={locationErrorId}
       onOpenLocation={handleOpenLocation}
       onClearLocationError={handleClearLocationError}
+      bulkAction={bulkAction}
+      bulkSummary={bulkSummary}
+      onBulkControl={handleBulkControl}
+      bulkUncertainties={bulkUncertainties}
+      bulkUncertaintyOverflow={bulkUncertaintyOverflow}
+      onDismissBulkUncertainty={handleDismissBulkUncertainty}
+      onDismissBulkUncertaintyOverflow={handleDismissBulkUncertaintyOverflow}
     />
   {/if}
 </main>

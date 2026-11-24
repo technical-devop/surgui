@@ -8,15 +8,17 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::path::BaseDirectory;
+use tauri::Emitter as _;
 use tauri::Manager as _;
 
 use crate::managed_server::{ManagedServer, OwnerLifetime, DEFAULT_STARTUP_TIMEOUT};
 use crate::open_location::{
     self, LocationError, LocationLaunch, LocationLauncher, SystemLocationLauncher,
 };
+use crate::progress_stream::ProgressStream;
 use crate::surge_client::{
-    AddOutcome, ConnectError, ControlAction, Download, SurgeClient, MAX_CONCURRENT_DOWNLOADS_MAX,
-    MAX_CONCURRENT_DOWNLOADS_MIN, MAX_RATE_LIMIT_BPS,
+    AddOutcome, BulkControlAction, BulkControlOutcome, ConnectError, ControlAction, Download,
+    SurgeClient, MAX_CONCURRENT_DOWNLOADS_MAX, MAX_CONCURRENT_DOWNLOADS_MIN, MAX_RATE_LIMIT_BPS,
 };
 
 /// How often an async lifecycle operation checks the app-shutdown flag.
@@ -71,6 +73,32 @@ impl fmt::Debug for QueueItemDto {
     }
 }
 
+/// Authoritative `/list` snapshot plus the stream cursor it corresponds to.
+///
+/// `stream_seq` is the progress-stream receipt sequence captured immediately
+/// before the `/list` request starts. Events received at or before the cursor
+/// are reflected by the authoritative snapshot; later events carry a higher
+/// receipt sequence and are merged per row (byte-monotonically) so a stale
+/// snapshot can never overwrite newer progress and a queued pre-read sample
+/// can never overwrite the newer list.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueSnapshotDto {
+    pub epoch: u64,
+    pub stream_seq: u64,
+    pub items: Vec<QueueItemDto>,
+}
+
+impl fmt::Debug for QueueSnapshotDto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueueSnapshotDto")
+            .field("epoch", &self.epoch)
+            .field("stream_seq", &self.stream_seq)
+            .field("item_count", &self.items.len())
+            .finish()
+    }
+}
+
 /// Bridge failure surfaced to the frontend as a stable, sanitized code.
 ///
 /// No variant carries the endpoint, bearer token, response body, filename, or
@@ -88,6 +116,7 @@ pub enum BridgeError {
     RateUnconfirmed,
     SettingsConflict,
     SettingsUnconfirmed,
+    BulkUnconfirmed,
     NotConnected,
     Superseded,
     State,
@@ -116,6 +145,7 @@ impl fmt::Debug for BridgeError {
             Self::RateUnconfirmed => "RateUnconfirmed",
             Self::SettingsConflict => "SettingsConflict",
             Self::SettingsUnconfirmed => "SettingsUnconfirmed",
+            Self::BulkUnconfirmed => "BulkUnconfirmed",
             Self::NotConnected => "NotConnected",
             Self::Superseded => "Superseded",
             Self::State => "State",
@@ -147,6 +177,7 @@ impl fmt::Display for BridgeError {
             Self::RateUnconfirmed => "rate limit state could not be confirmed",
             Self::SettingsConflict => "settings changed since editing began",
             Self::SettingsUnconfirmed => "settings change could not be confirmed",
+            Self::BulkUnconfirmed => "bulk queue action could not be confirmed",
             Self::NotConnected => "not connected to a Surge instance",
             Self::Superseded => "connection attempt was superseded",
             Self::State => "connection state unavailable",
@@ -285,6 +316,7 @@ impl From<ConnectError> for BridgeError {
             ConnectError::RateUnconfirmed => Self::RateUnconfirmed,
             ConnectError::SettingsConflict => Self::SettingsConflict,
             ConnectError::SettingsUnconfirmed => Self::SettingsUnconfirmed,
+            ConnectError::BulkUnconfirmed => Self::BulkUnconfirmed,
         }
     }
 }
@@ -878,6 +910,7 @@ impl Drop for ManagedStartGuard {
 pub struct ConnectionManager {
     state: Arc<Mutex<ConnectionState>>,
     lifecycle: Arc<ManagedLifecycle>,
+    progress: Arc<ProgressStream>,
     rate_writer: Arc<RateWriter>,
     settings_writer: Arc<SettingsWriteGate>,
     location_validation: Arc<LocationValidationGate>,
@@ -911,6 +944,9 @@ impl ConnectionManager {
         endpoint: &str,
         token: &str,
     ) -> Result<Vec<QueueItemDto>, BridgeError> {
+        // A replacement connection must never leave the previous stream task
+        // reading (or emitting) in the background.
+        self.progress.stop();
         // Hold the lifecycle operation only across taking and retiring the old
         // daemon. If app shutdown has already started, the shutdown path owns
         // any remaining server.
@@ -976,6 +1012,7 @@ impl ConnectionManager {
     fn begin_managed_start(
         &self,
     ) -> Result<(ManagedStartTicket, Option<ManagedServer>), ManagedError> {
+        self.progress.stop();
         let mut state = self.state.lock().map_err(|_| ManagedError::State)?;
         state.begin_managed_start()
     }
@@ -1116,6 +1153,7 @@ impl ConnectionManager {
         // This ordering means an operation that already claimed a slot either
         // sees `shutting_down` before finishing or gets cancelled below.
         self.lifecycle.begin_shutdown();
+        self.progress.stop();
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -1179,6 +1217,64 @@ impl ConnectionManager {
     /// no lock is held across the await.
     pub async fn list_downloads(&self) -> Result<Vec<QueueItemDto>, BridgeError> {
         self.refresh().await
+    }
+
+    /// Authoritative queue snapshot with the progress-stream cursor captured
+    /// before the `/list` request. Events received during the read therefore
+    /// carry a newer receipt sequence and can be merged over the snapshot,
+    /// while queued pre-read samples remain at or below the cursor.
+    pub async fn list_downloads_snapshot(&self) -> Result<QueueSnapshotDto, BridgeError> {
+        let (client, epoch) = self.acquire_active()?;
+        let stream_seq = self.progress.seq();
+        let downloads = client.refresh().await?;
+
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        if state.epoch != epoch {
+            return Err(BridgeError::Superseded);
+        }
+        drop(state);
+        Ok(QueueSnapshotDto {
+            epoch,
+            stream_seq,
+            items: project(&downloads),
+        })
+    }
+
+    /// Start the single progress stream for the current connection.
+    ///
+    /// `subscription` is the frontend's monotonic connection epoch. The stream
+    /// task is additionally bound to the Rust connection epoch and to a live
+    /// managed/manual connection, so it exits after any replacement,
+    /// disconnect, disposal or shutdown even if this start raced a stop.
+    pub fn start_progress_stream(
+        &self,
+        subscription: u64,
+        app: tauri::AppHandle,
+    ) -> Result<(), BridgeError> {
+        if subscription == 0 {
+            return Err(BridgeError::InvalidResponse);
+        }
+        let (client, epoch) = self.acquire_active()?;
+        let state = Arc::clone(&self.state);
+        let is_current = move || match state.lock() {
+            Ok(state) => state.epoch == epoch && state.active != ActiveConnection::None,
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                state.epoch == epoch && state.active != ActiveConnection::None
+            }
+        };
+        let emit: Arc<dyn Fn(&'static str, serde_json::Value) + Send + Sync> =
+            Arc::new(move |event, payload| {
+                let _ = app.emit(event, payload);
+            });
+        self.progress
+            .start(subscription, epoch, client, emit, is_current);
+        Ok(())
+    }
+
+    /// Stop and abort the progress stream (best-effort, non-blocking).
+    pub fn stop_progress_stream(&self) {
+        self.progress.stop();
     }
 
     /// Open the containing folder of a completed download on the owned managed
@@ -1379,6 +1475,30 @@ impl ConnectionManager {
         }
         drop(state);
         Ok(())
+    }
+
+    /// Apply a released bulk queue action to every download on the daemon.
+    ///
+    /// The client and epoch are cloned under the lock and the network round
+    /// trip runs without it. The epoch is re-checked after both success and
+    /// failure, so a superseding `connect`/`disconnect` can never attribute a
+    /// prior daemon's bulk result or error to the replacement connection.
+    /// Partial and unconfirmed outcomes are still surfaced (as
+    /// [`BridgeError::BulkUnconfirmed`]) so the frontend can reconcile; nothing
+    /// is retried here and no queue snapshot is cached or mutated.
+    pub async fn bulk_control(
+        &self,
+        action: BulkControlAction,
+    ) -> Result<BulkControlOutcome, BridgeError> {
+        let (client, epoch) = self.acquire_active()?;
+        let result = client.bulk_control(action).await;
+
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        if state.epoch != epoch {
+            return Err(BridgeError::Superseded);
+        }
+        drop(state);
+        result.map_err(BridgeError::from)
     }
 
     /// Enqueue a download on the active connection.
@@ -1712,6 +1832,9 @@ impl ConnectionManager {
     /// only hold an `Arc<SurgeClient>` clone, so they observe the new epoch (or
     /// a network error) without stranding state.
     pub fn disconnect(&self) {
+        // Abort the stream before any state change so no read survives the
+        // disconnect.
+        self.progress.stop();
         // The shutdown path owns lifecycle fencing once it starts; it also
         // takes any remaining managed server itself. Registering here keeps a
         // concurrent new start from binding the fixed port mid-retirement.
@@ -2089,6 +2212,26 @@ pub async fn list_downloads(
     state.list_downloads().await
 }
 
+/// Authoritative `/list` snapshot plus the stream cursor for merge fencing.
+#[tauri::command]
+pub async fn list_downloads_snapshot(
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<QueueSnapshotDto, BridgeError> {
+    state.list_downloads_snapshot().await
+}
+
+/// Start the authenticated `/events` progress stream for the current
+/// connection. `subscription` is the frontend's monotonic epoch; stale starts
+/// are ignored by the stream manager.
+#[tauri::command]
+pub async fn start_progress_stream(
+    subscription: u64,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<(), BridgeError> {
+    state.start_progress_stream(subscription, app)
+}
+
 /// Open the containing folder of a completed download on the owned managed
 /// daemon. Accepts only the server-owned download id; no path crosses IPC.
 #[tauri::command]
@@ -2166,6 +2309,27 @@ pub async fn control_download(
         _ => return Err(BridgeError::InvalidResponse),
     };
     state.control_download(action, &id).await
+}
+
+/// Apply Pause all or Resume all to the daemon's entire queue.
+///
+/// `action` is matched against a strict, case-sensitive allowlist (`pauseAll`
+/// or `resumeAll`); anything else becomes a sanitized
+/// [`BridgeError::InvalidResponse`] without a request. The applied set is the
+/// daemon's whole queue, not the rows currently filtered in the UI. Returns
+/// only the validated count and per-item results — the frontend owns the fresh
+/// queue reconciliation and never retries automatically.
+#[tauri::command]
+pub async fn bulk_control(
+    action: String,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<BulkControlOutcome, BridgeError> {
+    let action = match action.as_str() {
+        "pauseAll" => BulkControlAction::PauseAll,
+        "resumeAll" => BulkControlAction::ResumeAll,
+        _ => return Err(BridgeError::InvalidResponse),
+    };
+    state.bulk_control(action).await
 }
 
 /// Enqueue a download on the active connection.

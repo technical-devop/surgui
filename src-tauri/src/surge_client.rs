@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::{redirect::Policy, Certificate, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
@@ -14,6 +15,21 @@ const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// The exact query string is forwarded verbatim, so a bounded cap keeps a
 /// hostile or malformed URL from being relayed to the daemon.
 const MAX_URL_BYTES: usize = 8 * 1024;
+
+/// Upper bound for per-item ids returned by a bulk control route. The `/list`
+/// body is already capped at `MAX_BODY_BYTES`, so this is a second, explicit
+/// guard against pathological ids.
+const MAX_BULK_ID_BYTES: usize = 1024;
+
+/// Fixed, display-safe replacement for every daemon per-item error string.
+///
+/// The daemon's raw text can contain a bearer token, signed URL, or local
+/// path, so it never crosses IPC or reaches a log. Only the validated item id
+/// and the success/failure bit are preserved.
+const BULK_ITEM_ERROR_MESSAGE: &str = "Daemon reported an error for this item.";
+
+/// Upper bound for the number of per-item results accepted from a bulk route.
+const MAX_BULK_RESULT_ITEMS: usize = 100_000;
 
 /// Largest integer exactly representable as a JavaScript `Number`.
 ///
@@ -35,6 +51,9 @@ const DUPLICATE_MESSAGE: &str = "Download rejected: Duplicate download detected 
 
 /// Bounded round-trip for the authenticated `/list` probe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded wait for the `/events` TCP+TLS+response-header handshake. Once the
+/// headers arrive the established body may stay idle indefinitely.
+const EVENT_STREAM_HANDSHAKE_TIMEOUT: Duration = CONNECT_TIMEOUT;
 
 /// Pinned managed-mode origin.
 ///
@@ -126,6 +145,10 @@ impl fmt::Debug for Download {
 /// future Tauri commands can re-query the instance.
 pub struct SurgeClient {
     client: Client,
+    /// Same security posture as `client`, but with no whole-request timeout so
+    /// the indefinite `/events` SSE response is never cut at 10 seconds. Only
+    /// connect/handshake is bounded.
+    stream_client: Client,
     base_url: String,
     token: String,
     downloads: Vec<Download>,
@@ -156,6 +179,7 @@ pub enum ConnectError {
     RateUnconfirmed,
     SettingsConflict,
     SettingsUnconfirmed,
+    BulkUnconfirmed,
 }
 
 impl fmt::Debug for ConnectError {
@@ -173,6 +197,7 @@ impl fmt::Debug for ConnectError {
             Self::RateUnconfirmed => write!(f, "RateUnconfirmed"),
             Self::SettingsConflict => write!(f, "SettingsConflict"),
             Self::SettingsUnconfirmed => write!(f, "SettingsUnconfirmed"),
+            Self::BulkUnconfirmed => write!(f, "BulkUnconfirmed"),
         }
     }
 }
@@ -190,6 +215,7 @@ impl fmt::Display for ConnectError {
             Self::RateUnconfirmed => write!(f, "rate limit state could not be confirmed"),
             Self::SettingsConflict => write!(f, "settings changed since editing began"),
             Self::SettingsUnconfirmed => write!(f, "settings change could not be confirmed"),
+            Self::BulkUnconfirmed => write!(f, "bulk queue action could not be confirmed"),
         }
     }
 }
@@ -246,6 +272,90 @@ impl ControlAction {
             Self::Resume => status == "resumed",
             Self::RemoveRecord => false,
         }
+    }
+}
+
+/// Released Surge v0.12.4 bulk queue actions (`cmd/http_api.go`).
+///
+/// Only the two all-queue routes exist here. The enum is the allowlist: there
+/// is no arbitrary route string or user-supplied path, so `/purge` and every
+/// other daemon route stay unreachable through this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BulkControlAction {
+    PauseAll,
+    ResumeAll,
+}
+
+/// Exact origin-form routes the bulk client is allowed to POST to.
+const BULK_CONTROL_ROUTES: [&str; 2] = ["/pause-all", "/resume-all"];
+
+impl BulkControlAction {
+    /// Exact origin-form path for the released bulk route.
+    fn route(self) -> &'static str {
+        match self {
+            Self::PauseAll => "/pause-all",
+            Self::ResumeAll => "/resume-all",
+        }
+    }
+
+    /// Count field the daemon echoes for this action.
+    fn count_field(self) -> &'static str {
+        match self {
+            Self::PauseAll => "paused",
+            Self::ResumeAll => "resumed",
+        }
+    }
+
+    /// Route allowlist check. Kept explicit so a future variant cannot
+    /// silently reach an unreviewed daemon route.
+    fn is_allowlisted(self) -> bool {
+        BULK_CONTROL_ROUTES.contains(&self.route())
+    }
+}
+
+/// One sanitized per-item result from a bulk queue action.
+///
+/// `id` is the validated daemon row id. `error`, when present, is always the
+/// fixed `BULK_ITEM_ERROR_MESSAGE`; the daemon's raw text is discarded so a
+/// token, URL, or local path can never cross IPC. `Debug` never prints either
+/// value because both are server-controlled.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkControlItemResult {
+    pub id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl fmt::Debug for BulkControlItemResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BulkControlItemResult")
+            .field("ok", &self.ok)
+            .field("has_error", &self.error.is_some())
+            .finish()
+    }
+}
+
+/// Validated `POST /pause-all` or `POST /resume-all` outcome.
+///
+/// `count` is the daemon's `paused`/`resumed` success count. It is verified to
+/// equal the number of per-item results without an error, so the frontend can
+/// show accepted/failed counts without trusting an inconsistent number.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkControlOutcome {
+    pub status: String,
+    pub count: u64,
+    pub results: Vec<BulkControlItemResult>,
+}
+
+impl fmt::Debug for BulkControlOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BulkControlOutcome")
+            .field("count", &self.count)
+            .field("result_count", &self.results.len())
+            .finish()
     }
 }
 
@@ -691,6 +801,41 @@ fn map_send_error(err: reqwest::Error) -> ConnectError {
     }
 }
 
+/// Build the manual-mode client. `streaming` keeps the same redirect policy but
+/// replaces the whole-request timeout with a bounded connect/handshake timeout,
+/// because an idle SSE response must be allowed to stay open indefinitely.
+fn build_manual_client(streaming: bool) -> Result<Client, ConnectError> {
+    let mut builder = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT);
+    if !streaming {
+        builder = builder.timeout(CONNECT_TIMEOUT);
+    }
+    builder.build().map_err(|_| ConnectError::Network)
+}
+
+/// Validate the released SSE response before any body is read.
+fn validate_event_response(response: &reqwest::Response) -> Result<(), ConnectError> {
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(ConnectError::Unauthorized);
+    }
+    if status != StatusCode::OK {
+        return Err(ConnectError::InvalidResponse);
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream")) {
+        return Err(ConnectError::InvalidResponse);
+    }
+    Ok(())
+}
+
 /// Read a `/list` body in chunks, enforcing `MAX_BODY_BYTES` even when the
 /// server omits `Content-Length` (chunked transfer). `bytes().await` would
 /// buffer an unbounded body first, so chunks are accumulated with a cap.
@@ -714,6 +859,73 @@ async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, C
         }
     }
     Ok(buf)
+}
+
+/// Strictly validate a released bulk control body.
+///
+/// The released v0.12.4 shape is
+/// `{"status":"done","paused"|"resumed":N,"results":[{"id":...,"error"?:...}]}`.
+/// Anything unexpected is [`ConnectError::BulkUnconfirmed`] because the daemon
+/// may already have applied part of the action: unknown/malformed outcomes are
+/// never reported as a clean failure. Ids must be present, bounded, unique and
+/// control-free; `error` must be a string when present, but its content is
+/// discarded and replaced with [`BULK_ITEM_ERROR_MESSAGE`]; and the echoed
+/// count must exactly match the per-item successes.
+fn parse_bulk_response(
+    action: BulkControlAction,
+    bytes: &[u8],
+) -> Result<BulkControlOutcome, ConnectError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ConnectError::BulkUnconfirmed)?;
+    let object = value.as_object().ok_or(ConnectError::BulkUnconfirmed)?;
+    if object.get("status").and_then(serde_json::Value::as_str) != Some("done") {
+        return Err(ConnectError::BulkUnconfirmed);
+    }
+    let count = object
+        .get(action.count_field())
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(ConnectError::BulkUnconfirmed)?;
+    let raw_results = object
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(ConnectError::BulkUnconfirmed)?;
+    if raw_results.len() > MAX_BULK_RESULT_ITEMS {
+        return Err(ConnectError::BulkUnconfirmed);
+    }
+    let mut seen = HashSet::with_capacity(raw_results.len());
+    let mut results = Vec::with_capacity(raw_results.len());
+    for raw in raw_results {
+        let item = raw.as_object().ok_or(ConnectError::BulkUnconfirmed)?;
+        let id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ConnectError::BulkUnconfirmed)?;
+        if id.is_empty() || id.len() > MAX_BULK_ID_BYTES || id.chars().any(char::is_control) {
+            return Err(ConnectError::BulkUnconfirmed);
+        }
+        if !seen.insert(id) {
+            return Err(ConnectError::BulkUnconfirmed);
+        }
+        let error = match item.get("error") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(_)) => Some(BULK_ITEM_ERROR_MESSAGE.to_string()),
+            Some(_) => return Err(ConnectError::BulkUnconfirmed),
+        };
+        results.push(BulkControlItemResult {
+            id: id.to_string(),
+            ok: error.is_none(),
+            error,
+        });
+    }
+    let successes = results.iter().filter(|result| result.ok).count() as u64;
+    if count != successes {
+        return Err(ConnectError::BulkUnconfirmed);
+    }
+    Ok(BulkControlOutcome {
+        status: "done".to_string(),
+        count,
+        results,
+    })
 }
 
 /// Shared `GET <base>/list` probe used by both `connect` and `refresh`.
@@ -762,14 +974,12 @@ impl SurgeClient {
             return Err(invalid("token contains invalid characters"));
         }
         let base = validate_endpoint(endpoint)?;
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|_| ConnectError::Network)?;
+        let client = build_manual_client(false)?;
+        let stream_client = build_manual_client(true)?;
         let downloads = get_list(&client, &base, token).await?;
         Ok(Self {
             client,
+            stream_client,
             base_url: base,
             token: token.to_string(),
             downloads,
@@ -789,6 +999,40 @@ impl SurgeClient {
     /// Re-query `/list` with the retained bearer token.
     pub async fn refresh(&self) -> Result<Vec<Download>, ConnectError> {
         get_list(&self.client, &self.base_url, &self.token).await
+    }
+
+    /// Open the authenticated, indefinite `GET /events` SSE response.
+    ///
+    /// Uses the retained streaming client, which keeps the same pinned
+    /// TLS/no-redirect/no-proxy posture as the normal client but has no
+    /// whole-request timeout. Only the TCP/TLS/header handshake is bounded;
+    /// once headers arrive the established body may stay idle indefinitely.
+    /// The response status and `Content-Type: text/event-stream` are validated
+    /// before the caller reads any body. The bearer token travels only in the
+    /// `Authorization` header; no request URL, token or response content is
+    /// carried in an error.
+    pub async fn open_event_stream(&self) -> Result<reqwest::Response, ConnectError> {
+        self.open_event_stream_with_timeout(EVENT_STREAM_HANDSHAKE_TIMEOUT)
+            .await
+    }
+
+    async fn open_event_stream_with_timeout(
+        &self,
+        handshake_timeout: Duration,
+    ) -> Result<reqwest::Response, ConnectError> {
+        let request = self
+            .stream_client
+            .get(format!("{}/events", self.base_url))
+            .bearer_auth(&self.token)
+            .header(ACCEPT, "text/event-stream")
+            .send();
+        let response = match tokio::time::timeout(handshake_timeout, request).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => return Err(map_send_error(err)),
+            Err(_) => return Err(ConnectError::Timeout),
+        };
+        validate_event_response(&response)?;
+        Ok(response)
     }
 
     /// Apply a released control action to one queue record.
@@ -832,6 +1076,52 @@ impl SurgeClient {
             return Err(ConnectError::InvalidResponse);
         }
         Ok(())
+    }
+
+    /// Apply a released bulk control action to the whole daemon queue.
+    ///
+    /// The route comes only from [`BulkControlAction`] and is checked against
+    /// the explicit allowlist before any request is built. The retained client
+    /// already disables redirects and bounds the round trip; the bearer token
+    /// travels in the `Authorization` header only, the response body is bounded
+    /// before validation, and no request URL, token, id or body appears in an
+    /// error.
+    ///
+    /// A 401/403 response is a definitive rejection. A 500 is the released
+    /// `service.List()` failure that returns before any item is touched, so it
+    /// is a definitive non-application. Every other transport, status, body or
+    /// validation failure is [`ConnectError::BulkUnconfirmed`] because some of
+    /// the bulk action may already have taken effect.
+    pub async fn bulk_control(
+        &self,
+        action: BulkControlAction,
+    ) -> Result<BulkControlOutcome, ConnectError> {
+        if !action.is_allowlisted() {
+            return Err(ConnectError::InvalidResponse);
+        }
+        let mut url = Url::parse(&self.base_url).map_err(|_| ConnectError::InvalidResponse)?;
+        url.set_path(action.route());
+        let response = match self.client.post(url).bearer_auth(&self.token).send().await {
+            Ok(response) => response,
+            Err(_) => return Err(ConnectError::BulkUnconfirmed),
+        };
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(ConnectError::Unauthorized);
+        }
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            // `handlePauseAll`/`handleResumeAll` call `service.List()` first
+            // and return 500 before iterating, so nothing was applied.
+            return Err(ConnectError::InvalidResponse);
+        }
+        if status != StatusCode::OK {
+            return Err(ConnectError::BulkUnconfirmed);
+        }
+        let bytes = match read_bounded_body(response).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(ConnectError::BulkUnconfirmed),
+        };
+        parse_bulk_response(action, &bytes)
     }
 
     /// Request a graceful shutdown of this managed daemon.
@@ -1137,6 +1427,17 @@ fn parse_managed_ca(ca_pem: &[u8]) -> Result<Vec<Certificate>, ConnectError> {
 /// - TLS early data is never enabled: this crate does not enable reqwest's
 ///   `http3`/`reqwest_unstable` early-data API, so no early data is sent.
 fn build_managed_client(certs: Vec<Certificate>) -> Result<Client, ConnectError> {
+    build_managed_client_with_timeout(certs, true)
+}
+
+fn build_managed_stream_client(certs: Vec<Certificate>) -> Result<Client, ConnectError> {
+    build_managed_client_with_timeout(certs, false)
+}
+
+fn build_managed_client_with_timeout(
+    certs: Vec<Certificate>,
+    whole_request_timeout: bool,
+) -> Result<Client, ConnectError> {
     let mut builder = Client::builder()
         .use_rustls_tls()
         .tls_built_in_root_certs(false)
@@ -1144,7 +1445,10 @@ fn build_managed_client(certs: Vec<Certificate>) -> Result<Client, ConnectError>
         .redirect(Policy::none())
         .no_proxy()
         .pool_max_idle_per_host(0)
-        .timeout(CONNECT_TIMEOUT);
+        .connect_timeout(CONNECT_TIMEOUT);
+    if whole_request_timeout {
+        builder = builder.timeout(CONNECT_TIMEOUT);
+    }
     for cert in certs {
         builder = builder.add_root_certificate(cert);
     }
@@ -1170,10 +1474,13 @@ impl SurgeClient {
         validate_managed_token(token)?;
         let certs = parse_managed_ca(ca_pem)?;
         let client = build_managed_client(certs)?;
+        let stream_certs = parse_managed_ca(ca_pem)?;
+        let stream_client = build_managed_stream_client(stream_certs)?;
         let base = MANAGED_BASE_URL.to_string();
         let downloads = get_list(&client, &base, token).await?;
         Ok(Self {
             client,
+            stream_client,
             base_url: base,
             token: token.to_string(),
             downloads,
@@ -1191,6 +1498,19 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn bulk_control_routes_are_explicitly_allowlisted() {
+        assert_eq!(BulkControlAction::PauseAll.route(), "/pause-all");
+        assert_eq!(BulkControlAction::ResumeAll.route(), "/resume-all");
+        for action in [BulkControlAction::PauseAll, BulkControlAction::ResumeAll] {
+            assert!(action.is_allowlisted(), "bulk route must be allowlisted");
+        }
+        assert!(
+            !BULK_CONTROL_ROUTES.contains(&"/purge"),
+            "purge must never be an allowed bulk route"
+        );
+    }
+
     fn server_config_for(id: &ManagedIdentity) -> Arc<rustls::ServerConfig> {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
         let leaf_der = CertificateDer::from(id.server_cert_der().to_vec());
@@ -1206,8 +1526,13 @@ mod tests {
     fn managed_client_for(id: &ManagedIdentity) -> SurgeClient {
         let certs = parse_managed_ca(id.ca_cert_pem().as_bytes()).expect("managed CA");
         let client = build_managed_client(certs).expect("managed client");
+        let stream_certs =
+            parse_managed_ca(id.ca_cert_pem().as_bytes()).expect("managed stream CA");
+        let stream_client =
+            build_managed_stream_client(stream_certs).expect("managed stream client");
         SurgeClient {
             client,
+            stream_client,
             base_url: MANAGED_BASE_URL.to_string(),
             token: id.bearer_token().to_owned(),
             downloads: Vec::new(),
@@ -1297,6 +1622,116 @@ mod tests {
         server.join().expect("server thread");
         assert!(route_ok, "shutdown must use POST /shutdown");
         assert!(auth_ok, "bearer must travel only in Authorization header");
+    }
+
+    #[tokio::test]
+    async fn event_stream_never_reaches_untrusted_tls_identity() {
+        let _guard = crate::managed_server::test_port_lock().lock().await;
+        let client_id = ManagedIdentity::generate().expect("client identity");
+        let server_id = ManagedIdentity::generate().expect("server identity");
+        let surge = managed_client_for(&client_id);
+        let server_config = server_config_for(&server_id);
+        let listener = TcpListener::bind("127.0.0.1:1700").expect("bind 1700");
+        let (capture_tx, capture_rx) = mpsc::channel::<bool>();
+        let server = thread::spawn(move || {
+            let mut stream = accept_with_deadline(&listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut conn = rustls::ServerConnection::new(server_config).expect("server conn");
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            // Handshake fails before any HTTP bytes can be read with the wrong
+            // trust anchor.
+            let request = read_headers(&mut tls);
+            let _ = capture_tx.send(!request.is_empty());
+        });
+
+        let result = surge.open_event_stream().await;
+        assert!(
+            result.is_err(),
+            "event stream must not succeed against an untrusted TLS identity"
+        );
+        let request_reached = capture_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured handshake result");
+        server.join().expect("server thread");
+        assert!(
+            !request_reached,
+            "no HTTP request may reach an untrusted listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_stream_handshake_timeout_bounds_a_silent_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let mut stream = accept_with_deadline(&listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let _ = read_headers(&mut stream);
+            // Accept the request, then never send response headers.
+            thread::sleep(Duration::from_millis(200));
+        });
+        let surge = SurgeClient {
+            client: build_manual_client(false).expect("manual client"),
+            stream_client: build_manual_client(true).expect("manual stream client"),
+            base_url: format!("http://{}", addr),
+            token: "test-token".to_string(),
+            downloads: Vec::new(),
+        };
+        let started = Instant::now();
+        let error = surge
+            .open_event_stream_with_timeout(Duration::from_millis(40))
+            .await
+            .expect_err("silent server must time out");
+        assert_eq!(error, ConnectError::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "handshake wait must be bounded"
+        );
+        server.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn event_stream_does_not_time_out_an_idle_established_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let mut stream = accept_with_deadline(&listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let _ = read_headers(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .expect("headers");
+            stream.flush().expect("flush");
+            // Stay idle longer than the handshake timeout, then send a frame.
+            thread::sleep(Duration::from_millis(150));
+            stream.write_all(b"data: ok\n\n").expect("body");
+            stream.flush().expect("flush");
+        });
+        let surge = SurgeClient {
+            client: build_manual_client(false).expect("manual client"),
+            stream_client: build_manual_client(true).expect("manual stream client"),
+            base_url: format!("http://{}", addr),
+            token: "test-token".to_string(),
+            downloads: Vec::new(),
+        };
+        let response = surge
+            .open_event_stream_with_timeout(Duration::from_millis(30))
+            .await
+            .expect("headers must establish the stream");
+        let body = tokio::time::timeout(Duration::from_secs(2), response.text())
+            .await
+            .expect("idle body must not be cut by the handshake timeout")
+            .expect("body");
+        assert_eq!(body, "data: ok\n\n");
+        server.join().expect("server thread");
     }
 
     #[tokio::test]

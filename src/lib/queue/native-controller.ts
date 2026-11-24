@@ -1,4 +1,11 @@
-import type { DownloadStatus, QueueItem } from "./types.ts";
+import type {
+  BulkAction,
+  BulkItemFailure,
+  BulkSummary,
+  BulkUncertainty,
+  DownloadStatus,
+  QueueItem,
+} from "./types.ts";
 import {
   batchStatusMessage,
   isValidMaxConcurrentValue,
@@ -8,6 +15,14 @@ import {
   type BatchPlanEntry,
   type UrlLineError,
 } from "./queue.ts";
+import {
+  applyProgressUpdates,
+  mergeSnapshotWithProgress,
+  sanitizeLifecycleNotice,
+  sanitizeProgressBatch,
+  sanitizeSnapshotPayload,
+  sanitizeStreamState,
+} from "./progress.ts";
 
 export type NativePhase = "offline" | "connecting" | "connected" | "error";
 
@@ -118,10 +133,46 @@ export interface NativeState {
   locationOpeningId?: string | null;
   locationError?: string | null;
   locationErrorId?: string | null;
+  /** Bulk action currently in flight; mutually exclusive with `controllingId`. */
+  bulkAction?: BulkAction | null;
+  /** Display-safe result of the last bulk action on this connection. */
+  bulkSummary?: BulkSummary | null;
+  /**
+   * Persistent warnings for bulk requests whose outcome was never confirmed.
+   * Each notice is independent, survives reconnect, and clears only on its own
+   * explicit dismissal. The current connection may be the same daemon.
+   */
+  bulkUncertainties?: BulkUncertainty[];
+  /**
+   * Count of unresolved notices omitted from the bounded list above. Treated
+   * conservatively: they may still have applied and were not retried.
+   */
+  bulkUncertaintyOverflow?: number;
+  /** Near-real-time stream status; polling always continues regardless. */
+  streamState?: "off" | "starting" | "live" | "fallback";
 }
 
 export type InvokeFn = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 export type OnChangeFn = (snapshot: NativeState) => void;
+/** Minimal Tauri event-listener seam; injection keeps this module testable. */
+export type ListenFn = (
+  event: string,
+  handler: (event: { payload: unknown }) => void,
+) => Promise<() => void>;
+
+const PROGRESS_EVENT = "surge://progress";
+const LIFECYCLE_EVENT = "surge://lifecycle";
+const STREAM_STATE_EVENT = "surge://stream";
+
+/** Bounded reconcile retry delays after a transient snapshot failure. */
+const RECONCILE_RETRY_MS = [300, 750, 1500, 3000];
+/** Bounded time allowed for event-listener registration before connecting. */
+const DEFAULT_LISTENER_TIMEOUT_MS = 2000;
+const TRANSIENT_REFRESH_CODES: ReadonlySet<string> = new Set([
+  "network",
+  "timeout",
+  "state",
+]);
 
 const KNOWN_STATUSES: ReadonlySet<string> = new Set([
   "active",
@@ -258,6 +309,142 @@ function isSettingsUnconfirmed(err: unknown): boolean {
   return extractCodeText(err).toLowerCase().includes("settingsunconfirmed");
 }
 
+const KNOWN_BULK_ACTIONS: ReadonlySet<string> = new Set(["pauseAll", "resumeAll"]);
+const MAX_BULK_RESULTS = 100_000;
+const MAX_BULK_ID_LENGTH = 1024;
+/** Bounded number of independent unresolved bulk notices retained for display. */
+const MAX_BULK_UNCERTAINTIES = 5;
+
+const BULK_FALLBACK =
+  "Bulk action could not be completed. Downloads may have changed; the queue keeps refreshing periodically. Not retried automatically.";
+const BULK_UNCONFIRMED_MESSAGE =
+  "Bulk action outcome could not be confirmed. Downloads may have changed; the queue keeps refreshing periodically. Not retried automatically.";
+const BULK_NOT_CONNECTED_MESSAGE = "Not connected. No bulk action was sent.";
+const BULK_ITEM_ERROR_MESSAGE = "Daemon reported an error for this item.";
+
+function isBulkAction(value: unknown): value is BulkAction {
+  return typeof value === "string" && KNOWN_BULK_ACTIONS.has(value);
+}
+
+function bulkLabel(action: BulkAction): string {
+  return action === "pauseAll" ? "Pause all" : "Resume all";
+}
+
+function bulkUncertaintyMessage(action: BulkAction, sameConnection: boolean): string {
+  const scope = sameConnection
+    ? "was sent on this connection, but its outcome was not confirmed. It may still apply here."
+    : "was sent on a previous connection, but its outcome was never confirmed. The current connection may be the same daemon, so the action may still apply here.";
+  return `${bulkLabel(action)} ${scope} It was not retried automatically; the queue keeps refreshing periodically.`;
+}
+
+/**
+ * Validate the error field without ever forwarding its text. The daemon's
+ * per-item error can carry a bearer token, a signed URL, or a local path, so
+ * only the validated item id and the ok/failed bit survive into state.
+ */
+function sanitizeBulkError(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") throw "bulkUnconfirmed";
+  return BULK_ITEM_ERROR_MESSAGE;
+}
+
+function unconfirmedBulkSummary(action: BulkAction, message: string): BulkSummary {
+  return {
+    action,
+    status: "unconfirmed",
+    accepted: null,
+    failed: null,
+    total: null,
+    failures: [],
+    message,
+  };
+}
+
+function failedBulkSummary(action: BulkAction, message: string): BulkSummary {
+  return {
+    action,
+    status: "failed",
+    accepted: 0,
+    failed: 0,
+    total: 0,
+    failures: [],
+    message,
+  };
+}
+
+/**
+ * Validate the Rust bulk outcome a second time at the IPC boundary. The
+ * backend already enforces this, but a malformed/oversized payload is treated
+ * as unconfirmed rather than rendered as a clean result. A count that does not
+ * equal the per-item successes is rejected.
+ */
+function sanitizeBulkOutcome(raw: unknown, action: BulkAction): BulkSummary {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  if (r.status !== "done") throw "bulkUnconfirmed";
+  const count = r.count;
+  if (
+    typeof count !== "number" ||
+    !Number.isInteger(count) ||
+    count < 0 ||
+    count > Number.MAX_SAFE_INTEGER
+  ) {
+    throw "bulkUnconfirmed";
+  }
+  const results = r.results;
+  if (!Array.isArray(results) || results.length > MAX_BULK_RESULTS) throw "bulkUnconfirmed";
+  const seen = new Set<string>();
+  let accepted = 0;
+  const failures: BulkItemFailure[] = [];
+  for (const entry of results) {
+    if (entry === null || typeof entry !== "object") throw "bulkUnconfirmed";
+    const item = entry as Record<string, unknown>;
+    const id = item.id;
+    if (typeof id !== "string" || id.length === 0 || id.length > MAX_BULK_ID_LENGTH) {
+      throw "bulkUnconfirmed";
+    }
+    if (seen.has(id)) throw "bulkUnconfirmed";
+    seen.add(id);
+    const ok = item.ok;
+    if (typeof ok !== "boolean") throw "bulkUnconfirmed";
+    const error = sanitizeBulkError(item.error);
+    if (ok) {
+      if (error !== undefined) throw "bulkUnconfirmed";
+      accepted += 1;
+    } else {
+      if (error === undefined) throw "bulkUnconfirmed";
+      failures.push({ id, error });
+    }
+  }
+  if (accepted !== count) throw "bulkUnconfirmed";
+  const failed = results.length - accepted;
+  const label = bulkLabel(action);
+  return {
+    action,
+    status: "done",
+    accepted,
+    failed,
+    total: results.length,
+    failures,
+    message:
+      results.length === 0
+        ? `${label}: no downloads were eligible.`
+        : `${label} acknowledged: ${accepted} accepted, ${failed} failed. The daemon applies transitions asynchronously; the queue keeps refreshing periodically.`,
+  };
+}
+
+function classifyBulkError(err: unknown): BulkSummary["status"] | "notconnected" {
+  const text = extractCodeText(err).toLowerCase();
+  if (text.includes("notconnected")) return "notconnected";
+  if (
+    text.includes("unauthorized") ||
+    text.includes("invalidresponse") ||
+    text.includes("bulkunconfirmed")
+  ) {
+    return text.includes("bulkunconfirmed") ? "unconfirmed" : "failed";
+  }
+  return "unconfirmed";
+}
+
 function mapMaxConcurrentMessage(err: unknown, fallback: string): string {
   const text = extractCodeText(err).toLowerCase();
   if (text.includes("settingsunconfirmed")) return MAX_CONCURRENT_UNCONFIRMED_MESSAGE;
@@ -332,6 +519,11 @@ function mapManagedStartError(err: unknown): string {
 
 const KNOWN_ADD_OUTCOMES: ReadonlySet<string> = new Set(["queued", "pendingApproval", "duplicate"]);
 
+interface RefreshResult {
+  ok: boolean;
+  code: string | null;
+}
+
 interface ActiveBatchContext {
   epoch: number;
   identity: number;
@@ -379,15 +571,60 @@ export class NativeQueueController {
     locationOpeningId: null,
     locationError: null,
     locationErrorId: null,
+    bulkAction: null,
+    bulkSummary: null,
+    bulkUncertainties: [],
+    bulkUncertaintyOverflow: 0,
+    streamState: "off",
   };
 
   private epoch = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
+  private streamListen: ListenFn | null;
+  private listenerPromise: Promise<void> | null = null;
+  private listenerAttempt: object | null = null;
+  private listenerReady = false;
+  private listenerTimeoutMs: number;
+  private unlisteners: Array<() => void> = [];
+  private streamSubscription: number | null = null;
+  private snapshotCursor = 0;
+  private lastLifecycleSeq = 0;
+  private lastStateSeq = 0;
+  private progressSeqById = new Map<string, number>();
+  /**
+   * Ids whose daemon reset was observed in a snapshot, mapped to the generation
+   * (`addedAt`) that reset. Live events for that generation are ignored because
+   * a delayed old sample cannot be distinguished without a daemon generation
+   * id; snapshots alone update the row until `addedAt` changes.
+   */
+  private progressQuarantined = new Map<string, number>();
+  /**
+   * Ids whose lower snapshot was deferred because a newer in-flight sample may
+   * explain it. A fresh authoritative read confirms a real reset or clears the
+   * suspicion; while pending, the live value is kept rather than rewound.
+   */
+  private pendingSnapshotConfirmation = new Set<string>();
+  private reconcileQueued = false;
+  private reconcileRunning = false;
+  private reconcileRetryAttempt = 0;
+  private reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconcileRetryMs: number[];
   private controlEpoch: number | null = null;
+  private bulkEpoch: number | null = null;
+  private bulkSeq = 0;
+  private bulkUncertaintySeq = 0;
+  /**
+   * Connection epoch that produced the currently displayed bulk summary. Used
+   * to describe an unresolved outcome without blaming a previous connection
+   * when the request was made on the connection that is still current.
+   */
+  private bulkSummaryEpoch: number | null = null;
+  private bulkAwaitingReply = false;
+  private bulkReconcilePending = false;
   private addEpoch: number | null = null;
   private managedEpoch: number | null = null;
-  private refreshPromise: Promise<void> | null = null;
+  private refreshPromise: Promise<RefreshResult> | null = null;
   private refreshEpoch: number | null = null;
   private refreshSeq = 0;
   private rateSeq = 0;
@@ -414,10 +651,23 @@ export class NativeQueueController {
   private onChange: OnChangeFn;
   private pollMs: number;
 
-  constructor(invoke: InvokeFn, onChange: OnChangeFn, pollMs = 5000) {
+  constructor(
+    invoke: InvokeFn,
+    onChange: OnChangeFn,
+    pollMs = 5000,
+    listen?: ListenFn,
+    options?: { reconcileRetryMs?: number[]; listenerTimeoutMs?: number },
+  ) {
     this.invoke = invoke;
     this.onChange = onChange;
     this.pollMs = pollMs;
+    this.streamListen = typeof listen === "function" ? listen : null;
+    this.reconcileRetryMs = options?.reconcileRetryMs ?? RECONCILE_RETRY_MS;
+    const listenerTimeout = options?.listenerTimeoutMs;
+    this.listenerTimeoutMs =
+      typeof listenerTimeout === "number" && Number.isFinite(listenerTimeout) && listenerTimeout > 0
+        ? listenerTimeout
+        : DEFAULT_LISTENER_TIMEOUT_MS;
   }
 
   /** Monotonic connection epoch; changes on every connect/managed start/disconnect. */
@@ -555,7 +805,92 @@ export class NativeQueueController {
       locationOpeningId: this.state.locationOpeningId ?? null,
       locationError: this.state.locationError ?? null,
       locationErrorId: this.state.locationErrorId ?? null,
+      bulkAction: this.state.bulkAction ?? null,
+      bulkSummary: this.state.bulkSummary
+        ? {
+            ...this.state.bulkSummary,
+            failures: this.state.bulkSummary.failures.map((failure) => ({ ...failure })),
+          }
+        : null,
+      bulkUncertainties: (this.state.bulkUncertainties ?? []).map((notice) => ({
+        ...notice,
+      })),
+      bulkUncertaintyOverflow: this.state.bulkUncertaintyOverflow ?? 0,
+      streamState: this.state.streamState ?? "off",
     });
+  }
+
+  /**
+   * Convert an unconfirmed bulk outcome into an independent persistent notice
+   * before the per-connection summary is cleared. Notices survive reconnect,
+   * are never attributed to the new daemon, and are only removed one at a time.
+   */
+  private noteBulkUncertainty(): void {
+    const summary = this.state.bulkSummary;
+    const unconfirmed = summary?.status === "unconfirmed";
+    const action = this.state.bulkAction ?? summary?.action ?? null;
+    if (!this.bulkAwaitingReply && !unconfirmed) return;
+    if (!isBulkAction(action)) return;
+    this.recordBulkUncertainty(action, this.bulkSummaryEpoch === this.epoch);
+  }
+
+  private recordBulkUncertainty(action: BulkAction, sameConnection: boolean): void {
+    const notices = this.state.bulkUncertainties ?? [];
+    notices.push({
+      id: ++this.bulkUncertaintySeq,
+      action,
+      message: bulkUncertaintyMessage(action, sameConnection),
+    });
+    if (notices.length > MAX_BULK_UNCERTAINTIES) {
+      const omitted = notices.length - MAX_BULK_UNCERTAINTIES;
+      notices.splice(0, omitted);
+      this.state.bulkUncertaintyOverflow = (this.state.bulkUncertaintyOverflow ?? 0) + omitted;
+    }
+    this.state.bulkUncertainties = notices;
+  }
+
+  /** Dismiss one persistent bulk-uncertainty notice explicitly. */
+  dismissBulkUncertainty(id: number): void {
+    if (this.disposed) return;
+    const notices = this.state.bulkUncertainties ?? [];
+    const next = notices.filter((notice) => notice.id !== id);
+    if (next.length === notices.length) return;
+    this.state.bulkUncertainties = next;
+    this.emit();
+  }
+
+  /**
+   * Acknowledge the overflow summary on its own. Individual retained notices
+   * are independent and are never removed by this action.
+   */
+  dismissBulkUncertaintyOverflow(): void {
+    if (this.disposed) return;
+    if ((this.state.bulkUncertaintyOverflow ?? 0) === 0) return;
+    this.state.bulkUncertaintyOverflow = 0;
+    this.emit();
+  }
+
+  private resetBulkState(): void {
+    this.noteBulkUncertainty();
+    this.bulkEpoch = null;
+    this.bulkSeq += 1;
+    this.bulkAwaitingReply = false;
+    this.bulkReconcilePending = false;
+    this.bulkSummaryEpoch = null;
+    this.state.bulkAction = null;
+    this.state.bulkSummary = null;
+  }
+
+  /**
+   * If a possibly applied action settled while a connect was still in flight,
+   * its `/list` may predate the action. Run one more fresh read once the new
+   * connection is ready.
+   */
+  private flushBulkReconcile(): void {
+    if (!this.bulkReconcilePending) return;
+    this.bulkReconcilePending = false;
+    if (this.disposed || this.state.phase !== "connected") return;
+    void this.startRefresh();
   }
 
   private resetMaxConcurrentState(): void {
@@ -585,11 +920,311 @@ export class NativeQueueController {
     }, ms);
   }
 
+  /**
+   * Register the three stream listeners once, before the connection command is
+   * sent so no ready/progress frame can arrive before the renderer is
+   * listening. Registration is bounded: a hung listen never blocks the queue,
+   * a partial/timed-out attempt is unlistened (including late resolutions),
+   * and a failure is retried on the next reconnect. Disposal unlistens every
+   * registered callback.
+   */
+  private ensureStreamListener(): Promise<void> {
+    if (this.disposed || this.streamListen === null) return Promise.resolve();
+    if (this.listenerReady) return Promise.resolve();
+    if (this.listenerPromise !== null) return this.listenerPromise;
+    const listen = this.streamListen;
+    const registered: Array<() => void> = [];
+    const deadline = Date.now() + this.listenerTimeoutMs;
+    const attempt = {};
+    this.listenerAttempt = attempt;
+    const run = (async () => {
+      const registrations: Array<[string, (event: { payload: unknown }) => void]> = [
+        [PROGRESS_EVENT, (event) => this.onProgressPayload(event.payload)],
+        [LIFECYCLE_EVENT, (event) => this.onLifecyclePayload(event.payload)],
+        [STREAM_STATE_EVENT, (event) => this.onStreamStatePayload(event.payload)],
+      ];
+      try {
+        for (const [event, handler] of registrations) {
+          if (this.disposed) return;
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error("listener timeout");
+          const unlisten = await this.awaitListener(listen(event, handler), remaining);
+          if (this.disposed) {
+            try {
+              unlisten();
+            } catch {
+              // Best-effort cleanup.
+            }
+            return;
+          }
+          registered.push(unlisten);
+        }
+        this.unlisteners.push(...registered.splice(0));
+        this.listenerReady = true;
+      } catch {
+        // Streaming is an enhancement; the existing polling fallback stays and
+        // the next reconnect may retry the whole registration.
+      } finally {
+        for (const unlisten of registered.splice(0)) {
+          try {
+            unlisten();
+          } catch {
+            // Best-effort cleanup.
+          }
+        }
+        if (this.listenerAttempt === attempt) {
+          this.listenerAttempt = null;
+          this.listenerPromise = null;
+        }
+      }
+    })();
+    if (this.listenerAttempt === attempt) {
+      this.listenerPromise = run;
+    }
+    return run;
+  }
+
+  /**
+   * Resolve a listener registration within `remaining` ms. A registration that
+   * resolves after the timeout is unlistened immediately so a timed-out
+   * attempt cannot leak a listener into the active set.
+   */
+  private awaitListener(
+    pending: Promise<() => void>,
+    remaining: number,
+  ): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("listener timeout"));
+      }, Math.max(1, remaining));
+      pending.then(
+        (unlisten) => {
+          if (settled) {
+            try {
+              unlisten();
+            } catch {
+              // Best-effort cleanup for a late registration.
+            }
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          resolve(unlisten);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private clearStreamState(): void {
+    this.streamSubscription = null;
+    this.snapshotCursor = 0;
+    this.lastLifecycleSeq = 0;
+    this.lastStateSeq = 0;
+    this.progressSeqById.clear();
+    this.progressQuarantined.clear();
+    this.pendingSnapshotConfirmation.clear();
+    this.reconcileQueued = false;
+    this.reconcileRetryAttempt = 0;
+    if (this.reconcileRetryTimer !== null) {
+      clearTimeout(this.reconcileRetryTimer);
+      this.reconcileRetryTimer = null;
+    }
+    this.state.streamState = "off";
+  }
+
+  private async startProgressStream(epoch: number): Promise<void> {
+    if (this.disposed || this.streamListen === null || epoch !== this.epoch) return;
+    // Never start the native stream before all three listeners are registered.
+    // Otherwise ready/progress frames can be lost while the state is stuck on
+    // "starting"; the polling fallback stays active and the next reconnect
+    // retries registration.
+    if (!this.listenerReady) {
+      this.state.streamState = "fallback";
+      this.emit();
+      return;
+    }
+    this.streamSubscription = epoch;
+    this.snapshotCursor = 0;
+    this.lastLifecycleSeq = 0;
+    this.lastStateSeq = 0;
+    this.progressSeqById.clear();
+    this.progressQuarantined.clear();
+    this.pendingSnapshotConfirmation.clear();
+    this.state.streamState = "starting";
+    this.emit();
+    try {
+      await this.invoke("start_progress_stream", { subscription: epoch });
+    } catch {
+      if (this.disposed || epoch !== this.epoch) return;
+      this.state.streamState = "fallback";
+      this.emit();
+    }
+  }
+
+  private onProgressPayload(payload: unknown): void {
+    if (this.disposed || this.state.phase !== "connected") return;
+    const batch = sanitizeProgressBatch(payload);
+    if (batch === null || batch.subscription !== this.streamSubscription) return;
+    if (batch.subscription !== this.epoch) return;
+
+    const byId = new Map(this.state.items.map((item) => [item.id, item]));
+    const applicable = batch.updates.filter((update) => {
+      const item = byId.get(update.id);
+      if (item === undefined || item.status !== "active") return false;
+      // After an observed reset, a live sample may belong to the previous
+      // generation but still carry a newer receipt sequence. Without a daemon
+      // generation id it cannot be proven safe, so snapshots alone update this
+      // row for the quarantined generation.
+      const quarantinedAt = this.progressQuarantined.get(update.id);
+      if (quarantinedAt !== undefined && quarantinedAt === item.addedAt) return false;
+      // The snapshot cursor is captured before the list request. An update at
+      // or below it is already covered by the authoritative snapshot. Do not
+      // let a replayed/queued update roll newer bytes back.
+      if (update.seq <= this.snapshotCursor) return false;
+      const applied = this.progressSeqById.get(update.id) ?? -1;
+      if (update.seq <= applied) return false;
+      return update.bytesDone >= item.bytesDone;
+    });
+    if (applicable.length === 0) return;
+
+    for (const update of applicable) {
+      this.progressSeqById.set(update.id, update.seq);
+    }
+    const next = applyProgressUpdates(this.state.items, applicable);
+    if (next === this.state.items) return;
+    this.state.items = next;
+    this.emit();
+  }
+
+  private onLifecyclePayload(payload: unknown): void {
+    if (this.disposed || this.state.phase !== "connected") return;
+    const notice = sanitizeLifecycleNotice(payload);
+    if (notice === null || notice.subscription !== this.streamSubscription) return;
+    if (notice.subscription !== this.epoch || notice.seq <= this.lastLifecycleSeq) return;
+    this.lastLifecycleSeq = notice.seq;
+    this.requestReconcile();
+  }
+
+  private onStreamStatePayload(payload: unknown): void {
+    if (this.disposed || this.state.phase !== "connected") return;
+    const notice = sanitizeStreamState(payload);
+    if (notice === null || notice.subscription !== this.streamSubscription) return;
+    if (notice.subscription !== this.epoch) return;
+    // A delayed unavailable notice must not override a newer ready notice.
+    if (notice.seq <= this.lastStateSeq) return;
+    this.lastStateSeq = notice.seq;
+    if (notice.state === "unavailable") {
+      this.state.streamState = "fallback";
+      this.cancelReconcileRetry();
+      this.emit();
+      return;
+    }
+    this.state.streamState = "live";
+    this.emit();
+    this.requestReconcile();
+  }
+
+  /**
+   * Coalesce lifecycle/resync reconciliation. At most one snapshot is in
+   * flight; a transition during the read queues exactly one follow-up read.
+   * Transient snapshot failures retry with bounded backoff, then fall back to
+   * the continuing 5s poll.
+   */
+  private requestReconcile(): void {
+    if (this.disposed || this.state.phase !== "connected") return;
+    if (this.reconcileRetryTimer !== null) {
+      clearTimeout(this.reconcileRetryTimer);
+      this.reconcileRetryTimer = null;
+    }
+    this.reconcileRetryAttempt = 0;
+    this.reconcileQueued = true;
+    void this.drainReconcile();
+  }
+
+  private async drainReconcile(): Promise<void> {
+    if (this.reconcileRunning || this.disposed) return;
+    this.reconcileRunning = true;
+    try {
+      while (!this.disposed && this.reconcileQueued) {
+        const epoch = this.epoch;
+        if (this.state.phase !== "connected") break;
+        this.reconcileQueued = false;
+        // A read may already be in flight (poll, control, add). Wait for it so
+        // the queued lifecycle transition still gets one fresh authoritative
+        // read on the current epoch; never bypass the single-flight guard.
+        const pending = this.refreshPromise;
+        if (pending !== null) {
+          await pending.then(
+            () => {},
+            () => {},
+          );
+        }
+        if (this.disposed || epoch !== this.epoch) break;
+        const result = await this.startRefresh();
+        if (this.disposed || epoch !== this.epoch) break;
+        if (result.ok) {
+          this.reconcileRetryAttempt = 0;
+          continue;
+        }
+        const code = (result.code ?? "").toLowerCase();
+        if (!TRANSIENT_REFRESH_CODES.has(code)) break;
+        const delay = this.reconcileRetryMs[this.reconcileRetryAttempt];
+        if (delay === undefined) break;
+        this.reconcileRetryAttempt += 1;
+        this.reconcileRetryTimer = setTimeout(() => {
+          this.reconcileRetryTimer = null;
+          if (
+            this.disposed ||
+            epoch !== this.epoch ||
+            this.state.phase !== "connected"
+          ) {
+            return;
+          }
+          this.reconcileQueued = true;
+          void this.drainReconcile();
+        }, delay);
+        break;
+      }
+    } finally {
+      this.reconcileRunning = false;
+      // The drain may have started on an epoch that was replaced while its
+      // read was blocked. Queued work for the new epoch must still run once
+      // the old drain releases its single-flight flag.
+      if (
+        !this.disposed &&
+        this.reconcileQueued &&
+        this.state.phase === "connected"
+      ) {
+        void this.drainReconcile();
+      }
+    }
+  }
+
+  private cancelReconcileRetry(): void {
+    this.reconcileRetryAttempt = 0;
+    this.reconcileQueued = false;
+    if (this.reconcileRetryTimer !== null) {
+      clearTimeout(this.reconcileRetryTimer);
+      this.reconcileRetryTimer = null;
+    }
+  }
+
   async connect(endpoint: string, token: string): Promise<void> {
     if (this.disposed) return;
     this.epoch += 1;
     this.captureAbandonedBatch();
     const epoch = this.epoch;
+    this.clearStreamState();
+    this.resetBulkState();
     this.stopTimer();
     this.addEpoch = null;
     this.managedEpoch = null;
@@ -626,6 +1261,10 @@ export class NativeQueueController {
     this.state.locationError = null;
     this.state.locationErrorId = null;
     this.emit();
+    if (this.streamListen !== null) {
+      await this.ensureStreamListener();
+      if (epoch !== this.epoch || this.disposed) return;
+    }
     let raw: unknown;
     try {
       raw = await this.invoke("connect_surge", { endpoint, token });
@@ -706,7 +1345,9 @@ export class NativeQueueController {
     this.state.locationError = null;
     this.state.locationErrorId = null;
     this.emit();
+    this.flushBulkReconcile();
     this.startTimer();
+    await this.startProgressStream(epoch);
   }
 
   /**
@@ -729,6 +1370,8 @@ export class NativeQueueController {
     this.captureAbandonedBatch();
     const epoch = this.epoch;
     this.managedEpoch = epoch;
+    this.clearStreamState();
+    this.resetBulkState();
     this.stopTimer();
     this.addEpoch = null;
     this.rateWriteEpoch = null;
@@ -763,6 +1406,10 @@ export class NativeQueueController {
     this.state.locationError = null;
     this.state.locationErrorId = null;
     this.emit();
+    if (this.streamListen !== null) {
+      await this.ensureStreamListener();
+      if (epoch !== this.epoch || this.disposed) return false;
+    }
     try {
       let raw: unknown;
       try {
@@ -850,7 +1497,9 @@ export class NativeQueueController {
       this.state.locationError = null;
       this.state.locationErrorId = null;
       this.emit();
+      this.flushBulkReconcile();
       this.startTimer();
+      await this.startProgressStream(epoch);
       return true;
     } finally {
       if (this.managedEpoch === epoch) this.managedEpoch = null;
@@ -860,76 +1509,144 @@ export class NativeQueueController {
   async refresh(): Promise<void> {
     if (this.disposed) return;
     if (this.refreshPromise !== null && this.refreshEpoch === this.epoch) {
-      return this.refreshPromise;
+      await this.refreshPromise;
+      return;
     }
-    return this.startRefresh();
+    await this.startRefresh();
   }
 
-  private startRefresh(): Promise<void> {
-    if (this.disposed) return Promise.resolve();
+  private startRefresh(): Promise<RefreshResult> {
+    if (this.disposed) return Promise.resolve({ ok: true, code: null });
+    // Single-flight per connection epoch: every path (poll, control, add,
+    // reconcile) joins the existing read instead of starting a duplicate.
+    if (this.refreshPromise !== null && this.refreshEpoch === this.epoch) {
+      return this.refreshPromise;
+    }
     const epoch = this.epoch;
     const seq = (this.refreshSeq += 1);
     const task = this.executeRefresh(epoch, seq);
     this.refreshPromise = task;
     this.refreshEpoch = epoch;
     return task.then(
-      () => {
+      (result) => {
         if (this.refreshPromise === task) {
           this.refreshPromise = null;
           this.refreshEpoch = null;
         }
+        return result;
       },
       () => {
         if (this.refreshPromise === task) {
           this.refreshPromise = null;
           this.refreshEpoch = null;
         }
+        return { ok: false, code: "state" };
       },
     );
   }
 
-  private async executeRefresh(epoch: number, seq: number): Promise<void> {
-    if (this.disposed) return;
+  private async executeRefresh(epoch: number, seq: number): Promise<RefreshResult> {
+    if (this.disposed) return { ok: true, code: null };
     this.state.refreshing = true;
     this.state.error = null;
     this.emit();
     let raw: unknown;
     try {
-      raw = await this.invoke("list_downloads");
+      raw = await this.invoke("list_downloads_snapshot");
     } catch (err) {
-      if (epoch !== this.epoch || this.disposed) return;
-      if (seq !== this.refreshSeq) return;
+      if (epoch !== this.epoch || this.disposed) return { ok: true, code: null };
+      if (seq !== this.refreshSeq) return { ok: true, code: null };
       this.state.error = mapToSafeMessage(err, REFRESH_FALLBACK) ?? REFRESH_FALLBACK;
       this.state.refreshing = false;
       this.emit();
-      return;
+      return { ok: false, code: extractCodeText(err) };
     }
-    if (epoch !== this.epoch || this.disposed) return;
-    if (seq !== this.refreshSeq) return;
+    if (epoch !== this.epoch || this.disposed) return { ok: true, code: null };
+    if (seq !== this.refreshSeq) return { ok: true, code: null };
     let items: QueueItem[];
+    let cursor = 0;
     try {
-      items = sanitizeList(raw);
+      const snapshot = sanitizeSnapshotPayload(raw);
+      if (snapshot === null) throw "invalidResponse";
+      items = sanitizeList(snapshot.items);
+      cursor = snapshot.streamSeq;
     } catch (err) {
-      if (epoch !== this.epoch || this.disposed) return;
-      if (seq !== this.refreshSeq) return;
+      if (epoch !== this.epoch || this.disposed) return { ok: true, code: null };
+      if (seq !== this.refreshSeq) return { ok: true, code: null };
       this.state.error = mapToSafeMessage(err, REFRESH_FALLBACK) ?? REFRESH_FALLBACK;
       this.state.refreshing = false;
       this.emit();
-      return;
+      return { ok: false, code: extractCodeText(err) };
     }
-    if (epoch !== this.epoch || this.disposed) return;
-    if (seq !== this.refreshSeq) return;
+    if (epoch !== this.epoch || this.disposed) return { ok: true, code: null };
+    if (seq !== this.refreshSeq) return { ok: true, code: null };
     this.state.phase = "connected";
-    this.state.items = items;
+    // Capture the current suspicion set before this read replaces it, so a
+    // fresh follow-up read that is still ambiguous does not trigger an
+    // unbounded chain of reads. Only a newly suspected id starts one.
+    const previouslyPending = new Set(this.pendingSnapshotConfirmation);
+    const merged = mergeSnapshotWithProgress(
+      this.state.items,
+      items,
+      cursor,
+      this.progressSeqById,
+    );
+    this.state.items = merged.items;
+    const snapshotById = new Map(merged.items.map((item) => [item.id, item]));
+    for (const id of merged.rolledBack) {
+      const item = snapshotById.get(id);
+      if (item !== undefined && item.status === "active") {
+        this.progressQuarantined.set(id, item.addedAt);
+      } else {
+        this.progressQuarantined.delete(id);
+      }
+    }
+    // Quarantine lasts for the reset generation only. A new `addedAt`, an
+    // absent row, or an actual terminal status (`completed`/`failed`) is
+    // provably a different state, so live events may be trusted again for a
+    // replacement generation. Paused/pausing (and other non-terminal states)
+    // are not terminal: the same id+addedAt stays quarantined across
+    // pause/resume, otherwise a delayed old-generation sample would inflate
+    // the reset after resume.
+    for (const [id, addedAt] of this.progressQuarantined) {
+      const item = snapshotById.get(id);
+      if (
+        item === undefined ||
+        item.addedAt !== addedAt ||
+        item.status === "completed" ||
+        item.status === "failed"
+      ) {
+        this.progressQuarantined.delete(id);
+      }
+    }
+    const nextPending = new Set<string>();
+    for (const id of merged.pendingConfirmation) {
+      const item = snapshotById.get(id);
+      if (item !== undefined && item.status === "active") nextPending.add(id);
+    }
+    this.pendingSnapshotConfirmation = nextPending;
+    const newlyPending = [...nextPending].some((id) => !previouslyPending.has(id));
+    this.snapshotCursor = Math.max(this.snapshotCursor, cursor);
+    for (const [id, appliedSeq] of this.progressSeqById) {
+      if (appliedSeq <= this.snapshotCursor) this.progressSeqById.delete(id);
+    }
     this.state.error = null;
     this.state.refreshing = false;
     this.emit();
+    if (newlyPending) {
+      // Confirm the suspected rollback with a fresh authoritative read that
+      // starts after this list completes; the reconcile drain is single-flight
+      // and bounded-backoff, and a read that catches up clears the suspicion.
+      this.requestReconcile();
+    }
+    return { ok: true, code: null };
   }
 
   async control(action: "pause" | "resume" | "removeRecord", id: string): Promise<void> {
     if (this.disposed) return;
     if (this.state.phase !== "connected") return;
     if (this.controlEpoch === this.epoch) return;
+    if (this.bulkEpoch === this.epoch) return;
     this.controlEpoch = this.epoch;
     const epoch = this.epoch;
     this.state.controllingId = id;
@@ -962,6 +1679,129 @@ export class NativeQueueController {
         }
       }
     }
+  }
+
+  /**
+   * Apply Pause all or Resume all to the daemon's whole queue.
+   *
+   * A single bulk request is sent; results and errors are fenced by connection
+   * epoch and operation identity, so a disconnected/reconnected outcome is
+   * never shown as the new connection's summary. Whatever the outcome, the
+   * queue is reconciled with a fresh daemon read that starts after the action
+   * (never an in-flight pre-action snapshot). The visible busy state is held
+   * until that reconciliation settles. Nothing is retried automatically.
+   * If the connection changes before the daemon answers, the outcome becomes a
+   * persistent, previous-connection-scoped uncertainty notice instead of being
+   * attributed to the replacement connection.
+   * Shares the single-control exclusion: one Pause/Resume/Remove or bulk op can
+   * be in flight per connection epoch.
+   */
+  async bulkControl(action: BulkAction): Promise<boolean> {
+    if (this.disposed) return false;
+    if (!isBulkAction(action)) return false;
+    if (this.state.phase !== "connected") {
+      this.state.bulkSummary = failedBulkSummary(action, BULK_NOT_CONNECTED_MESSAGE);
+      this.bulkSummaryEpoch = this.epoch;
+      this.emit();
+      return false;
+    }
+    const epoch = this.epoch;
+    if (this.controlEpoch === epoch || this.bulkEpoch === epoch) return false;
+    // Only a request that actually settled may become a persistent notice. A
+    // busy/rejected call must not downgrade the in-flight operation's confirmed
+    // outcome to "uncertain".
+    this.noteBulkUncertainty();
+    this.bulkEpoch = epoch;
+    const opId = ++this.bulkSeq;
+    const owns = (): boolean =>
+      !this.disposed &&
+      this.epoch === epoch &&
+      this.bulkEpoch === epoch &&
+      this.bulkSeq === opId;
+    this.bulkAwaitingReply = true;
+    this.state.bulkAction = action;
+    this.state.bulkSummary = null;
+    this.state.error = null;
+    this.emit();
+
+    let summary: BulkSummary = unconfirmedBulkSummary(action, BULK_UNCONFIRMED_MESSAGE);
+    try {
+      let raw: unknown;
+      try {
+        raw = await this.invoke("bulk_control", { action });
+      } catch (err) {
+        const classification = classifyBulkError(err);
+        summary =
+          classification === "notconnected"
+            ? failedBulkSummary(action, BULK_NOT_CONNECTED_MESSAGE)
+            : classification === "failed"
+              ? failedBulkSummary(action, BULK_FALLBACK)
+              : unconfirmedBulkSummary(action, BULK_UNCONFIRMED_MESSAGE);
+      }
+      // The daemon has answered (or the transport failed): from here the
+      // outcome is known even while the reconciliation read is still running.
+      // Only this operation may clear the flag; a late reply from a superseded
+      // operation must not clear a newer operation's in-flight marker.
+      if (this.bulkSeq === opId) this.bulkAwaitingReply = false;
+      if (raw !== undefined) {
+        try {
+          summary = sanitizeBulkOutcome(raw, action);
+        } catch {
+          summary = unconfirmedBulkSummary(action, BULK_UNCONFIRMED_MESSAGE);
+        }
+      }
+      if (owns()) {
+        this.state.bulkSummary = summary;
+        this.bulkSummaryEpoch = epoch;
+        this.state.error = null;
+        this.emit();
+      }
+      // Keep `bulkAction` set through reconciliation so the visible busy state
+      // matches the controller's actual exclusion. Even a fenced or
+      // unconfirmed action may have applied; reconcile with a fresh read on
+      // whichever connection is current, but never attribute it to a new one.
+      await this.reconcileAfterBulk();
+      return owns() && summary.status === "done";
+    } finally {
+      if (
+        this.bulkEpoch === epoch &&
+        this.epoch === epoch &&
+        this.bulkSeq === opId
+      ) {
+        this.bulkEpoch = null;
+        this.bulkAwaitingReply = false;
+        if (this.state.bulkAction === action) {
+          this.state.bulkAction = null;
+          this.emit();
+        }
+      }
+    }
+  }
+
+  /**
+   * Start a reconciliation read after a possibly applied action. If a read was
+   * already in flight when the action settled, it is a pre-action snapshot for
+   * this purpose: wait for it to settle, then start a new read.
+   */
+  private async reconcileAfterBulk(): Promise<void> {
+    if (this.disposed) return;
+    if (this.state.phase === "connecting") {
+      // The in-flight connect owns the next read; ask for one more after it.
+      this.bulkReconcilePending = true;
+      return;
+    }
+    if (this.state.phase !== "connected") return;
+    const epoch = this.epoch;
+    const prior =
+      this.refreshPromise !== null && this.refreshEpoch === epoch ? this.refreshPromise : null;
+    if (prior) {
+      await prior.then(
+        () => {},
+        () => {},
+      );
+    }
+    if (this.disposed || epoch !== this.epoch || this.state.phase !== "connected") return;
+    await this.startRefresh();
   }
 
   private async addAttempt(
@@ -1766,6 +2606,8 @@ export class NativeQueueController {
   async disconnect(): Promise<void> {
     this.epoch += 1;
     this.captureAbandonedBatch();
+    this.clearStreamState();
+    this.resetBulkState();
     this.stopTimer();
     this.addEpoch = null;
     this.managedEpoch = null;
@@ -1812,8 +2654,17 @@ export class NativeQueueController {
     if (this.disposed) return;
     this.epoch += 1;
     this.disposed = true;
+    this.clearStreamState();
+    for (const unlisten of this.unlisteners.splice(0)) {
+      try {
+        unlisten();
+      } catch {
+        // Unlisten is best-effort and never surfaces transport detail.
+      }
+    }
     this.activeBatch = null;
     this.batchRecoveries = [];
+    this.resetBulkState();
     this.stopTimer();
     this.state.controllingId = null;
     this.state.adding = false;

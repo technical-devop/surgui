@@ -15,6 +15,11 @@ function makeInvoke(handler) {
   const calls = [];
   const invoke = async (command, args) => {
     calls.push({ command, args });
+    if (command === "list_downloads_snapshot") {
+      calls.push({ command: "list_downloads", args });
+      const items = await handler("list_downloads", args);
+      return { epoch: 1, streamSeq: 0, items };
+    }
     return handler(command, args);
   };
   return { invoke, calls };
