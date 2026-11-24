@@ -1,6 +1,6 @@
 [package]
 name = "surge-desktop"
-version = "0.1.1"
+version = "0.1.2"
 description = "Unofficial desktop GUI controller for the Surge download daemon"
 edition = "2021"
 
