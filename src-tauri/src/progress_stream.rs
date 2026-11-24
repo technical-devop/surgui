@@ -207,10 +207,7 @@ impl SseParser {
     where
         F: FnMut(SseFrame) -> bool,
     {
-        loop {
-            let Some((line_end, consumed)) = find_line_end(&self.buffer) else {
-                break;
-            };
+        while let Some((line_end, consumed)) = find_line_end(&self.buffer) {
             let line: Vec<u8> = self.buffer.drain(..line_end).collect();
             self.buffer.drain(..consumed - line_end);
             if !self.process_line(&line, emit)? {
@@ -280,10 +277,8 @@ impl SseParser {
                 let text = std::str::from_utf8(value).map_err(|_| SseError::Malformed)?;
                 self.event = Some(text.to_string());
             }
-            b"id" | b"retry" => {
-                if value.len() > MAX_SSE_LINE_BYTES {
-                    return Err(SseError::Oversized);
-                }
+            b"id" | b"retry" if value.len() > MAX_SSE_LINE_BYTES => {
+                return Err(SseError::Oversized);
             }
             _ => {}
         }
@@ -424,6 +419,10 @@ impl ProgressCoalescer {
 
     pub fn len(&self) -> usize {
         self.updates.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty()
     }
 }
 
@@ -718,13 +717,9 @@ async fn consume_stream(
     is_connection_current: &Arc<CurrentFn>,
 ) -> Result<ConsumeStats, StreamFailure> {
     let mut parser = SseParser::new();
-    let mut coalescer = ProgressCoalescer::new(MAX_PROGRESS_IDS);
+    let mut pending = PendingFlush::new(MAX_PROGRESS_IDS);
     let mut flush = tokio::time::interval(COALESCE_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut lifecycle_pending = false;
-    let mut resync_pending = false;
-    let mut lifecycle_seq = 0u64;
-    let mut resync_seq = 0u64;
     let mut stats = ConsumeStats::default();
 
     loop {
@@ -733,7 +728,7 @@ async fn consume_stream(
                 if !stream.is_current(subscription, epoch) || !is_connection_current() {
                     return Err(StreamFailure::Stopped);
                 }
-                flush_pending(stream, emit, subscription, epoch, &mut coalescer, &mut lifecycle_pending, &mut resync_pending, lifecycle_seq, resync_seq)?;
+                flush_pending(stream, emit, subscription, epoch, &mut pending)?;
             }
             chunk = response.chunk() => {
                 let chunk = match chunk {
@@ -744,19 +739,19 @@ async fn consume_stream(
                             match project_frame(&frame) {
                                 Ok(FrameAction::Progress(update)) => {
                                     let seq = stream.next_seq();
-                                    coalescer.insert(update.with_seq(seq));
+                                    pending.coalescer.insert(update.with_seq(seq));
                                     stats.saw_valid_frame = true;
                                 }
                                 Ok(FrameAction::Lifecycle) => {
                                     let seq = stream.next_seq();
-                                    lifecycle_seq = lifecycle_seq.max(seq);
-                                    lifecycle_pending = true;
+                                    pending.lifecycle_seq = pending.lifecycle_seq.max(seq);
+                                    pending.lifecycle_pending = true;
                                     stats.saw_valid_frame = true;
                                 }
                                 Ok(FrameAction::Resync) => {
                                     let seq = stream.next_seq();
-                                    resync_seq = resync_seq.max(seq);
-                                    resync_pending = true;
+                                    pending.resync_seq = pending.resync_seq.max(seq);
+                                    pending.resync_pending = true;
                                     stats.saw_valid_frame = true;
                                 }
                                 Ok(FrameAction::Ignore) => {}
@@ -770,7 +765,7 @@ async fn consume_stream(
                         if rejected {
                             return Err(StreamFailure::Protocol);
                         }
-                        flush_pending(stream, emit, subscription, epoch, &mut coalescer, &mut lifecycle_pending, &mut resync_pending, lifecycle_seq, resync_seq)?;
+                        flush_pending(stream, emit, subscription, epoch, &mut pending)?;
                         return Ok(stats);
                     }
                     Err(_) => return Err(StreamFailure::Network),
@@ -780,19 +775,19 @@ async fn consume_stream(
                     match project_frame(&frame) {
                         Ok(FrameAction::Progress(update)) => {
                             let seq = stream.next_seq();
-                            coalescer.insert(update.with_seq(seq));
+                            pending.coalescer.insert(update.with_seq(seq));
                             stats.saw_valid_frame = true;
                         }
                         Ok(FrameAction::Lifecycle) => {
                             let seq = stream.next_seq();
-                            lifecycle_seq = lifecycle_seq.max(seq);
-                            lifecycle_pending = true;
+                            pending.lifecycle_seq = pending.lifecycle_seq.max(seq);
+                            pending.lifecycle_pending = true;
                             stats.saw_valid_frame = true;
                         }
                         Ok(FrameAction::Resync) => {
                             let seq = stream.next_seq();
-                            resync_seq = resync_seq.max(seq);
-                            resync_pending = true;
+                            pending.resync_seq = pending.resync_seq.max(seq);
+                            pending.resync_pending = true;
                             stats.saw_valid_frame = true;
                         }
                         Ok(FrameAction::Ignore) => {}
@@ -811,26 +806,43 @@ async fn consume_stream(
     }
 }
 
+/// Mutable per-flush progress/lifecycle state owned by `consume_stream`.
+struct PendingFlush {
+    coalescer: ProgressCoalescer,
+    lifecycle_pending: bool,
+    resync_pending: bool,
+    lifecycle_seq: u64,
+    resync_seq: u64,
+}
+
+impl PendingFlush {
+    fn new(max: usize) -> Self {
+        Self {
+            coalescer: ProgressCoalescer::new(max),
+            lifecycle_pending: false,
+            resync_pending: false,
+            lifecycle_seq: 0,
+            resync_seq: 0,
+        }
+    }
+}
+
 fn flush_pending(
     stream: &Arc<ProgressStream>,
     emit: &Arc<EmitFn>,
     subscription: u64,
     epoch: u64,
-    coalescer: &mut ProgressCoalescer,
-    lifecycle_pending: &mut bool,
-    resync_pending: &mut bool,
-    lifecycle_seq: u64,
-    resync_seq: u64,
+    pending: &mut PendingFlush,
 ) -> Result<(), StreamFailure> {
     if !stream.is_current(subscription, epoch) {
         return Err(StreamFailure::Stopped);
     }
-    let updates = coalescer.drain();
+    let updates = pending.coalescer.drain();
     // Emit the group whose last receipt sequence is older first so the other
     // group's newer sequence is not swallowed by the receiver's fence.
     let update_seq = updates.iter().map(|update| update.seq).max().unwrap_or(0);
-    let notice_seq = if *lifecycle_pending || *resync_pending {
-        resync_seq.max(lifecycle_seq)
+    let notice_seq = if pending.lifecycle_pending || pending.resync_pending {
+        pending.resync_seq.max(pending.lifecycle_seq)
     } else {
         0
     };
@@ -841,8 +853,8 @@ fn flush_pending(
             emit,
             subscription,
             epoch,
-            lifecycle_pending,
-            resync_pending,
+            &mut pending.lifecycle_pending,
+            &mut pending.resync_pending,
             notice_seq,
         );
     } else {
@@ -850,8 +862,8 @@ fn flush_pending(
             emit,
             subscription,
             epoch,
-            lifecycle_pending,
-            resync_pending,
+            &mut pending.lifecycle_pending,
+            &mut pending.resync_pending,
             notice_seq,
         );
         emit_progress(emit, subscription, epoch, updates);
