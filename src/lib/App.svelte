@@ -1,13 +1,28 @@
 <script lang="ts">
   import QueueScreen from "./QueueScreen.svelte";
   import { SAMPLE_ITEMS } from "./sampleData";
-  import type { QueueItem } from "./queue/types";
+  import type { BulkAction, QueueItem } from "./queue/types";
   import { NativeQueueController } from "./queue/native-controller";
-  import type { NativeState } from "./queue/native-controller";
-  import { formatRateBpsToMb, parseRateMbToBps, rateInputErrorMessage } from "./queue/queue";
+  import { projectBatchRecovery } from "./queue/native-controller";
+  import type { BatchRecoveryView, NativeState } from "./queue/native-controller";
+  import {
+    BATCH_STATUS_LABELS,
+    MAX_BATCH_LINES,
+    MAX_CONCURRENT_DOWNLOADS_DEFAULT,
+    MAX_CONCURRENT_DOWNLOADS_MAX,
+    MAX_CONCURRENT_DOWNLOADS_MIN,
+    consumeRecoveryDraft,
+    formatRateBpsToMb,
+    isValidMaxConcurrentValue,
+    mergeRecoverableLines,
+    parseRateMbToBps,
+    rateInputErrorMessage,
+    resolveBatchDraft,
+  } from "./queue/queue";
   import { onDestroy, onMount } from "svelte";
   import { untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import logoUrl from "../assets/surge-logo.webp";
 
   // Tauri runtime starts offline/empty and never pretends to be connected.
@@ -25,10 +40,22 @@
   let endpoint = $state("");
   let token = $state("");
   let addUrl = $state("");
-  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, locationOpeningId: null, locationError: null, locationErrorId: null });
+  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, batch: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, maxConcurrent: null, maxConcurrentLoading: false, maxConcurrentSaving: false, maxConcurrentError: null, maxConcurrentUnconfirmed: false, maxConcurrentRestartPending: false, locationOpeningId: null, locationError: null, locationErrorId: null, bulkAction: null, bulkSummary: null, bulkUncertainties: [], bulkUncertaintyOverflow: 0 });
   let rateDraft = $state("");
   let rateDirty = $state(false);
   let rateTouched = $state(false);
+  let maxConcurrentDraft = $state("");
+  let maxConcurrentDirty = $state(false);
+  let maxConcurrentTouched = $state(false);
+  let addOperationSeq = 0;
+  let rateSaveSeq = 0;
+  let maxConcurrentSaveSeq = 0;
+  let recoveredBatches = $state<BatchRecoveryView[]>([]);
+  let pendingRecoveryLines = $state<string[]>([]);
+  const maxConcurrentOptions = Array.from(
+    { length: MAX_CONCURRENT_DOWNLOADS_MAX - MAX_CONCURRENT_DOWNLOADS_MIN + 1 },
+    (_, index) => MAX_CONCURRENT_DOWNLOADS_MIN + index,
+  );
 
   let controller: NativeQueueController | null = null;
   if (isTauri) {
@@ -38,6 +65,7 @@
         snapshot = s;
       },
       5000,
+      (event, handler) => listen(event, handler),
     );
   }
 
@@ -49,7 +77,15 @@
     if (!isTauri || !controller) return;
     if (managedAutoStarted) return;
     managedAutoStarted = true;
-    void controller.startManaged();
+    const starting = controller.startManaged();
+    // captureAbandonedBatch runs synchronously before the first await, so a
+    // detached batch is recoverable and editable while still connecting.
+    pullRecoveries(controller);
+    restoreRecoveredDraft();
+    void starting.then(() => {
+      pullRecoveries(controller);
+      restoreRecoveredDraft();
+    });
   });
 
   onDestroy(() => {
@@ -62,6 +98,34 @@
   const isConnected = $derived(snapshot.phase === "connected");
   const isAdding = $derived(snapshot.adding === true);
   const isManaged = $derived(snapshot.managed === true);
+  const batch = $derived(snapshot.batch ?? null);
+  const batchRunning = $derived(batch?.running === true);
+  // Disable the whole add surface for the entire batch, not just the gaps
+  // between individual add requests.
+  const addBusy = $derived(isAdding || batchRunning);
+  // Keep the add surface available while offline/connecting so a recovered
+  // draft can be reviewed and edited; submission still requires a connection.
+  const showAddPanel = $derived(
+    isConnected ||
+      addUrl.trim().length > 0 ||
+      pendingRecoveryLines.length > 0 ||
+      recoveredBatches.length > 0,
+  );
+  const batchHasAmbiguous = $derived(
+    batch?.results.some((result) => result.status === "ambiguous") === true,
+  );
+  const recoveredUncertainCount = $derived(
+    recoveredBatches.reduce((total, recovery) => total + recovery.uncertainCount, 0),
+  );
+  const recoveredUnsentCount = $derived(
+    recoveredBatches.reduce((total, recovery) => total + recovery.unsentCount, 0),
+  );
+  const recoveredRejectedCount = $derived(
+    recoveredBatches.reduce((total, recovery) => total + recovery.rejectedCount, 0),
+  );
+  const recoveredAcceptedCount = $derived(
+    recoveredBatches.reduce((total, recovery) => total + recovery.acceptedCount, 0),
+  );
   const rateLimitBps = $derived(snapshot.rateLimitBps ?? null);
   const rateLoading = $derived(snapshot.rateLoading === true);
   const rateSaving = $derived(snapshot.rateSaving === true);
@@ -70,6 +134,10 @@
   const locationOpeningId = $derived(snapshot.locationOpeningId ?? null);
   const locationError = $derived(snapshot.locationError ?? null);
   const locationErrorId = $derived(snapshot.locationErrorId ?? null);
+  const bulkAction = $derived(snapshot.bulkAction ?? null);
+  const bulkSummary = $derived(snapshot.bulkSummary ?? null);
+  const bulkUncertainties = $derived(snapshot.bulkUncertainties ?? []);
+  const bulkUncertaintyOverflow = $derived(snapshot.bulkUncertaintyOverflow ?? 0);
 
   // Load the managed limit once per connection epoch. The draft lives in the
   // UI so list polls never overwrite an in-progress edit. tryClaim gates the
@@ -117,6 +185,62 @@
     });
   });
 
+  // Load the daemon concurrency setting once per connection epoch. This is
+  // the saved settings value, not the running daemon's active concurrency.
+  $effect(() => {
+    const phase = snapshot.phase;
+    const known = snapshot.maxConcurrent;
+    const loading = snapshot.maxConcurrentLoading === true;
+    const poisoned = snapshot.maxConcurrentUnconfirmed === true;
+    untrack(() => {
+      if (!isTauri || !controller) return;
+      if (phase !== "connected") return;
+      if (known !== null || loading || poisoned) return;
+      if (maxConcurrentDirty) return;
+      if (!controller.tryClaimMaxConcurrentAutoLoad()) return;
+      void controller.loadMaxConcurrent();
+    });
+  });
+
+  // Mirror the saved value into the select only while the user has no unsaved
+  // edit, so background loads never clobber a choice.
+  $effect(() => {
+    const known = snapshot.maxConcurrent;
+    untrack(() => {
+      if (maxConcurrentDirty) return;
+      if (known === null || known === undefined) return;
+      maxConcurrentDraft = String(known);
+      maxConcurrentTouched = false;
+    });
+  });
+
+  // Clear the concurrency draft when the connection leaves connected so a
+  // stale value never looks like the new daemon's setting.
+  $effect(() => {
+    const phase = snapshot.phase;
+    untrack(() => {
+      if (phase !== "connected") {
+        maxConcurrentDraft = "";
+        maxConcurrentDirty = false;
+        maxConcurrentTouched = false;
+      }
+    });
+  });
+
+  // Detached batch lines wait outside the controller until no batch is running.
+  // Merging appends after any newer draft, so recovery can never overwrite text
+  // the user typed while reconnecting. It does not wait for a connection: the
+  // editable draft is available offline and only submission needs the daemon.
+  $effect(() => {
+    const busy = addBusy;
+    const queued = pendingRecoveryLines.length;
+    untrack(() => {
+      if (busy || queued === 0) return;
+      addUrl = mergeRecoverableLines(addUrl, pendingRecoveryLines);
+      pendingRecoveryLines = [];
+    });
+  });
+
   const rateParsed = $derived(parseRateMbToBps(rateDraft));
   const rateLocalError = $derived(
     rateDirty && !rateParsed.ok ? rateInputErrorMessage(rateParsed.reason) : null,
@@ -142,6 +266,85 @@
         : `Current: ${formatRateBpsToMb(rateLimitBps)} MB/s`,
   );
 
+  const maxConcurrent = $derived(snapshot.maxConcurrent ?? null);
+  const maxConcurrentLoading = $derived(snapshot.maxConcurrentLoading === true);
+  const maxConcurrentSaving = $derived(snapshot.maxConcurrentSaving === true);
+  const maxConcurrentError = $derived(snapshot.maxConcurrentError ?? null);
+  const maxConcurrentUnconfirmed = $derived(snapshot.maxConcurrentUnconfirmed === true);
+  const maxConcurrentRestartPending = $derived(snapshot.maxConcurrentRestartPending === true);
+  const maxConcurrentParsed = $derived(
+    maxConcurrentDraft === "" ? null : Number(maxConcurrentDraft),
+  );
+  const maxConcurrentLocalError = $derived(
+    maxConcurrentTouched &&
+      maxConcurrentDraft !== "" &&
+      !isValidMaxConcurrentValue(maxConcurrentParsed)
+      ? "Choose a whole number from 1 to 10."
+      : null,
+  );
+  const maxConcurrentInvalid = $derived(!!(maxConcurrentLocalError || maxConcurrentError));
+  const maxConcurrentErrorVisible = $derived(
+    !maxConcurrentLoading && !!(maxConcurrentLocalError || maxConcurrentError),
+  );
+  const maxConcurrentDescribedBy = $derived(
+    maxConcurrentErrorVisible
+      ? "max-concurrent-help max-concurrent-error"
+      : "max-concurrent-help",
+  );
+  const maxConcurrentCanSave = $derived(
+    isManaged &&
+      isConnected &&
+      !maxConcurrentLoading &&
+      !maxConcurrentSaving &&
+      !maxConcurrentUnconfirmed &&
+      maxConcurrent !== null &&
+      isValidMaxConcurrentValue(maxConcurrentParsed) &&
+      maxConcurrentParsed !== maxConcurrent,
+  );
+  const maxConcurrentInputDisabled = $derived(
+    !isManaged ||
+      !isConnected ||
+      maxConcurrentLoading ||
+      maxConcurrentSaving ||
+      maxConcurrentUnconfirmed ||
+      maxConcurrent === null,
+  );
+  const maxConcurrentSavedLabel = $derived(
+    maxConcurrent === null
+      ? null
+      : `Saved daemon value: ${maxConcurrent}. Surge applies it only after a daemon restart; the app does not restart it.`,
+  );
+
+  async function handleMaxConcurrentSave(event: SubmitEvent) {
+    event.preventDefault();
+    if (!isTauri || !controller) return;
+    if (!isManaged || !isConnected || maxConcurrentSaving || maxConcurrentLoading || maxConcurrentUnconfirmed) return;
+    maxConcurrentTouched = true;
+    if (maxConcurrent === null || !isValidMaxConcurrentValue(maxConcurrentParsed)) return;
+    const activeController = controller;
+    const epoch = activeController.connectionEpoch();
+    const requestId = ++maxConcurrentSaveSeq;
+    const before = maxConcurrent;
+    const value = maxConcurrentParsed;
+    maxConcurrentDirty = false;
+    const ok = await activeController.setMaxConcurrent(before, value);
+    // Only the connection/request that started this save may touch the draft.
+    if (controller !== activeController) return;
+    if (requestId !== maxConcurrentSaveSeq) return;
+    if (epoch !== activeController.connectionEpoch()) return;
+    if (ok) {
+      untrack(() => {
+        maxConcurrentDraft = String(value);
+        maxConcurrentDirty = false;
+        maxConcurrentTouched = false;
+      });
+    } else {
+      untrack(() => {
+        maxConcurrentDirty = true;
+      });
+    }
+  }
+
   async function handleRateSave(event: SubmitEvent) {
     event.preventDefault();
     if (!isTauri || !controller) return;
@@ -149,8 +352,15 @@
     rateTouched = true;
     const parsed = parseRateMbToBps(rateDraft);
     if (!parsed.ok) return;
+    const activeController = controller;
+    const epoch = activeController.connectionEpoch();
+    const requestId = ++rateSaveSeq;
     rateDirty = false;
-    const ok = await controller.setRateLimit(parsed.bytes);
+    const ok = await activeController.setRateLimit(parsed.bytes);
+    // Only the connection/request that started this save may touch the draft.
+    if (controller !== activeController) return;
+    if (requestId !== rateSaveSeq) return;
+    if (epoch !== activeController.connectionEpoch()) return;
     if (ok) {
       untrack(() => {
         rateDraft = formatRateBpsToMb(parsed.bytes);
@@ -197,14 +407,58 @@
           : "",
   );
 
+  // Merge only recoveries not yet delivered to the input. Consumed lines are
+  // cleared so connect/disconnect cannot wipe the current draft or resurrect a
+  // link the user removed, submitted or already recovered.
+  function restoreRecoveredDraft(): void {
+    const restored = consumeRecoveryDraft(addUrl, pendingRecoveryLines);
+    addUrl = restored.draft;
+    pendingRecoveryLines = restored.pending;
+  }
+
+  function dismissRecoveredBatch(id: number): void {
+    // Notices are display-only projections; dismissing removes the notice and
+    // there is no raw recovery left to restore it silently later.
+    recoveredBatches = recoveredBatches.filter((recovery) => recovery.id !== id);
+  }
+
+  function pullRecoveries(activeController: NativeQueueController | null): void {
+    if (!activeController) return;
+    const drained = activeController.drainBatchRecoveries();
+    if (drained.length === 0) return;
+    const notices: BatchRecoveryView[] = [];
+    const lines: string[] = [];
+    for (const recovery of drained) {
+      const projected = projectBatchRecovery(recovery);
+      notices.push(projected.view);
+      lines.push(...projected.lines);
+      // Drop the raw signed arrays now that only redacted results and the
+      // editable-draft lines remain.
+      recovery.results.length = 0;
+      recovery.uncertain.length = 0;
+      recovery.unsent.length = 0;
+      recovery.rejected.length = 0;
+    }
+    recoveredBatches = [...recoveredBatches, ...notices];
+    pendingRecoveryLines = [...pendingRecoveryLines, ...lines];
+    if (!addBusy) restoreRecoveredDraft();
+  }
+
   async function handleConnect(event: SubmitEvent) {
     event.preventDefault();
     if (!controller || isConnecting) return;
-    addUrl = "";
+    restoreRecoveredDraft();
     const nextEndpoint = endpoint.trim();
     const nextToken = token;
     token = "";
-    await controller.connect(nextEndpoint, nextToken);
+    const connecting = controller.connect(nextEndpoint, nextToken);
+    // The controller captures the abandoned batch synchronously before its
+    // first await; drain it now so recovery shows while still connecting.
+    pullRecoveries(controller);
+    restoreRecoveredDraft();
+    await connecting;
+    pullRecoveries(controller);
+    restoreRecoveredDraft();
   }
 
   function handleRefresh() {
@@ -212,22 +466,43 @@
   }
 
   function handleDisconnect() {
-    addUrl = "";
+    const activeController = controller;
     rateDraft = "";
     rateDirty = false;
     rateTouched = false;
-    void controller?.disconnect();
+    maxConcurrentDraft = "";
+    maxConcurrentDirty = false;
+    maxConcurrentTouched = false;
+    void activeController?.disconnect();
+    pullRecoveries(activeController);
+    restoreRecoveredDraft();
   }
 
-  function handleManagedRetry() {
+  async function handleManagedRetry() {
     if (!controller || isConnecting) return;
-    void controller.startManaged();
+    const activeController = controller;
+    const starting = activeController.startManaged();
+    pullRecoveries(activeController);
+    restoreRecoveredDraft();
+    await starting;
+    pullRecoveries(activeController);
+    restoreRecoveredDraft();
   }
 
   function handleRateRetry() {
     if (!controller) return;
     if (!isManaged || !isConnected || rateLoading || rateSaving || rateUnconfirmed) return;
     void controller.loadRate();
+  }
+
+  function handleMaxConcurrentRetry() {
+    if (!controller) return;
+    if (!isConnected || maxConcurrentLoading || maxConcurrentSaving || maxConcurrentUnconfirmed) return;
+    // Reloading discards the unsaved draft so the fresh daemon value can be
+    // mirrored into the select (e.g. after a 409 conflict).
+    maxConcurrentDirty = false;
+    maxConcurrentTouched = false;
+    void controller.loadMaxConcurrent();
   }
 
   const showManagedRetry = $derived(
@@ -242,14 +517,53 @@
     void controller?.control(action, id);
   }
 
+  function handleBulkControl(action: BulkAction) {
+    // Applies to the daemon's whole queue, not the rows currently shown.
+    if (!isTauri) return;
+    void controller?.bulkControl(action);
+  }
+
+  function handleDismissBulkUncertainty(id: number) {
+    if (!isTauri) return;
+    controller?.dismissBulkUncertainty(id);
+  }
+
+  function handleDismissBulkUncertaintyOverflow() {
+    if (!isTauri) return;
+    controller?.dismissBulkUncertaintyOverflow();
+  }
+
   async function handleAdd(event: SubmitEvent) {
     event.preventDefault();
     if (!isTauri || !controller) return;
-    if (!isConnected || isAdding) return;
-    const url = addUrl.trim();
+    if (!isConnected || addBusy) return;
+    const input = addUrl.trim();
+    if (!input) return;
+    const activeController = controller;
+    const operationId = ++addOperationSeq;
+    const epoch = activeController.connectionEpoch();
     addUrl = "";
-    if (!url) return;
-    void controller.add(url);
+    const result = await activeController.addBatch(input);
+    // A reconnect, a newer submission or a disposed controller makes this
+    // result stale; the resolver returns null and leaves the input untouched.
+    // Accepted, pending and duplicate links are complete. Recoverable lines
+    // remain so the user can fix or resend deliberately; never auto-retry.
+    const nextDraft = resolveBatchDraft({
+      draft: addUrl,
+      submitted: input,
+      hasResults: result.results.length > 0,
+      recoverable: result.recoverable,
+      operationId,
+      currentOperationId: addOperationSeq,
+      epoch,
+      currentEpoch: activeController.connectionEpoch(),
+      sameController: controller === activeController,
+    });
+    if (nextDraft !== null) addUrl = nextDraft;
+    // A stale batch is no longer allowed to touch the input through the epoch
+    // resolver, but its full original lines are preserved separately. Restore
+    // them only through the non-overwriting merge effect above.
+    pullRecoveries(activeController);
   }
 </script>
 
@@ -345,37 +659,91 @@
         </form>
       </details>
     </section>
-    {#if isConnected}
-      <section class="add-panel" aria-label="Add download">
+    {#if recoveredBatches.length > 0}
+      <section class="add-panel" aria-label="Interrupted batch recovery">
+        <p class="add-feedback" role="status">
+          Recovered from an interrupted batch. In-flight outcome unknown for {recoveredUncertainCount} link{recoveredUncertainCount === 1 ? "" : "s"}. The unsent tail of {recoveredUnsentCount} link{recoveredUnsentCount === 1 ? "" : "s"} was not attempted. Definitely accepted or tracked before the interruption: {recoveredAcceptedCount}.{recoveredRejectedCount > 0 ? ` Definitively rejected: ${recoveredRejectedCount}.` : ""}
+        </p>
+        {#each recoveredBatches as recovery (recovery.id)}
+          <ol class="batch-results recovery-results" aria-label={`Recovered batch ${recovery.id} link outcomes`}>
+            {#each recovery.results as result}
+              <li class="batch-row is-{result.status}">
+                <span class="batch-status">{BATCH_STATUS_LABELS[result.status]}</span>
+                <span class="batch-url">{result.line}</span>
+                <span class="batch-note">{result.message}</span>
+              </li>
+            {/each}
+          </ol>
+          <div class="add-actions">
+            <button
+              type="button"
+              class="btn"
+              onclick={() => dismissRecoveredBatch(recovery.id)}
+              aria-label={`Dismiss recovered batch ${recovery.id} notice`}
+            >
+              Dismiss notice
+            </button>
+          </div>
+        {/each}
+        <p class="add-feedback">Each link above carries its exact outcome. Unconfirmed means the daemon may have accepted it; Not attempted means it was never sent; Invalid or Failed means it was rejected. Full original links are available only in the editable field; nothing was retried automatically.</p>
+      </section>
+    {/if}
+    {#if showAddPanel}
+      <section class="add-panel" aria-label="Add downloads">
         <form class="add-form" onsubmit={handleAdd}>
           <div class="field add-field">
-            <label class="field-label" for="add-url">Download URL</label>
-            <input
+            <label class="field-label" for="add-url">Download URLs</label>
+            <textarea
               id="add-url"
-              class="field-input"
-              type="url"
+              class="field-input url-lines"
+              rows="3"
               required
               autocomplete="off"
               spellcheck="false"
               placeholder="https://example.com/file.iso"
               bind:value={addUrl}
-              disabled={isAdding}
+              disabled={addBusy}
               aria-describedby="add-url-help"
-            />
-            <p class="field-help" id="add-url-help">Sent to the daemon only; cleared on submit/disconnect and not saved by this app.</p>
+            ></textarea>
+            <p class="field-help" id="add-url-help">One HTTP(S) URL per line. Up to {MAX_BATCH_LINES} per batch, sent one at a time through the normal add path. Repeated exact links are sent once per batch; daemon duplicates are reported. Failed, unconfirmed, invalid and unattempted links stay here. The field locks while a batch runs. You can edit offline; submitting needs a connection.</p>
           </div>
           <div class="add-actions">
             <button
               type="submit"
               class="btn"
-              disabled={isAdding}
-              aria-busy={isAdding ? "true" : undefined}
+              disabled={addBusy || addUrl.trim().length === 0 || !isConnected}
+              aria-busy={addBusy ? "true" : undefined}
             >
-              {isAdding ? "Adding…" : "Add download"}
+              {!isConnected ? "Connect to add" : batchRunning ? "Adding links…" : isAdding ? "Adding…" : "Add downloads"}
             </button>
           </div>
         </form>
-        {#if isAdding}
+        {#if !isConnected}
+          <p class="add-feedback" role="note">Offline or connecting — this draft is preserved and editable. Reconnect before submitting.</p>
+        {/if}
+        {#if batch}
+          <div class="batch-summary">
+            {#if batch.running}
+              <p class="add-feedback" role="status">Adding {Math.min(batch.completed + 1, batch.total)} of {batch.total}…</p>
+            {:else if batch.stopReason}
+              <p class="add-feedback" role="status">{batch.stopReason}</p>
+            {/if}
+            {#if batch.results.length > 0}
+              <ol class="batch-results" aria-label="Add outcomes">
+                {#each batch.results as result}
+                  <li class="batch-row is-{result.status}">
+                    <span class="batch-status">{BATCH_STATUS_LABELS[result.status]}</span>
+                    <span class="batch-url">{result.line}</span>
+                    <span class="batch-note">{result.message}</span>
+                  </li>
+                {/each}
+              </ol>
+            {/if}
+            {#if !batch.running && batchHasAmbiguous}
+              <p class="add-feedback">Unconfirmed links stay above and are not retried. Check the daemon queue before resending.</p>
+            {/if}
+          </div>
+        {:else if isAdding}
           <p class="add-feedback" role="status">Adding…</p>
         {:else if snapshot.addOutcome === "queued"}
           <p class="add-feedback" role="status">Added — daemon accepted. Row may appear after refresh.</p>
@@ -385,6 +753,8 @@
           <p class="add-feedback" role="status">Duplicate — daemon already tracks this URL; not queued.</p>
         {/if}
       </section>
+    {/if}
+    {#if isConnected}
       <section class="add-panel" aria-label="Global download speed">
         <form class="add-form" onsubmit={handleRateSave}>
           <div class="field add-field">
@@ -436,6 +806,58 @@
           <p class="add-feedback" role="status">{rateCurrentLabel}</p>
         {/if}
       </section>
+      <section class="add-panel" aria-label="Daemon max simultaneous downloads">
+        <form class="add-form" onsubmit={handleMaxConcurrentSave}>
+          <div class="field add-field">
+            <label class="field-label" for="max-concurrent">Max simultaneous downloads</label>
+            <select
+              id="max-concurrent"
+              class="field-input select-input"
+              bind:value={maxConcurrentDraft}
+              onchange={() => { maxConcurrentDirty = true; maxConcurrentTouched = true; }}
+              disabled={maxConcurrentInputDisabled}
+              aria-describedby={maxConcurrentDescribedBy}
+              aria-invalid={maxConcurrentInvalid ? "true" : "false"}
+            >
+              <option value="" disabled>Select 1–10</option>
+              {#each maxConcurrentOptions as option}
+                <option value={String(option)}>{option}</option>
+              {/each}
+            </select>
+            <p class="field-help" id="max-concurrent-help">Daemon setting (1–10; default {MAX_CONCURRENT_DOWNLOADS_DEFAULT}). Saved changes apply only after the daemon restarts. The app never restarts the daemon automatically; active transfers are unchanged.</p>
+          </div>
+          <div class="add-actions">
+            <button
+              type="submit"
+              class="btn"
+              disabled={!maxConcurrentCanSave}
+              aria-busy={maxConcurrentSaving ? "true" : undefined}
+            >
+              {maxConcurrentSaving ? "Saving…" : "Save setting"}
+            </button>
+          </div>
+        </form>
+        {#if maxConcurrentLoading}
+          <p class="add-feedback" role="status">Loading daemon setting…</p>
+        {:else if maxConcurrentUnconfirmed}
+          <p class="conn-error" id="max-concurrent-error" role="alert">Max simultaneous downloads could not be confirmed. This control is disabled until the app restarts to avoid unsafe writes; the daemon may have saved a value. Restart the daemon if you intended the change.</p>
+        {:else if maxConcurrentError}
+          <p class="conn-error" id="max-concurrent-error" role="alert">{maxConcurrentError}</p>
+          <div class="add-actions">
+            <button type="button" class="btn" onclick={handleMaxConcurrentRetry} disabled={maxConcurrentLoading}>
+              Retry loading setting
+            </button>
+          </div>
+        {:else if maxConcurrentLocalError}
+          <p class="conn-error" id="max-concurrent-error" role="alert">{maxConcurrentLocalError}</p>
+        {:else if !isManaged}
+          <p class="add-feedback" role="note">Read-only on manual connections. Saving requires the bundled daemon.</p>
+        {:else if maxConcurrentRestartPending}
+          <p class="add-feedback" role="status">Saved {maxConcurrent}. Restart the daemon to apply; active transfers are unchanged.</p>
+        {:else if maxConcurrentSavedLabel}
+          <p class="add-feedback" role="status">{maxConcurrentSavedLabel}</p>
+        {/if}
+      </section>
     {/if}
     <QueueScreen
       items={snapshot.items}
@@ -448,6 +870,13 @@
       locationErrorId={locationErrorId}
       onOpenLocation={handleOpenLocation}
       onClearLocationError={handleClearLocationError}
+      bulkAction={bulkAction}
+      bulkSummary={bulkSummary}
+      onBulkControl={handleBulkControl}
+      bulkUncertainties={bulkUncertainties}
+      bulkUncertaintyOverflow={bulkUncertaintyOverflow}
+      onDismissBulkUncertainty={handleDismissBulkUncertainty}
+      onDismissBulkUncertaintyOverflow={handleDismissBulkUncertaintyOverflow}
     />
   {/if}
 </main>
@@ -754,6 +1183,88 @@
 
   .add-field {
     flex: 1 1 auto;
+  }
+
+  .url-lines {
+    min-height: calc(var(--control-h) * 2);
+    padding-block: var(--space-sm);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    resize: vertical;
+  }
+
+  .select-input {
+    cursor: pointer;
+  }
+
+  .select-input:disabled {
+    cursor: not-allowed;
+  }
+
+  .batch-summary {
+    margin-top: var(--space-sm);
+    min-width: 0;
+  }
+
+  .batch-results {
+    list-style: none;
+    margin: var(--space-xs) 0 0;
+    padding: 0;
+    border-top: 1px solid var(--color-rule);
+    min-width: 0;
+  }
+
+  .batch-row {
+    display: grid;
+    grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+    column-gap: var(--space-sm);
+    row-gap: var(--space-2xs);
+    padding-block: var(--space-xs);
+    border-bottom: 1px solid var(--color-rule);
+    min-width: 0;
+  }
+
+  .batch-status {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-muted);
+    white-space: nowrap;
+  }
+
+  .batch-url {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--color-ink);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .batch-note {
+    grid-column: 1 / -1;
+    font-size: var(--text-sm);
+    color: var(--color-muted);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .batch-row.is-queued .batch-status {
+    color: var(--color-ok);
+  }
+
+  .batch-row.is-invalid .batch-status,
+  .batch-row.is-failed .batch-status,
+  .batch-row.is-ambiguous .batch-status {
+    color: var(--color-error);
+  }
+
+  @media (max-width: 40rem) {
+    .batch-row {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
 
   .field-input:disabled {

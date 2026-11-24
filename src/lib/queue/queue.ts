@@ -161,3 +161,245 @@ export function rateInputErrorMessage(reason: RateParseError): string {
       return "Enter a number in MB/s, for example 2.5. Use 0 for unlimited.";
   }
 }
+
+/* Multi-URL batch helpers.
+ *
+ * Submission is bounded and sequential in the controller; these helpers only
+ * parse, validate, and label. Validation mirrors the pinned Surge v0.12.4
+ * `validate_download_url`: http(s), a host, no embedded credentials, no
+ * whitespace/control characters, and an 8 KiB cap. Invalid links are never
+ * sent, so they are reported locally as "invalid" rather than as a failure.
+ */
+
+/** Upper bound for one pasted batch; extra lines stay recoverable and unsent. */
+export const MAX_BATCH_LINES = 100;
+
+/** Same 8 KiB cap the Rust client enforces before any network request. */
+export const MAX_DOWNLOAD_URL_BYTES = 8 * 1024;
+
+export const MAX_CONCURRENT_DOWNLOADS_MIN = 1;
+export const MAX_CONCURRENT_DOWNLOADS_MAX = 10;
+export const MAX_CONCURRENT_DOWNLOADS_DEFAULT = 3;
+
+export type UrlLineError =
+  | "empty"
+  | "too-long"
+  | "whitespace"
+  | "scheme"
+  | "host"
+  | "credentials"
+  | "malformed";
+
+export type UrlLineValidation = { ok: true; url: string } | { ok: false; reason: UrlLineError };
+
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+export function validateDownloadUrl(raw: string): UrlLineValidation {
+  const url = raw.trim();
+  if (url.length === 0) return { ok: false, reason: "empty" };
+  if (utf8ByteLength(url) > MAX_DOWNLOAD_URL_BYTES) return { ok: false, reason: "too-long" };
+  if (/[\s\u0000-\u001f\u007f]/.test(url)) return { ok: false, reason: "whitespace" };
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, reason: "scheme" };
+  }
+  if (parsed.hostname.length === 0) return { ok: false, reason: "host" };
+  if (parsed.username.length > 0 || parsed.password.length > 0) {
+    return { ok: false, reason: "credentials" };
+  }
+  return { ok: true, url };
+}
+
+export type BatchPlanEntry =
+  | { index: number; line: string; kind: "url"; url: string }
+  | { index: number; line: string; kind: "invalid"; reason: UrlLineError }
+  | { index: number; line: string; kind: "over-limit" };
+
+/** One line per URL; blank lines are ignored and order is preserved. */
+export function planUrlLines(input: string, limit = MAX_BATCH_LINES): BatchPlanEntry[] {
+  const lines = input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  return lines.map((line, index) => {
+    if (index >= limit) return { index, line, kind: "over-limit" };
+    const validation = validateDownloadUrl(line);
+    return validation.ok
+      ? { index, line, kind: "url", url: validation.url }
+      : { index, line, kind: "invalid", reason: validation.reason };
+  });
+}
+
+export type BatchLinkStatus =
+  | "queued"
+  | "pendingApproval"
+  | "duplicate"
+  | "duplicateInBatch"
+  | "invalid"
+  | "failed"
+  | "ambiguous"
+  | "unattempted";
+
+export const BATCH_STATUS_LABELS: Record<BatchLinkStatus, string> = {
+  queued: "Accepted",
+  pendingApproval: "Pending approval",
+  duplicate: "Duplicate",
+  duplicateInBatch: "Repeated in batch",
+  invalid: "Invalid",
+  failed: "Failed",
+  ambiguous: "Unconfirmed",
+  unattempted: "Not attempted",
+};
+
+export function urlLineErrorMessage(reason: UrlLineError): string {
+  switch (reason) {
+    case "too-long":
+      return "URL is longer than the 8 KB limit.";
+    case "whitespace":
+      return "URL contains whitespace or control characters.";
+    case "scheme":
+      return "Use an http:// or https:// URL.";
+    case "host":
+      return "URL has no host.";
+    case "credentials":
+      return "Remove embedded username or password from the URL.";
+    case "empty":
+      return "Line is empty.";
+    case "malformed":
+    default:
+      return "Not a parseable URL.";
+  }
+}
+
+export function batchStatusMessage(status: BatchLinkStatus, reason?: UrlLineError): string {
+  switch (status) {
+    case "queued":
+      return "Daemon queued it. The row may appear after refresh.";
+    case "pendingApproval":
+      return "Not queued yet. Approve it in the daemon TUI.";
+    case "duplicate":
+      return "Daemon already tracks this URL; not queued.";
+    case "duplicateInBatch":
+      return "This exact URL already appeared earlier in the batch; it was not sent again.";
+    case "invalid":
+      return reason ? urlLineErrorMessage(reason) : "Not a valid download URL.";
+    case "failed":
+      return "Daemon did not accept this URL. Not retried automatically.";
+    case "ambiguous":
+      return "Request may have reached the daemon. Not retried automatically.";
+    case "unattempted":
+    default:
+      return "Batch stopped before this link was sent.";
+  }
+}
+
+/** Generic label used whenever a URL cannot be safely shown (non-http or malformed). */
+export const INVALID_URL_DISPLAY = "Invalid URL";
+
+/**
+ * Safe per-link label for the results list: strip embedded credentials, the
+ * query string and the fragment so signed secrets pasted into a URL are not
+ * echoed by the UI. The full original line is retained only in the editable
+ * input when it is recoverable. Non-http(s) schemes (including opaque URLs such
+ * as `mailto:alice:SECRET@example.com`) and unparseable input fail closed to a
+ * generic label that contains no part of the original input.
+ */
+export function redactUrlForDisplay(raw: string): string {
+  const line = raw.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(line);
+  } catch {
+    return INVALID_URL_DISPLAY;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return INVALID_URL_DISPLAY;
+  }
+  parsed.username = "";
+  parsed.password = "";
+  parsed.search = parsed.search ? "?redacted" : "";
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+/**
+ * Merge recoverable batch lines into the editable input without discarding a
+ * draft the user started while the request was in flight. Existing draft text
+ * stays first; exact duplicate lines already present are not appended again.
+ */
+export function mergeRecoverableLines(draft: string, recoverable: string[]): string {
+  const base = draft.trim();
+  const seen = new Set(
+    base
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0),
+  );
+  const extras: string[] = [];
+  for (const line of recoverable) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    extras.push(line);
+  }
+  if (extras.length === 0) return base;
+  return base.length > 0 ? `${base}\n${extras.join("\n")}` : extras.join("\n");
+}
+
+/**
+ * Move only the not-yet-delivered recovery lines into the editable draft.
+ * Existing draft text stays first and the pending list is cleared, so a later
+ * connect/disconnect never resurrects a link the user removed or resubmitted.
+ */
+export function consumeRecoveryDraft(
+  draft: string,
+  pending: string[],
+): { draft: string; pending: string[] } {
+  if (pending.length === 0) return { draft, pending: [] };
+  return { draft: mergeRecoverableLines(draft, pending), pending: [] };
+}
+
+export interface BatchDraftResolution {
+  draft: string;
+  submitted: string;
+  hasResults: boolean;
+  recoverable: string[];
+  operationId: number;
+  currentOperationId: number;
+  epoch: number;
+  currentEpoch: number;
+  sameController: boolean;
+}
+
+/**
+ * Decide the textarea value after a batch settles. Returns null when the
+ * result belongs to a superseded controller, operation or connection epoch,
+ * so callers leave the current draft completely untouched.
+ */
+export function resolveBatchDraft(resolution: BatchDraftResolution): string | null {
+  if (!resolution.sameController) return null;
+  if (resolution.operationId !== resolution.currentOperationId) return null;
+  if (resolution.epoch !== resolution.currentEpoch) return null;
+  if (!resolution.hasResults) {
+    return mergeRecoverableLines(resolution.draft, [resolution.submitted]);
+  }
+  if (resolution.recoverable.length === 0) return resolution.draft;
+  return mergeRecoverableLines(resolution.draft, resolution.recoverable);
+}
+
+/** True only for a whole number inside the daemon's 1–10 contract. */
+export function isValidMaxConcurrentValue(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= MAX_CONCURRENT_DOWNLOADS_MIN &&
+    value <= MAX_CONCURRENT_DOWNLOADS_MAX
+  );
+}

@@ -8,14 +8,17 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::path::BaseDirectory;
+use tauri::Emitter as _;
 use tauri::Manager as _;
 
 use crate::managed_server::{ManagedServer, OwnerLifetime, DEFAULT_STARTUP_TIMEOUT};
 use crate::open_location::{
     self, LocationError, LocationLaunch, LocationLauncher, SystemLocationLauncher,
 };
+use crate::progress_stream::ProgressStream;
 use crate::surge_client::{
-    AddOutcome, ConnectError, ControlAction, Download, SurgeClient, MAX_RATE_LIMIT_BPS,
+    AddOutcome, BulkControlAction, BulkControlOutcome, ConnectError, ControlAction, Download,
+    SurgeClient, MAX_CONCURRENT_DOWNLOADS_MAX, MAX_CONCURRENT_DOWNLOADS_MIN, MAX_RATE_LIMIT_BPS,
 };
 
 /// How often an async lifecycle operation checks the app-shutdown flag.
@@ -70,6 +73,32 @@ impl fmt::Debug for QueueItemDto {
     }
 }
 
+/// Authoritative `/list` snapshot plus the stream cursor it corresponds to.
+///
+/// `stream_seq` is the progress-stream receipt sequence captured immediately
+/// before the `/list` request starts. Events received at or before the cursor
+/// are reflected by the authoritative snapshot; later events carry a higher
+/// receipt sequence and are merged per row (byte-monotonically) so a stale
+/// snapshot can never overwrite newer progress and a queued pre-read sample
+/// can never overwrite the newer list.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueSnapshotDto {
+    pub epoch: u64,
+    pub stream_seq: u64,
+    pub items: Vec<QueueItemDto>,
+}
+
+impl fmt::Debug for QueueSnapshotDto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueueSnapshotDto")
+            .field("epoch", &self.epoch)
+            .field("stream_seq", &self.stream_seq)
+            .field("item_count", &self.items.len())
+            .finish()
+    }
+}
+
 /// Bridge failure surfaced to the frontend as a stable, sanitized code.
 ///
 /// No variant carries the endpoint, bearer token, response body, filename, or
@@ -85,6 +114,9 @@ pub enum BridgeError {
     BodyTooLarge,
     InvalidResponse,
     RateUnconfirmed,
+    SettingsConflict,
+    SettingsUnconfirmed,
+    BulkUnconfirmed,
     NotConnected,
     Superseded,
     State,
@@ -111,6 +143,9 @@ impl fmt::Debug for BridgeError {
             Self::BodyTooLarge => "BodyTooLarge",
             Self::InvalidResponse => "InvalidResponse",
             Self::RateUnconfirmed => "RateUnconfirmed",
+            Self::SettingsConflict => "SettingsConflict",
+            Self::SettingsUnconfirmed => "SettingsUnconfirmed",
+            Self::BulkUnconfirmed => "BulkUnconfirmed",
             Self::NotConnected => "NotConnected",
             Self::Superseded => "Superseded",
             Self::State => "State",
@@ -140,6 +175,9 @@ impl fmt::Display for BridgeError {
             Self::BodyTooLarge => "response body too large",
             Self::InvalidResponse => "invalid response from server",
             Self::RateUnconfirmed => "rate limit state could not be confirmed",
+            Self::SettingsConflict => "settings changed since editing began",
+            Self::SettingsUnconfirmed => "settings change could not be confirmed",
+            Self::BulkUnconfirmed => "bulk queue action could not be confirmed",
             Self::NotConnected => "not connected to a Surge instance",
             Self::Superseded => "connection attempt was superseded",
             Self::State => "connection state unavailable",
@@ -276,6 +314,9 @@ impl From<ConnectError> for BridgeError {
             ConnectError::BodyTooLarge => Self::BodyTooLarge,
             ConnectError::InvalidResponse => Self::InvalidResponse,
             ConnectError::RateUnconfirmed => Self::RateUnconfirmed,
+            ConnectError::SettingsConflict => Self::SettingsConflict,
+            ConnectError::SettingsUnconfirmed => Self::SettingsUnconfirmed,
+            ConnectError::BulkUnconfirmed => Self::BulkUnconfirmed,
         }
     }
 }
@@ -509,6 +550,51 @@ impl Drop for RateWritePoison {
     }
 }
 
+/// Serializes daemon settings mutations for this app lifetime.
+///
+/// Kept separate from [`RateWriter`] so an ambiguous rate write never blocks
+/// or poisons the concurrency control (and vice versa). `poisoned` is only set
+/// by an ambiguous concurrency write and is never cleared by reconnect or
+/// retirement; only an app restart starts fresh.
+#[derive(Default)]
+struct SettingsWriteGate {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    poisoned: AtomicBool,
+}
+
+/// Fail-closed guard for one in-flight settings write. Disarmed only for a
+/// definitive result (confirmed success or a definite pre-request/rejection).
+struct SettingsWritePoison {
+    writer: Arc<SettingsWriteGate>,
+    armed: bool,
+}
+
+impl SettingsWritePoison {
+    fn new(writer: Arc<SettingsWriteGate>) -> Self {
+        Self {
+            writer,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn poison_now(&mut self) {
+        self.writer.poisoned.store(true, Ordering::SeqCst);
+        self.armed = false;
+    }
+}
+
+impl Drop for SettingsWritePoison {
+    fn drop(&mut self) {
+        if self.armed {
+            self.writer.poisoned.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Serializes synchronous location validation for this manager.
 ///
 /// The permit is acquired before dispatch and moved into the blocking closure,
@@ -644,6 +730,14 @@ impl ConnectionState {
     }
 
     fn managed_location_snapshot(&self) -> Result<ManagedRateSnapshot, BridgeError> {
+        if self.active == ActiveConnection::Manual {
+            return Err(BridgeError::ManagedConnectionRequired);
+        }
+        self.managed_rate_snapshot()
+    }
+
+    /// Same managed-only target as a location read, used for settings writes.
+    fn managed_settings_snapshot(&self) -> Result<ManagedRateSnapshot, BridgeError> {
         if self.active == ActiveConnection::Manual {
             return Err(BridgeError::ManagedConnectionRequired);
         }
@@ -816,7 +910,9 @@ impl Drop for ManagedStartGuard {
 pub struct ConnectionManager {
     state: Arc<Mutex<ConnectionState>>,
     lifecycle: Arc<ManagedLifecycle>,
+    progress: Arc<ProgressStream>,
     rate_writer: Arc<RateWriter>,
+    settings_writer: Arc<SettingsWriteGate>,
     location_validation: Arc<LocationValidationGate>,
     location_launch: Arc<LocationLaunchGate>,
 }
@@ -848,6 +944,9 @@ impl ConnectionManager {
         endpoint: &str,
         token: &str,
     ) -> Result<Vec<QueueItemDto>, BridgeError> {
+        // A replacement connection must never leave the previous stream task
+        // reading (or emitting) in the background.
+        self.progress.stop();
         // Hold the lifecycle operation only across taking and retiring the old
         // daemon. If app shutdown has already started, the shutdown path owns
         // any remaining server.
@@ -913,6 +1012,7 @@ impl ConnectionManager {
     fn begin_managed_start(
         &self,
     ) -> Result<(ManagedStartTicket, Option<ManagedServer>), ManagedError> {
+        self.progress.stop();
         let mut state = self.state.lock().map_err(|_| ManagedError::State)?;
         state.begin_managed_start()
     }
@@ -1053,6 +1153,7 @@ impl ConnectionManager {
         // This ordering means an operation that already claimed a slot either
         // sees `shutting_down` before finishing or gets cancelled below.
         self.lifecycle.begin_shutdown();
+        self.progress.stop();
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -1116,6 +1217,64 @@ impl ConnectionManager {
     /// no lock is held across the await.
     pub async fn list_downloads(&self) -> Result<Vec<QueueItemDto>, BridgeError> {
         self.refresh().await
+    }
+
+    /// Authoritative queue snapshot with the progress-stream cursor captured
+    /// before the `/list` request. Events received during the read therefore
+    /// carry a newer receipt sequence and can be merged over the snapshot,
+    /// while queued pre-read samples remain at or below the cursor.
+    pub async fn list_downloads_snapshot(&self) -> Result<QueueSnapshotDto, BridgeError> {
+        let (client, epoch) = self.acquire_active()?;
+        let stream_seq = self.progress.seq();
+        let downloads = client.refresh().await?;
+
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        if state.epoch != epoch {
+            return Err(BridgeError::Superseded);
+        }
+        drop(state);
+        Ok(QueueSnapshotDto {
+            epoch,
+            stream_seq,
+            items: project(&downloads),
+        })
+    }
+
+    /// Start the single progress stream for the current connection.
+    ///
+    /// `subscription` is the frontend's monotonic connection epoch. The stream
+    /// task is additionally bound to the Rust connection epoch and to a live
+    /// managed/manual connection, so it exits after any replacement,
+    /// disconnect, disposal or shutdown even if this start raced a stop.
+    pub fn start_progress_stream(
+        &self,
+        subscription: u64,
+        app: tauri::AppHandle,
+    ) -> Result<(), BridgeError> {
+        if subscription == 0 {
+            return Err(BridgeError::InvalidResponse);
+        }
+        let (client, epoch) = self.acquire_active()?;
+        let state = Arc::clone(&self.state);
+        let is_current = move || match state.lock() {
+            Ok(state) => state.epoch == epoch && state.active != ActiveConnection::None,
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                state.epoch == epoch && state.active != ActiveConnection::None
+            }
+        };
+        let emit: Arc<dyn Fn(&'static str, serde_json::Value) + Send + Sync> =
+            Arc::new(move |event, payload| {
+                let _ = app.emit(event, payload);
+            });
+        self.progress
+            .start(subscription, epoch, client, emit, is_current);
+        Ok(())
+    }
+
+    /// Stop and abort the progress stream (best-effort, non-blocking).
+    pub fn stop_progress_stream(&self) {
+        self.progress.stop();
     }
 
     /// Open the containing folder of a completed download on the owned managed
@@ -1318,6 +1477,30 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Apply a released bulk queue action to every download on the daemon.
+    ///
+    /// The client and epoch are cloned under the lock and the network round
+    /// trip runs without it. The epoch is re-checked after both success and
+    /// failure, so a superseding `connect`/`disconnect` can never attribute a
+    /// prior daemon's bulk result or error to the replacement connection.
+    /// Partial and unconfirmed outcomes are still surfaced (as
+    /// [`BridgeError::BulkUnconfirmed`]) so the frontend can reconcile; nothing
+    /// is retried here and no queue snapshot is cached or mutated.
+    pub async fn bulk_control(
+        &self,
+        action: BulkControlAction,
+    ) -> Result<BulkControlOutcome, BridgeError> {
+        let (client, epoch) = self.acquire_active()?;
+        let result = client.bulk_control(action).await;
+
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        if state.epoch != epoch {
+            return Err(BridgeError::Superseded);
+        }
+        drop(state);
+        result.map_err(BridgeError::from)
+    }
+
     /// Enqueue a download on the active connection.
     ///
     /// Mirrors [`Self::control_download`]: the client and epoch are cloned/
@@ -1501,6 +1684,136 @@ impl ConnectionManager {
         }
     }
 
+    /// Read the daemon's saved max-concurrent-downloads value. Reads are
+    /// allowed on manual and managed connections; writes are managed-only.
+    pub async fn get_max_concurrent_downloads(&self) -> Result<i64, BridgeError> {
+        let (client, epoch) = self.acquire_active()?;
+        let result = client.get_max_concurrent_downloads().await;
+
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        if state.epoch != epoch {
+            return Err(BridgeError::Superseded);
+        }
+        drop(state);
+        result.map_err(BridgeError::from)
+    }
+
+    /// Save the daemon's `network.max_concurrent_downloads` on the owned
+    /// bundled daemon only.
+    ///
+    /// `before` is the value the UI loaded; the daemon rejects a stale edit
+    /// with 409 instead of overwriting a concurrent change. Even a same-value
+    /// write is sent so an externally changed daemon value surfaces as a
+    /// conflict. The app never restarts the daemon. Only a confirmed
+    /// 200/readback is success; an
+    /// ambiguous outcome returns [`BridgeError::SettingsUnconfirmed`] and
+    /// poisons this settings writer until the app restarts, so no later write
+    /// is sent and nothing is retried silently. This gate is independent of
+    /// the global-rate writer.
+    pub async fn set_max_concurrent_downloads(
+        &self,
+        before: i64,
+        value: i64,
+    ) -> Result<i64, BridgeError> {
+        let range = MAX_CONCURRENT_DOWNLOADS_MIN..=MAX_CONCURRENT_DOWNLOADS_MAX;
+        if !range.contains(&before) || !range.contains(&value) {
+            return Err(BridgeError::InvalidResponse);
+        }
+        if self.settings_writer.poisoned.load(Ordering::SeqCst) {
+            return Err(BridgeError::SettingsUnconfirmed);
+        }
+
+        let snapshot = {
+            let state = self.state.lock().map_err(|_| BridgeError::State)?;
+            if state.shutting_down {
+                return Err(BridgeError::Superseded);
+            }
+            state.managed_settings_snapshot()?
+        };
+
+        let lifecycle = self
+            .lifecycle
+            .begin_operation()
+            .ok_or(BridgeError::Superseded)?;
+
+        let writer = Arc::clone(&self.settings_writer);
+        let gate = Arc::clone(&writer.gate).lock_owned().await;
+        if writer.poisoned.load(Ordering::SeqCst) {
+            return Err(BridgeError::SettingsUnconfirmed);
+        }
+
+        let state = Arc::clone(&self.state);
+        let client = Arc::clone(&snapshot.client);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let _gate = gate;
+            let operation_lifecycle = lifecycle;
+            let mut poison = SettingsWritePoison::new(Arc::clone(&writer));
+
+            let dispatch = if operation_lifecycle.is_shutting_down() {
+                Err(BridgeError::Superseded)
+            } else {
+                match state.lock() {
+                    Ok(state) if !state.shutting_down && state.rate_write_is_current(&snapshot) => {
+                        Ok(())
+                    }
+                    Ok(_) => Err(BridgeError::Superseded),
+                    Err(_) => Err(BridgeError::State),
+                }
+            };
+            if let Err(error) = dispatch {
+                poison.disarm();
+                let _ = result_tx.send(Err(error));
+                return;
+            }
+
+            let operation = client.set_max_concurrent_downloads(before, value).await;
+            if matches!(&operation, Err(ConnectError::SettingsUnconfirmed)) {
+                poison.poison_now();
+            } else {
+                poison.disarm();
+            }
+
+            let result = {
+                let state = match state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        let result = if matches!(&operation, Err(ConnectError::SettingsUnconfirmed))
+                        {
+                            Err(BridgeError::SettingsUnconfirmed)
+                        } else {
+                            Err(BridgeError::State)
+                        };
+                        let _ = result_tx.send(result);
+                        return;
+                    }
+                };
+                if !state.rate_write_is_current(&snapshot) {
+                    if matches!(&operation, Err(ConnectError::SettingsUnconfirmed)) {
+                        Err(BridgeError::SettingsUnconfirmed)
+                    } else {
+                        Err(BridgeError::Superseded)
+                    }
+                } else {
+                    operation.map_err(BridgeError::from)
+                }
+            };
+            let _ = result_tx.send(result);
+        });
+
+        match result_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                if self.settings_writer.poisoned.load(Ordering::SeqCst) {
+                    Err(BridgeError::SettingsUnconfirmed)
+                } else {
+                    Err(BridgeError::State)
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     fn install_test_managed(&self, client: Arc<SurgeClient>, pid: u32) -> u64 {
         let mut state = self.state.lock().expect("test state lock");
@@ -1519,6 +1832,9 @@ impl ConnectionManager {
     /// only hold an `Arc<SurgeClient>` clone, so they observe the new epoch (or
     /// a network error) without stranding state.
     pub fn disconnect(&self) {
+        // Abort the stream before any state change so no read survives the
+        // disconnect.
+        self.progress.stop();
         // The shutdown path owns lifecycle fencing once it starts; it also
         // takes any remaining managed server itself. Registering here keeps a
         // concurrent new start from binding the fixed port mid-retirement.
@@ -1896,6 +2212,26 @@ pub async fn list_downloads(
     state.list_downloads().await
 }
 
+/// Authoritative `/list` snapshot plus the stream cursor for merge fencing.
+#[tauri::command]
+pub async fn list_downloads_snapshot(
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<QueueSnapshotDto, BridgeError> {
+    state.list_downloads_snapshot().await
+}
+
+/// Start the authenticated `/events` progress stream for the current
+/// connection. `subscription` is the frontend's monotonic epoch; stale starts
+/// are ignored by the stream manager.
+#[tauri::command]
+pub async fn start_progress_stream(
+    subscription: u64,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<(), BridgeError> {
+    state.start_progress_stream(subscription, app)
+}
+
 /// Open the containing folder of a completed download on the owned managed
 /// daemon. Accepts only the server-owned download id; no path crosses IPC.
 #[tauri::command]
@@ -1926,6 +2262,27 @@ pub async fn set_global_rate_limit(
     state.set_global_rate_limit(rate).await
 }
 
+/// Read the daemon's saved max-concurrent-downloads value (1–10).
+#[tauri::command]
+pub async fn get_max_concurrent_downloads(
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<i64, BridgeError> {
+    state.get_max_concurrent_downloads().await
+}
+
+/// Save the daemon's max-concurrent-downloads setting on the owned bundled
+/// daemon. `before` is the loaded value for the daemon's conflict check. The
+/// daemon is not restarted; the frontend must present the change as pending a
+/// restart. An unconfirmed write is never retried automatically.
+#[tauri::command]
+pub async fn set_max_concurrent_downloads(
+    before: i64,
+    value: i64,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<i64, BridgeError> {
+    state.set_max_concurrent_downloads(before, value).await
+}
+
 #[tauri::command]
 pub fn disconnect_surge(state: tauri::State<'_, ConnectionManager>) {
     state.disconnect();
@@ -1952,6 +2309,27 @@ pub async fn control_download(
         _ => return Err(BridgeError::InvalidResponse),
     };
     state.control_download(action, &id).await
+}
+
+/// Apply Pause all or Resume all to the daemon's entire queue.
+///
+/// `action` is matched against a strict, case-sensitive allowlist (`pauseAll`
+/// or `resumeAll`); anything else becomes a sanitized
+/// [`BridgeError::InvalidResponse`] without a request. The applied set is the
+/// daemon's whole queue, not the rows currently filtered in the UI. Returns
+/// only the validated count and per-item results — the frontend owns the fresh
+/// queue reconciliation and never retries automatically.
+#[tauri::command]
+pub async fn bulk_control(
+    action: String,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<BulkControlOutcome, BridgeError> {
+    let action = match action.as_str() {
+        "pauseAll" => BulkControlAction::PauseAll,
+        "resumeAll" => BulkControlAction::ResumeAll,
+        _ => return Err(BridgeError::InvalidResponse),
+    };
+    state.bulk_control(action).await
 }
 
 /// Enqueue a download on the active connection.
@@ -3537,8 +3915,35 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .expect("set read timeout");
         let head = rate_test_read_head(stream);
-        let mut lines = head.split("\r\n");
-        let request_line = lines.next().unwrap_or_default().trim().to_string();
+        let head_end = head
+            .find("\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap_or(head.len());
+        let content_length: usize = head
+            .get(..head_end)
+            .unwrap_or_default()
+            .split("\r\n")
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse().ok())
+            .unwrap_or(0);
+        let mut remaining = content_length.saturating_sub(head.len().saturating_sub(head_end));
+        let mut buffer = [0u8; 4096];
+        while remaining > 0 {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => remaining = remaining.saturating_sub(count),
+            }
+        }
+        let request_line = head
+            .get(..head_end)
+            .unwrap_or_default()
+            .split("\r\n")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         RateTestCaptured { request_line }
     }
 
@@ -4723,5 +5128,191 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ambiguous_settings_write_poisons_settings_but_not_rate_writer() {
+        const RATE: i64 = 1_234_000;
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("500 Internal Server Error", "{}".to_string()),
+            ("200 OK", rate_test_ack(RATE)),
+            ("200 OK", rate_test_settings(RATE)),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 5151).await;
+
+        assert_eq!(
+            manager.set_max_concurrent_downloads(3, 5).await,
+            Err(BridgeError::SettingsUnconfirmed),
+            "an ambiguous settings write must fail closed"
+        );
+        assert!(
+            manager.settings_writer.poisoned.load(Ordering::SeqCst),
+            "an ambiguous settings write must poison settings writes"
+        );
+        assert!(
+            !manager.rate_writer.poisoned.load(Ordering::SeqCst),
+            "settings poisoning must not touch rate control"
+        );
+
+        assert_eq!(
+            manager.set_global_rate_limit(RATE).await,
+            Ok(RATE),
+            "rate control must still work after a settings ambiguity"
+        );
+        assert_eq!(
+            manager.set_max_concurrent_downloads(3, 5).await,
+            Err(BridgeError::SettingsUnconfirmed),
+            "the poisoned settings writer must refuse later writes"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            4,
+            "the poisoned settings writer must not send another request"
+        );
+        assert!(
+            captured[1].request_line.starts_with("PATCH /settings "),
+            "settings write must use PATCH, got {}",
+            captured[1].request_line
+        );
+        assert!(captured[2]
+            .request_line
+            .starts_with("POST /rate-limit/global"));
+        assert!(captured[3].request_line.starts_with("GET /settings "));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_ambiguous_settings_write_stays_unconfirmed_after_epoch_change() {
+        let (base, server, started, release) = rate_test_spawn_gated_post(
+            "500 Internal Server Error",
+            "{}".to_string(),
+            String::new(),
+        );
+        let manager = Arc::new(ConnectionManager::default());
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 5152).await;
+
+        let set_manager = Arc::clone(&manager);
+        let set = tokio::spawn(async move { set_manager.set_max_concurrent_downloads(3, 5).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("PATCH must reach the gated server");
+
+        manager.disconnect();
+        manager.install_test_managed(Arc::clone(&client), 5152);
+        let _ = release.send(());
+
+        assert_eq!(
+            set.await.expect("set task"),
+            Err(BridgeError::SettingsUnconfirmed),
+            "a stale ambiguous settings write poisons globally and must stay visible"
+        );
+        assert!(
+            manager.settings_writer.poisoned.load(Ordering::SeqCst),
+            "the stale ambiguous response must poison the settings writer"
+        );
+        assert_eq!(
+            manager.set_max_concurrent_downloads(3, 5).await,
+            Err(BridgeError::SettingsUnconfirmed),
+            "poison must block any write to the replacement"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "poisoned settings writer must not send another request"
+        );
+        assert!(
+            captured[1].request_line.starts_with("PATCH /settings "),
+            "settings write must use PATCH, got {}",
+            captured[1].request_line
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_value_settings_write_confirms_via_daemon_patch() {
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            (
+                "200 OK",
+                r#"{"network":{"max_concurrent_downloads":3}}"#.to_string(),
+            ),
+        ]);
+        let manager = ConnectionManager::default();
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 5160).await;
+
+        assert_eq!(manager.set_max_concurrent_downloads(3, 3).await, Ok(3));
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "same-value writes must still reach the daemon"
+        );
+        assert!(
+            captured[1].request_line.starts_with("PATCH /settings "),
+            "same-value writes must not bypass the daemon conflict check"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_value_settings_write_rejects_external_change() {
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("409 Conflict", "{}".to_string()),
+        ]);
+        let manager = ConnectionManager::default();
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 5161).await;
+
+        assert_eq!(
+            manager.set_max_concurrent_downloads(3, 3).await,
+            Err(BridgeError::SettingsConflict),
+            "a same-value write must report an externally changed daemon setting"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 2);
+        assert!(
+            captured[1].request_line.starts_with("PATCH /settings "),
+            "same-value writes must not bypass the daemon conflict check"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_same_value_settings_write_is_superseded() {
+        let (base, server, started, release) =
+            rate_test_spawn_gated_post("409 Conflict", "{}".to_string(), String::new());
+        let manager = Arc::new(ConnectionManager::default());
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 5162).await;
+
+        let set_manager = Arc::clone(&manager);
+        let set = tokio::spawn(async move { set_manager.set_max_concurrent_downloads(3, 3).await });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("same-value PATCH must reach the gated server");
+
+        manager.disconnect();
+        manager.install_test_managed(Arc::clone(&client), 5162);
+        let _ = release.send(());
+
+        assert_eq!(
+            set.await.expect("set task"),
+            Err(BridgeError::Superseded),
+            "a stale same-value write must not report a local success"
+        );
+        assert!(
+            !manager.settings_writer.poisoned.load(Ordering::SeqCst),
+            "a definitive conflict on a stale connection must not poison the writer"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 2);
+        assert!(
+            captured[1].request_line.starts_with("PATCH /settings "),
+            "settings write must use PATCH, got {}",
+            captured[1].request_line
+        );
     }
 }

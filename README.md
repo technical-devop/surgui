@@ -8,7 +8,9 @@ affiliated with it. It targets the Surge v0.12.4 API. The app bundles a patched 
 ## Scope
 
 - Native Tauri app for Windows x64 and Linux x64. The bundled daemon starts automatically; advanced manual connection accepts an endpoint URL and bearer token.
-- Add URL through the UI; pause, resume, and remove with an in-app confirmation step.
+- Add one or more URLs through the UI (one per line, up to 100 per batch); the app
+  submits them strictly one at a time through the same single-add path. Pause,
+  resume, and remove with an in-app confirmation step.
 - Managed credentials are generated per launch and passed to the child process environment, not the UI, disk, arguments, or logs. Local processes with sufficient privileges may inspect that environment.
 - Remote endpoints must use HTTPS. Plain HTTP is loopback-only (e.g. `localhost`, or
   an SSH tunnel to the daemon host).
@@ -22,6 +24,15 @@ affiliated with it. It targets the Surge v0.12.4 API. The app bundles a patched 
   bytes), where `0` means unlimited. Managed bundled-daemon connection only; if a
   write's outcome cannot be confirmed, speed control stays disabled until the
   app restarts.
+- **Daemon max simultaneous downloads**: reads and saves
+  `network.max_concurrent_downloads` (1–10; daemon default 3). Saving requires
+  the bundled managed-daemon connection. The setting is persisted by the daemon,
+  but Surge applies it only after a daemon restart; the app never restarts the
+  daemon automatically and does not claim a live effect. The write uses the
+  pinned `PATCH /settings` change contract with the loaded value as `before`, so
+  a concurrent settings change is rejected instead of overwritten. An
+  unconfirmed write disables this control until the app restarts to avoid unsafe
+  retries.
 
 ## Advanced: Running the daemon (Windows)
 
@@ -97,11 +108,67 @@ connection before starting a broadly-listening server.
 
 - **Connect / list**: authenticated `GET /list`, then the queue refreshes on a
   timer.
-- **Add URL**: sends the URL to the daemon. The daemon may queue it immediately, or
-  return "pending approval" — in that case approve it in the Surge TUI on the
-  daemon host; the row is not queued until then. A duplicate URL is reported and
-  not re-queued.
+- **Live progress (optional)**: authenticated `GET /events` SSE adds
+  near-real-time progress on top of polling. The snapshot cursor is captured
+  before `/list` and every event is sequenced at client receipt, but receipt
+  order cannot prove daemon order: the daemon stream carries no generation id,
+  so the cursor is a conservative heuristic, not absolute ordering. Byte
+  counters are kept monotonic for a download generation as a best-effort
+  guard; a transient stale value can still appear. A
+  snapshot that reports fewer bytes than the displayed value for the same
+  id/addedAt is ambiguous: if a newer progress receipt arrived after the list
+  request started, the live value is kept and a fresh authoritative follow-up
+  read (single-flight, bounded backoff) conservatively confirms whether it was a real reset.
+  Only a read that still reports the lower value after its cursor covers the
+  newer receipt is treated as a likely reset; live events for that row are then
+  quarantined because a delayed sample from the previous generation cannot be
+  distinguished without a daemon generation id. Snapshots alone update the row
+  until its `addedAt` changes, the record disappears, or it becomes
+  `completed`/`failed` (paused/pausing do not release the quarantine). A lower snapshot with no
+  newer in-flight progress is accepted as a reset through reconciliation, without
+  claiming that a stale snapshot can never overwrite newer progress.
+  The `/events` handshake is bounded but an established idle body is never cut,
+  manual mode disables proxies, and repeated malformed or immediately-empty
+  streams back off and fall back to polling. Reconnect backoff resets only after
+  a sustained stream, so one valid frame followed by an immediate EOF keeps
+  backing off instead of retrying forever at 500 ms. Listener registration is
+  bounded, cleaned up on failure/timeout, and retried on the next reconnect; the
+  native stream starts only after all three listeners are ready.
+- **Add URLs**: accepts HTTP(S) URLs one per line. Blank lines are ignored;
+  invalid or non-HTTP(S) lines are reported without being sent; up to 100 lines
+  are attempted per batch. Valid lines are submitted strictly one at a time
+  through the existing single-add route, so the daemon still manages download
+  concurrency itself. Each line reports exactly one outcome: accepted/queued,
+  pending approval, duplicate, invalid, failed, or unconfirmed (ambiguous).
+  A disconnect, a definitive connection failure, or an unconfirmed request
+  stops the batch; remaining links are not attempted, and
+  invalid/failed/unconfirmed/unattempted lines stay in the input for the user
+  to fix or resend deliberately. Nothing is retried automatically. Pending approval still happens in the Surge TUI on the daemon
+  host; a duplicate URL is reported and not re-queued.
 - **Pause / resume**: sends `/pause` and `/resume` for the selected record.
+- **Pause all / Resume all**: sends the daemon's bulk `/pause-all` and
+  `/resume-all` routes. These apply to the daemon's whole queue, not just the
+  rows currently filtered in the UI. Pause all targets every item except
+  completed, already-paused, and errored ones (queued and unknown included);
+  Resume all targets every paused item, including individually paused ones.
+  The UI reports accepted and failed counts from the bounded, validated
+  per-item response. Per-item daemon error text is never forwarded: it can
+  contain a token, URL, or local path, so failed rows show a fixed safe
+  message and only the validated item id. The UI acknowledges the request,
+  states that row changes are applied asynchronously, and keeps refreshing
+  periodically. A transport or malformed/unconfirmed outcome is reported as
+  uncertain, triggers a fresh daemon reconciliation, and is **never retried
+  automatically**. If the connection changes while a bulk request is in
+  flight, a persistent warning survives reconnect and clears only on explicit
+  per-warning dismissal. It says the current connection **may be the same
+  daemon**, so the unconfirmed action may still apply; it never claims the new
+  connection is unaffected. A timeout on the connection that is still current
+  says so directly instead of blaming a previous connection. Warnings stay
+  visible while offline/connecting, are bounded in number, and any overflow is
+  reported conservatively; the overflow summary has its own dismissal that
+  leaves the individual warnings in place. A busy/rejected bulk attempt never
+  turns a still-confirmed request into an uncertainty warning. Server ids and
+  raw per-item error strings are never rendered.
 - **Remove**: asks for confirmation, then calls `/delete`. It never calls `/purge`.
   Removing may delete the incomplete working file of a transfer still in progress;
   a completed final file is left on disk.
@@ -117,6 +184,15 @@ connection before starting a broadly-listening server.
   `/rate-limit/global`, confirming the readback. Only the bundled managed daemon
   can be written; an unconfirmed write disables speed control until the app
   restarts.
+- **Daemon max simultaneous downloads**: reads
+  `network.max_concurrent_downloads` from `/settings` (1–10; default 3) and
+  saves it with `PATCH /settings` using the change's `before` baseline. Only the
+  bundled managed daemon can be written; manual connections are read-only. The
+  app never restarts the daemon, so the UI presents every save as requiring a
+  daemon restart and does not claim the running concurrency changed. A 409
+  means the daemon value changed since it was loaded; reload and retry. An
+  unconfirmed write disables this control until the app restarts, independent of
+  the speed-limit control.
 
 ### Where files land
 
