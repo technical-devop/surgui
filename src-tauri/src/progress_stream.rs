@@ -223,9 +223,9 @@ impl SseParser {
                 // plus a trailing CR) while awaiting the LF. Anything else
                 // beyond MAX is an actual oversized line and stays rejected so
                 // the bound is not weakened.
-                if self.buffer.len() > MAX_SSE_LINE_BYTES + 1
-                    || self.buffer.last() != Some(&b'\r')
-                {
+                let exceeds_line_limit = self.buffer.len() > MAX_SSE_LINE_BYTES + 1;
+                let ends_without_cr = self.buffer.last() != Some(&b'\r');
+                if exceeds_line_limit || ends_without_cr {
                     return Err(SseError::Oversized);
                 }
             }
