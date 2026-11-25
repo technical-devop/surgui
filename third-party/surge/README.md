@@ -8,13 +8,13 @@ download.
 ## Pin
 
 - Upstream: `https://github.com/SurgeDM/Surge`
-- Pinned tag: contents of `SURGE_VERSION` (`v0.12.4`)
+- Pinned tag: contents of `SURGE_VERSION` (`v0.13.0`)
 - Tag commit (audit reference): contents of `SURGE_COMMIT`
-  (`0481d309a2e41ccc7a7bda3b2fc368fcb9c1d892`)
+  (`a560cd207c235ed800a367c5019dc9f3b8bbabc5`)
 - Source archive (CI fetches this exact URL, never `git clone`):
-  `https://codeload.github.com/SurgeDM/Surge/tar.gz/refs/tags/v0.12.4`
+  `https://codeload.github.com/SurgeDM/Surge/tar.gz/refs/tags/v0.13.0`
 - Archive SHA-256 (contents of `SURGE_SHA256`):
-  `97d34131f6a0aba56a048e45bb7a5162558bb38ae37c9f0f8ee6d09e5b0b14f6`
+  `9e45f2004171578658e1d31524128966727b3a4c5fec8a1f9b1677648643e022`
 
 The codeload tarball carries no git metadata, so CI cannot re-derive the
 commit hash from the archive. CI pins the **content hash** above instead,
@@ -24,10 +24,19 @@ human audit.
 
 ## Patch
 
-`surge-bind-loopback.patch` touches `cmd/root_http_server.go` and
-`cmd/cmd_test.go`: it adds a managed mode that binds `127.0.0.1` at a fixed
-port with no fallback, authenticates via an ephemeral token, and uses
-in-memory TLS PEM, plus managed-mode tests.
+`surge-bind-loopback.patch` touches `cmd/root_http_server.go`,
+`cmd/cmd_test.go`, and `internal/config/settings.go`:
+
+- It adds a managed mode that binds `127.0.0.1` at the caller-supplied fixed
+  port with no fallback, authenticates via an ephemeral in-memory token, and
+  uses in-memory TLS PEM, plus managed-mode security tests.
+- v0.13.0 made the standard server bind address configurable and defaults it
+  to `0.0.0.0`. The patch changes `DefaultBindHost` to `127.0.0.1` and makes
+  `validateBindHost` reject every non-loopback value, so neither the default
+  nor a settings edit can expose the bundled daemon beyond the local host.
+  Regression tests cover the loopback default, rejection of `0.0.0.0` and
+  private addresses in the shared startup path before any listener exists,
+  and the listener's actual bound address.
 
 ## Upstream license
 
@@ -46,6 +55,8 @@ Toolchain: Go `1.26.0` (matches upstream `go.mod`'s `go 1.26.0`), set via
 - `CGO_ENABLED=0`
 - `GOTOOLCHAIN=local` (refuse silent toolchain switching)
 - `GOFLAGS=-trimpath`
+- `GOMAXPROCS=2` and `GOMEMLIMIT=2GiB` (bounded CPU/memory on small hosts)
+- `go test -p 1` (serial package tests)
 - `go build -trimpath -ldflags="-s -w" -o <resource> .` from the extracted
   source root, with `GOOS`/`GOARCH` per target:
   - Linux x64: `GOOS=linux GOARCH=amd64` →

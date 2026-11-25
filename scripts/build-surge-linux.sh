@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build pinned Surge v0.12.4 for Linux x64 with the loopback-only bind patch,
+# Build pinned Surge v0.13.0 for Linux x64 with the loopback-only bind patch,
 # then stage it as a Tauri resource.
 #
 # Groundwork only: fetch + verify + patch + compile + bundle. No runtime
@@ -70,7 +70,7 @@ esac
 
 ARCHIVE="$RUN_DIR/surge-${VERSION}.tar.gz"
 SRC_PARENT="$RUN_DIR/src"
-SRC_DIR="$SRC_PARENT/Surge-0.12.4"
+SRC_DIR="$SRC_PARENT/Surge-${VERSION#v}"
 RUN_TMP="$RUN_DIR/sandbox-tmp"
 RUN_GOTMP="$RUN_DIR/gotmp"
 RUN_GOCACHE="$RUN_DIR/gocache"
@@ -131,18 +131,23 @@ echo "Applying loopback patch strictly (fail closed on mismatch)..."
   git apply --verbose "$PATCH"
 )
 
-echo "Verifying patched bind host..."
+echo "Verifying patched bind host defaults to loopback..."
 HTTP_SERVER_GO="$SRC_DIR/cmd/root_http_server.go"
-PATCHED_COUNT="$(grep -Fxc 'const serverBindHost = "127.0.0.1"' "$HTTP_SERVER_GO" || true)"
-PATCHED_COUNT="${PATCHED_COUNT:-0}"
-if [ "$PATCHED_COUNT" -ne 1 ]; then
-  echo "ERROR: expected exactly 1 occurrence of the patched bind host line, found ${PATCHED_COUNT}." >&2
+SETTINGS_GO="$SRC_DIR/internal/config/settings.go"
+DEFAULT_COUNT="$(grep -Fc 'DefaultBindHost = "127.0.0.1"' "$SETTINGS_GO" || true)"
+DEFAULT_COUNT="${DEFAULT_COUNT:-0}"
+if [ "$DEFAULT_COUNT" -ne 1 ]; then
+  echo "ERROR: expected exactly 1 loopback DefaultBindHost line, found ${DEFAULT_COUNT}." >&2
   exit 1
 fi
-OLD_COUNT="$(grep -Fxc 'const serverBindHost = "0.0.0.0"' "$HTTP_SERVER_GO" || true)"
+OLD_COUNT="$(grep -Fc 'DefaultBindHost = "0.0.0.0"' "$SETTINGS_GO" || true)"
 OLD_COUNT="${OLD_COUNT:-0}"
 if [ "$OLD_COUNT" -ne 0 ]; then
-  echo "ERROR: unpatched 0.0.0.0 bind host still present after patch (${OLD_COUNT} occurrence(s))." >&2
+  echo "ERROR: upstream 0.0.0.0 bind default still present after patch (${OLD_COUNT} occurrence(s))." >&2
+  exit 1
+fi
+if ! grep -Fq 'if strings.TrimSpace(sVal) == LoopbackBindHost' "$SETTINGS_GO"; then
+  echo "ERROR: bind_host validator does not reject non-loopback addresses." >&2
   exit 1
 fi
 
@@ -223,7 +228,10 @@ for t in \
   'func TestSurguiManaged_NoPlaintextFallback' \
   'func TestSurguiManaged_PortCollisionFailsClosed' \
   'func TestSurguiManaged_WrongCertFailsClosed' \
-  'func TestSurguiManaged_TokenNotPersisted'; do
+  'func TestSurguiManaged_TokenNotPersisted' \
+  'func TestSurguiManaged_BindHostDefaultsToLoopback' \
+  'func TestSurguiManaged_DefaultServerListenerBindsLoopback' \
+  'func TestSurguiManaged_NonLoopbackBindHostFailsBeforeListen'; do
   if ! printf '%s\n' "$TEST_SECTION" | grep -Fq "$t"; then
     echo "ERROR: managed test missing: $t" >&2
     exit 1
@@ -258,7 +266,7 @@ done
 echo "Checking gofmt on patched files..."
 GOFMT_OUT=""
 GOFMT_STATUS=0
-GOFMT_OUT="$(gofmt -l "$HTTP_SERVER_GO" "$CMD_TEST_GO")" || GOFMT_STATUS=$?
+GOFMT_OUT="$(gofmt -l "$HTTP_SERVER_GO" "$CMD_TEST_GO" "$SETTINGS_GO")" || GOFMT_STATUS=$?
 if [ "$GOFMT_STATUS" -ne 0 ]; then
   echo "ERROR: gofmt execution failed with exit code ${GOFMT_STATUS}." >&2
   exit 1
@@ -271,16 +279,16 @@ fi
 echo "Running managed + related Go tests (fail closed)..."
 (
   cd "$SRC_DIR"
-  CGO_ENABLED=0 GOTOOLCHAIN=local GOMAXPROCS=2 GOFLAGS=-trimpath \
+  CGO_ENABLED=0 GOTOOLCHAIN=local GOMAXPROCS=2 GOMEMLIMIT=2GiB GOFLAGS=-trimpath \
     TMPDIR="$RUN_TMP" TMP="$RUN_TMP" TEMP="$RUN_TMP" GOTMPDIR="$RUN_GOTMP" \
     GOCACHE="$RUN_GOCACHE" GOMODCACHE="$RUN_GOMODCACHE" GOPATH="$RUN_GOPATH" \
-    go test -p 1 ./cmd/ -run 'TestSurguiManaged|TestFindAvailablePort|TestStartHTTPServer' -count=1 -v
+    go test -p 1 ./cmd/ -run 'TestSurguiManaged|TestFindAvailablePort|TestStartHTTPServer|TestBindServerListener' -count=1 -v
 )
 
 echo "Compiling Surge for linux/amd64 (reproducible flags)..."
 (
   cd "$SRC_DIR"
-  CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-trimpath GOOS=linux GOARCH=amd64 \
+  CGO_ENABLED=0 GOTOOLCHAIN=local GOMAXPROCS=2 GOMEMLIMIT=2GiB GOFLAGS=-trimpath GOOS=linux GOARCH=amd64 \
     TMPDIR="$RUN_TMP" TMP="$RUN_TMP" TEMP="$RUN_TMP" GOTMPDIR="$RUN_GOTMP" \
     GOCACHE="$RUN_GOCACHE" GOMODCACHE="$RUN_GOMODCACHE" GOPATH="$RUN_GOPATH" \
     go build -trimpath -ldflags="-s -w" -o "$OUT" .

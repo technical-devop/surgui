@@ -1,4 +1,4 @@
-# Build pinned Surge v0.12.4 for Windows x64 with the loopback-only bind patch,
+# Build pinned Surge v0.13.0 for Windows x64 with the loopback-only bind patch,
 # then stage it as a Tauri resource.
 #
 # Groundwork only: fetch + verify + patch + compile + bundle. No runtime
@@ -115,7 +115,7 @@ if (-not $RunDir.StartsWith($StagePrefix, [System.StringComparison]::OrdinalIgno
 
 $Archive = Join-Path $RunDir "surge-$Version.tar.gz"
 $SrcParent = Join-Path $RunDir 'src'
-$SrcDir = Join-Path $SrcParent 'Surge-0.12.4'
+$SrcDir = Join-Path $SrcParent ('Surge-' + $Version.TrimStart('v'))
 $SandboxTmp = Join-Path $RunDir 'sandbox-tmp'
 $GoTmp = Join-Path $RunDir 'gotmp'
 $GoCache = Join-Path $RunDir 'gocache'
@@ -225,17 +225,21 @@ try {
   Pop-Location
 }
 
-Write-Host 'Verifying patched bind host...'
+Write-Host 'Verifying patched bind host defaults to loopback...'
 $HttpServerFile = Join-Path $SrcDir 'cmd\root_http_server.go'
-$PatchedLine = 'const serverBindHost = "127.0.0.1"'
-$OldLine = 'const serverBindHost = "0.0.0.0"'
-$PatchedMatches = @(Select-String -Path $HttpServerFile -Pattern $PatchedLine -SimpleMatch)
+$SettingsFile = Join-Path $SrcDir 'internal\config\settings.go'
+$PatchedLine = 'DefaultBindHost = "127.0.0.1"'
+$OldLine = 'DefaultBindHost = "0.0.0.0"'
+$PatchedMatches = @(Select-String -Path $SettingsFile -Pattern $PatchedLine -SimpleMatch)
 if ($PatchedMatches.Count -ne 1) {
-  throw "Expected exactly 1 occurrence of the patched bind host line in $HttpServerFile, found $($PatchedMatches.Count). Refusing to build."
+  throw "Expected exactly 1 occurrence of the loopback DefaultBindHost line in $SettingsFile, found $($PatchedMatches.Count). Refusing to build."
 }
-$OldMatches = @(Select-String -Path $HttpServerFile -Pattern $OldLine -SimpleMatch)
+$OldMatches = @(Select-String -Path $SettingsFile -Pattern $OldLine -SimpleMatch)
 if ($OldMatches.Count -ne 0) {
-  throw "Expected 0 occurrences of the unpatched bind host line in $HttpServerFile, found $($OldMatches.Count). Refusing to build."
+  throw "Expected 0 occurrences of the upstream 0.0.0.0 bind default in $SettingsFile, found $($OldMatches.Count). Refusing to build."
+}
+if (-not (Select-String -Path $SettingsFile -Pattern 'if strings.TrimSpace\(sVal\) == LoopbackBindHost' -Quiet)) {
+  throw "bind_host validator does not reject non-loopback addresses. Refusing to build."
 }
 
 Write-Host 'Verifying Surgui-managed section (TLS-only, env-configured)...'
@@ -324,7 +328,10 @@ $RequiredTests = @(
   'func TestSurguiManaged_NoPlaintextFallback',
   'func TestSurguiManaged_PortCollisionFailsClosed',
   'func TestSurguiManaged_WrongCertFailsClosed',
-  'func TestSurguiManaged_TokenNotPersisted'
+  'func TestSurguiManaged_TokenNotPersisted',
+  'func TestSurguiManaged_BindHostDefaultsToLoopback',
+  'func TestSurguiManaged_DefaultServerListenerBindsLoopback',
+  'func TestSurguiManaged_NonLoopbackBindHostFailsBeforeListen'
 )
 foreach ($t in $RequiredTests) {
   if ($TestSection -notmatch [regex]::Escape($t)) {
@@ -360,7 +367,7 @@ foreach ($f in $ForbiddenPemTests) {
 }
 
 Write-Host 'Checking gofmt on patched files...'
-$GofmtOut = & gofmt -l $HttpServerFile $CmdTestFile 2>&1
+$GofmtOut = & gofmt -l $HttpServerFile $CmdTestFile $SettingsFile 2>&1
 $GofmtCode = $LASTEXITCODE
 if ($GofmtCode -ne 0) {
   throw "gofmt execution failed with exit code $GofmtCode : $GofmtOut. Refusing to build."
@@ -376,6 +383,7 @@ try {
   $env:CGO_ENABLED = '0'
   $env:GOTOOLCHAIN = 'local'
   $env:GOMAXPROCS = '2'
+  $env:GOMEMLIMIT = '2GiB'
   $env:GOFLAGS = '-trimpath'
   $env:TMPDIR = $SandboxTmp
   $env:TMP = $SandboxTmp
@@ -384,7 +392,7 @@ try {
   $env:GOCACHE = $GoCache
   $env:GOMODCACHE = $GoModCache
   $env:GOPATH = $GoPathDir
-  & go test -p 1 ./cmd/ -run 'TestSurguiManaged|TestFindAvailablePort|TestStartHTTPServer' -count=1 -v
+  & go test -p 1 ./cmd/ -run 'TestSurguiManaged|TestFindAvailablePort|TestStartHTTPServer|TestBindServerListener' -count=1 -v
   if ($LASTEXITCODE -ne 0) { throw "go test failed with exit code $LASTEXITCODE" }
 } finally {
   Pop-Location
@@ -736,6 +744,8 @@ Push-Location $SrcDir
 try {
   $env:CGO_ENABLED = '0'
   $env:GOTOOLCHAIN = 'local'
+  $env:GOMAXPROCS = '2'
+  $env:GOMEMLIMIT = '2GiB'
   $env:GOFLAGS = '-trimpath'
   $env:GOOS = 'windows'
   $env:GOARCH = 'amd64'

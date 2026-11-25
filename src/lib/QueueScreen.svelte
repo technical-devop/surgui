@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { filterQueue, formatEta, formatSizePair, formatSpeed, groupByStatus, progressRatio } from "./queue/queue";
+  import { filterQueue, formatEta, formatSizePair, formatSpeed, groupByStatus, lifecycleLabel, lifecycleSuffix, progressRatio } from "./queue/queue";
   import type { BulkAction, BulkSummary, BulkUncertainty, QueueItem, StatusFilter } from "./queue/types";
   import { STATUS_ORDER } from "./queue/types";
   import { untrack } from "svelte";
@@ -357,7 +357,7 @@
               <button
                 type="button"
                 class="row-main"
-                aria-label={`Inspect ${item.name}, status ${item.status}, ${pct} percent`}
+                aria-label={`Inspect ${item.name}, status ${item.status}${lifecycleSuffix(item)}, ${pct} percent`}
                 aria-current={selectedId === item.id ? "true" : undefined}
                 onclick={() => { selectedId = item.id; }}
               >
@@ -367,6 +367,9 @@
                   </span>
                   <span class="row-name">{item.name}</span>
                 </span>
+                {#if lifecycleLabel(item) !== null}
+                  <span class="lifecycle" class:lifecycle-hook={item.hookFailed === true} role="note">{lifecycleLabel(item)}</span>
+                {/if}
                 <span
                   class="progress"
                   role="progressbar"
@@ -433,6 +436,15 @@
             <span class="status-dot" aria-hidden="true"></span>{sel.status}
           </span>
         </p>
+        {#if sel.processing === true}
+          <p class="lifecycle-note" role="status">Processing… Post-download step is running. Not done yet.</p>
+        {:else if sel.hookFailed === true}
+          <p class="lifecycle-note lifecycle-failed" role="alert">Post-download step failed. Download bytes are complete; the transfer itself did not fail.</p>
+        {:else if sel.status === "active" && sel.phase === "verifying"}
+          <p class="lifecycle-note" role="status">Verifying… Verification is still running. Not done yet.</p>
+        {:else if (sel.status === "active" || sel.status === "completed") && sel.phase === "finalizing"}
+          <p class="lifecycle-note" role="status">Finalizing… Finalization is still running. Not done yet.</p>
+        {/if}
         <span
           class="progress progress-large"
           role="progressbar"
@@ -1203,6 +1215,38 @@
   }
   .status[data-status="completed"] .status-dot {
     background: var(--color-ok);
+  }
+
+  /* Lifecycle line: text carries the truth, colour only reinforces it. */
+  .lifecycle {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-accent);
+    white-space: nowrap;
+    overflow-wrap: anywhere;
+  }
+
+  .lifecycle-hook {
+    color: var(--color-error);
+  }
+
+  .lifecycle-note {
+    margin: var(--space-xs) 0 0;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+    color: var(--color-ink);
+    border: 1px solid var(--color-rule-2);
+    background: var(--color-paper-2);
+    padding: var(--space-xs) var(--space-sm);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .lifecycle-failed {
+    border-color: var(--color-error);
+    background: var(--color-error-wash);
   }
 
   .progress {

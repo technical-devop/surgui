@@ -3,7 +3,7 @@
 Unofficial desktop GUI for Surge, the download daemon. Built with Tauri + Svelte.
 
 This is a **third-party controller**, not part of the Surge upstream project and not
-affiliated with it. It targets the Surge v0.12.4 API. The app bundles a patched Surge v0.12.4 daemon for Windows x64 and Linux x64. It starts the daemon automatically on 127.0.0.1:1700 over TLS and stops its owned daemon on disconnect or exit. If the port is occupied, startup fails rather than using an unrelated listener.
+affiliated with it. It targets the Surge v0.13.0 API. The app bundles a patched Surge v0.13.0 daemon for Windows x64 and Linux x64. It starts the daemon automatically on 127.0.0.1:1700 over TLS and stops its owned daemon on disconnect or exit. If the port is occupied, startup fails rather than using an unrelated listener.
 
 ## Scope
 
@@ -37,7 +37,7 @@ affiliated with it. It targets the Surge v0.12.4 API. The app bundles a patched 
 ## Advanced: Running the daemon (Windows)
 
 Surge runs as a separate server process. Download `surge.exe` for Windows from the
-[Surge v0.12.4 release](https://github.com/SurgeDM/Surge/releases/tag/v0.12.4),
+[Surge v0.13.0 release](https://github.com/SurgeDM/Surge/releases/tag/v0.13.0),
 then extract it to a folder.
 
 A minimal local setup uses two PowerShell windows, both opened in that extracted
@@ -67,17 +67,19 @@ Then in the app:
 
 ### Network exposure
 
-Surge v0.12.4's server listens broadly on the host by default — not only on
-loopback. Before starting it, block inbound port 1700 in Windows Firewall (or your
-equivalent), or put the daemon behind an HTTPS tunnel. The app requires HTTPS for
-anything that is not loopback HTTP, but that is a client-side rule only; it does
-not restrict who can reach the daemon.
+Upstream Surge v0.13.0 still defaults its server to all interfaces
+(`0.0.0.0`), not loopback-only. Set `network.bind_host = '127.0.0.1'` in the
+Surge settings before starting a manually installed daemon. If you do not, block
+inbound port 1700 in Windows Firewall (or your equivalent), or put the daemon
+behind an HTTPS tunnel. The app requires HTTPS for anything that is not loopback
+HTTP, but that is a client-side rule only; it does not restrict who can reach
+the daemon.
 
 ## Advanced: Running the daemon (Linux)
 
 The same Surge release ships Linux binaries. Download
-`Surge_0.12.4_linux_amd64.tar.gz` (or `Surge_0.12.4_linux_arm64.tar.gz`) from the
-[Surge v0.12.4 release](https://github.com/SurgeDM/Surge/releases/tag/v0.12.4),
+`Surge_0.13.0_linux_amd64.tar.gz` (or `Surge_0.13.0_linux_arm64.tar.gz`) from the
+[Surge v0.13.0 release](https://github.com/SurgeDM/Surge/releases/tag/v0.13.0),
 then extract it to a folder.
 
 A minimal local setup uses two terminals, both opened in that extracted Surge

@@ -51,10 +51,23 @@ export function formatSpeed(bps: number): string {
 }
 
 export function formatEta(item: QueueItem): string {
+  // Truthful lifecycle copy: a running post-download hook is never Done,
+  // even when byte counters are complete; a hook failure is not a transfer
+  // failure, so it never reads as Failed/Done. A failed transfer is never
+  // Done even when counters are complete, and verifying/finalizing is never
+  // Done even when counters are complete. Per local_service.go
+  // attachPostDownloadState, phase finalizing is set whenever the scheduler
+  // IsFinalizing(id) independent of status, so completed + finalizing is a
+  // real state (not stale). Failure keeps precedence; paused/failed rows
+  // carrying a phase stay stale; old daemons (phase absent) read as before.
+  if (item.processing === true) return "Processing…";
+  if (item.hookFailed === true) return "Hook failed";
+  if (item.status === "failed") return "Failed";
+  if (item.status === "active" && item.phase === "verifying") return "Verifying…";
+  if ((item.status === "active" || item.status === "completed") && item.phase === "finalizing") return "Finalizing…";
   if (item.status === "completed" || (item.bytesTotal > 0 && item.bytesDone >= item.bytesTotal)) {
     return "Done";
   }
-  if (item.status === "failed") return "Failed";
   if (item.status === "paused") return "Paused";
   if (item.status === "pausing") return "Pausing…";
   if (item.status === "queued") return "Waiting";
@@ -71,6 +84,46 @@ export function formatEta(item: QueueItem): string {
 
 export function formatSizePair(item: QueueItem): string {
   return `${formatBytes(item.bytesDone)} of ${formatBytes(item.bytesTotal)}`;
+}
+
+/** True only when a post-download hook is currently running. */
+export function isProcessing(item: QueueItem): boolean {
+  return item.processing === true;
+}
+
+/** True only when the sanitized hook-failed bit is set. Raw hook text is never exposed. */
+export function hasHookFailed(item: QueueItem): boolean {
+  return item.hookFailed === true;
+}
+
+/**
+ * Accessible lifecycle suffix for row/detail labels. Empty when idle so
+ * older daemons (absent fields) read exactly as before. Completed +
+ * finalizing qualifies the "completed" status so accessible names never
+ * unqualifiedly assert overall completion; failed/paused rows carrying a
+ * phase stay stale and never override the authoritative status.
+ */
+export function lifecycleSuffix(item: QueueItem): string {
+  if (item.processing === true) return ", processing post-download step";
+  if (item.hookFailed === true) return ", post-download step failed";
+  if (item.status === "active" && item.phase === "verifying") return ", verifying download";
+  if ((item.status === "active" || item.status === "completed") && item.phase === "finalizing")
+    return ", finalizing download, not done yet";
+  return "";
+}
+
+/**
+ * Short visible lifecycle label; null when idle (including old-daemon absence).
+ * Completed + finalizing is real (not stale) and shows Finalizing…; failed/
+ * paused rows carrying a phase stay stale and never override their status.
+ */
+export function lifecycleLabel(item: QueueItem): string | null {
+  if (item.processing === true) return "Processing…";
+  if (item.hookFailed === true) return "Hook failed";
+  if (item.status === "active" && item.phase === "verifying") return "Verifying…";
+  if ((item.status === "active" || item.status === "completed") && item.phase === "finalizing")
+    return "Finalizing…";
+  return null;
 }
 
 /* Global download limit helpers. Decimal MB/s with 1 MB = 1,000,000 bytes.

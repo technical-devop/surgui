@@ -25,16 +25,7 @@
  )
  
  func resolveTokenPath() string {
-@@ -25,7 +30,7 @@
- 	return config.GetRuntimeDir()
- }
- 
--const serverBindHost = "0.0.0.0"
-+const serverBindHost = "127.0.0.1"
- 
- const maxAPIRequestBodyBytes = 8 << 20
- 
-@@ -211,3 +216,255 @@
+@@ -217,3 +222,255 @@
  	}
  	return os.Chmod(path, 0o600)
  }
@@ -42,7 +33,7 @@
 +// Surgui-managed Surge server (TLS-only loopback, environment-configured).
 +//
 +// This file is part of the Surgui auditable patch set on top of Surge
-+// v0.12.4. It adds an internal `surgui-managed-server` command used only by
++// v0.13.0. It adds an internal `surgui-managed-server` command used only by
 +// the Surgui desktop app to spawn its bundled daemon. Design rules:
 +//
 +//   - Listens only on 127.0.0.1 with an explicit port from SURGUI_PORT.
@@ -318,7 +309,7 @@
  
  	"github.com/SurgeDM/Surge/internal/config"
  	"github.com/SurgeDM/Surge/internal/scheduler"
-@@ -1549,3 +1558,394 @@
+@@ -1594,3 +1603,486 @@
  		t.Fatalf("resolveServerToken() = %q, want %q", got, "flag-token-xyz")
  	}
  }
@@ -713,3 +704,128 @@
 +		t.Fatalf("unexpected error reading token file: %v", err)
 +	}
 +}
++
++// TestSurguiManaged_BindHostDefaultsToLoopback locks the security patch that
++// makes the bundled daemon loopback-only by default. Upstream v0.13.0 defaults
++// to 0.0.0.0 and accepts it explicitly; this bundle rejects that value.
++func TestSurguiManaged_BindHostDefaultsToLoopback(t *testing.T) {
++	if config.DefaultBindHost != config.LoopbackBindHost {
++		t.Fatalf("DefaultBindHost = %q, want loopback %q", config.DefaultBindHost, config.LoopbackBindHost)
++	}
++	if config.DefaultBindHost != "127.0.0.1" {
++		t.Fatalf("DefaultBindHost = %q, want 127.0.0.1", config.DefaultBindHost)
++	}
++	if surguiManagedHost != "127.0.0.1" {
++		t.Fatalf("managed host must stay 127.0.0.1, got %q", surguiManagedHost)
++	}
++
++	// No settings file: the bind decision must still be loopback.
++	emptyConfig := t.TempDir()
++	t.Setenv("XDG_CONFIG_HOME", emptyConfig)
++	t.Setenv("APPDATA", emptyConfig)
++	host, err := config.LoadBindHost()
++	if err != nil {
++		t.Fatalf("LoadBindHost() with no settings file failed: %v", err)
++	}
++	if host != "127.0.0.1" {
++		t.Fatalf("LoadBindHost() with no settings file = %q, want 127.0.0.1", host)
++	}
++
++	// Upstream's all-interfaces value must fail closed, not expose the API.
++	for _, content := range []string{
++		"[network]\nbind_host = '0.0.0.0'\n",
++		"[network]\nbind_host = '192.168.1.10'\n",
++	} {
++		writeSettingsFile(t, content)
++		if host, err := config.LoadBindHost(); err == nil {
++			t.Fatalf("LoadBindHost() accepted %q as %q; only loopback is allowed", content, host)
++		}
++	}
++}
++
++// TestSurguiManaged_DefaultServerListenerBindsLoopback proves the default bind
++// decision reaches the initial listener as 127.0.0.1, not just the config value.
++func TestSurguiManaged_DefaultServerListenerBindsLoopback(t *testing.T) {
++	requireTCPListener(t)
++	emptyConfig := t.TempDir()
++	t.Setenv("XDG_CONFIG_HOME", emptyConfig)
++	t.Setenv("APPDATA", emptyConfig)
++	previousHost := activeBindHost
++	t.Cleanup(func() { activeBindHost = previousHost })
++
++	_, ln, err := bindServerListener(0)
++	if err != nil {
++		t.Fatalf("bindServerListener(0) failed: %v", err)
++	}
++	defer func() { _ = ln.Close() }()
++
++	addr, ok := ln.Addr().(*net.TCPAddr)
++	if !ok {
++		t.Fatalf("listener addr is %T, want *net.TCPAddr", ln.Addr())
++	}
++	if !addr.IP.IsLoopback() {
++		t.Fatalf("listener bound %v; initial listen must be loopback-only", ln.Addr())
++	}
++	if activeBindHost != "127.0.0.1" {
++		t.Fatalf("activeBindHost = %q, want 127.0.0.1", activeBindHost)
++	}
++}
++
++// TestSurguiManaged_NonLoopbackBindHostFailsBeforeListen proves an existing
++// settings file cannot make ordinary server startup expose the API: the
++// shared startup path must refuse before any listener is created, not merely
++// when the config validator is called directly.
++func TestSurguiManaged_NonLoopbackBindHostFailsBeforeListen(t *testing.T) {
++	for name, content := range map[string]string{
++		"all interfaces":    "[network]\nbind_host = '0.0.0.0'\n",
++		"private interface": "[network]\nbind_host = '192.168.1.10'\n",
++	} {
++		t.Run(name, func(t *testing.T) {
++			writeSettingsFile(t, content)
++			port, ln, err := bindServerListener(0)
++			if err == nil {
++				if ln != nil {
++					_ = ln.Close()
++				}
++				t.Fatalf("ordinary startup accepted %q and bound port %d; only loopback is allowed", content, port)
++			}
++			if ln != nil {
++				_ = ln.Close()
++				t.Fatalf("startup returned a listener despite rejecting %q", content)
++			}
++		})
++	}
++}
+--- a/internal/config/settings.go
++++ b/internal/config/settings.go
+@@ -26,8 +26,9 @@
+ var ErrCategoryExists = errors.New("category already exists")
+ 
+ const (
+-	// DefaultBindHost exposes the HTTP API on all interfaces.
+-	DefaultBindHost = "0.0.0.0"
++	// DefaultBindHost restricts the HTTP API to this machine. The Surgui
++	// bundle must never expose the daemon on a non-loopback interface.
++	DefaultBindHost = "127.0.0.1"
+ 	// LoopbackBindHost restricts the HTTP API to this machine.
+ 	LoopbackBindHost = "127.0.0.1"
+ )
+@@ -37,13 +38,13 @@
+ 	if !ok {
+ 		return fmt.Errorf("must be a string")
+ 	}
+-	// Local CLI commands and the browser extension always connect
+-	// through 127.0.0.1, so other addresses would lock them out.
+-	switch strings.TrimSpace(sVal) {
+-	case DefaultBindHost, LoopbackBindHost:
++	// Surgui bundles this daemon and only ever talks to it over loopback.
++	// Upstream's all-interfaces default is intentionally rejected so a
++	// settings edit cannot expose the API beyond this machine.
++	if strings.TrimSpace(sVal) == LoopbackBindHost {
+ 		return nil
+ 	}
+-	return fmt.Errorf("must be %s (all interfaces) or %s (this machine only)", DefaultBindHost, LoopbackBindHost)
++	return fmt.Errorf("must be %s (this machine only)", LoopbackBindHost)
+ }
+ 
+ // LoadBindHost reads network.bind_host for the server's bind decision. Unlike

@@ -198,6 +198,22 @@ function toSafeSpeed(value: unknown): number {
   return Math.min(JS_MAX_SAFE, n);
 }
 
+const KNOWN_PHASES: ReadonlySet<string> = new Set([
+  "queued",
+  "retrying",
+  "downloading",
+  "verifying",
+  "finalizing",
+  "unknown",
+]);
+
+function sanitizePhase(value: unknown): QueueItem["phase"] {
+  if (typeof value !== "string") return undefined;
+  const phase = value.trim();
+  if (phase.length === 0) return undefined;
+  return KNOWN_PHASES.has(phase) ? (phase as NonNullable<QueueItem["phase"]>) : "unknown";
+}
+
 function sanitizeItem(raw: unknown): QueueItem {
   const r = (raw ?? {}) as Record<string, unknown>;
   const statusRaw = typeof r.status === "string" ? r.status : "unknown";
@@ -205,6 +221,10 @@ function sanitizeItem(raw: unknown): QueueItem {
   const bytesTotal = toSafeNumber(r.bytesTotal);
   let bytesDone = toSafeNumber(r.bytesDone);
   if (bytesTotal > 0 && bytesDone > bytesTotal) bytesDone = bytesTotal;
+  // v0.13 lifecycle bits: absent on older daemons, so default to idle.
+  // Only the hookFailed bit survives; hook_error/hookError text, commands and
+  // secrets are never read into state.
+  const hookFailed = r.hookFailed === true || r.hook_failed === true;
   return {
     id: String(r.id ?? ""),
     name: String(r.name ?? "download"),
@@ -213,6 +233,10 @@ function sanitizeItem(raw: unknown): QueueItem {
     bytesTotal,
     speedBps: toSafeSpeed(r.speedBps),
     addedAt: toSafeNumber(r.addedAt),
+    phase: sanitizePhase(r.phase),
+    processing: r.processing === true,
+    processed: r.processed === true,
+    hookFailed,
   };
 }
 

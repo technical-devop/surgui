@@ -1,5 +1,7 @@
 export type DownloadStatus = "active" | "queued" | "pausing" | "paused" | "failed" | "completed" | "unknown";
 
+export type QueuePhase = "queued" | "retrying" | "downloading" | "verifying" | "finalizing" | "unknown";
+
 export interface QueueItem {
   id: string;
   name: string;
@@ -10,6 +12,14 @@ export interface QueueItem {
   speedBps: number;
   addedAt: number;
   error?: string;
+  /** Sanitized daemon phase; absent when an older daemon omits it. */
+  phase?: QueuePhase;
+  /** A post-download hook is running; never treat the row as Done while true. */
+  processing?: boolean;
+  /** A post-download hook has finished (successfully or not). */
+  processed?: boolean;
+  /** Only the failed bit is exposed; hook text/commands/secrets never cross IPC. */
+  hookFailed?: boolean;
 }
 
 export type StatusFilter = "all" | DownloadStatus;

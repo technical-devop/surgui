@@ -376,10 +376,10 @@ async fn managed_malformed_ca_fails_closed_and_redacts_secrets() {
     }
 }
 
-/// Upstream v0.12.4 regression: `/pause` acknowledges `pause_requested` and
+/// Upstream v0.13.0 regression: `/pause` acknowledges `pause_requested` and
 /// `/resume` acknowledges `resume_requested` (`cmd/http_api.go` at
-/// v0.12.4; v0.12.2 used `paused`/`resumed`). The client must accept the
-/// canonical v0.12.4 strings.
+/// v0.13.0; v0.12.2 used `paused`/`resumed`). The client must accept the
+/// canonical v0.13.0 strings.
 #[tokio::test]
 async fn control_download_accepts_v12_4_requested_acks() {
     use surge_desktop_lib::surge_client::ControlAction;
@@ -397,14 +397,14 @@ async fn control_download_accepts_v12_4_requested_acks() {
         client
             .control_download(action, FIXTURE_ID)
             .await
-            .expect("v0.12.4 requested ack must succeed");
+            .expect("v0.13.0 requested ack must succeed");
         let _ = server.join().expect("server thread panicked");
     }
 }
 
 /// Backward compatibility: the legacy v0.12.2 `paused`/`resumed`
 /// acknowledgments remain accepted so a mixed-version fleet does not break
-/// during the v0.12.4 upgrade window.
+/// during the v0.13.0 upgrade window.
 #[tokio::test]
 async fn control_download_accepts_legacy_v12_2_acks() {
     use surge_desktop_lib::surge_client::ControlAction;
@@ -469,9 +469,10 @@ async fn control_download_rejects_mismatched_ack_without_leaking_body() {
     }
 }
 
-/// Full Surge v0.12.4 `DownloadStatus` shape: signed eta (-1 = unknown),
-/// all carried fields, optional dest_path/rate_limit set, `error` omitted,
-/// plus unknown future fields that must be ignored.
+/// Full pre-v0.13 (v0.12.x) `DownloadStatus` shape: signed eta (-1 =
+/// unknown), all carried fields, optional dest_path/rate_limit set, `error`
+/// omitted, plus unknown future fields that must be ignored. The v0.13
+/// lifecycle fields are absent here on purpose.
 const FULL_SCHEMA_BODY: &str = r#"[{"id":"f-003","url":"https://dl.example.test/gamma.bin?sig=signed-secret-abc","filename":"gamma.bin","dest_path":"/downloads/gamma.bin","total_size":5242880,"downloaded":1048576,"progress":20.0,"speed":1048576.0,"status":"downloading","eta":-1,"connections":4,"added_at":1750000000,"time_taken":0,"avg_speed":0.0,"rate_limit":1048576,"rate_limit_set":true,"some_future_field":"future-value","another_future":123}]"#;
 
 const SECRET_DEBUG_BODY: &str = r#"[{"id":"f-003","url":"https://dl.example.test/gamma.bin?sig=signed-secret-abc","filename":"gamma-private.bin","dest_path":"/private/downloads/gamma-private.bin","total_size":5242880,"downloaded":1048576,"progress":20.0,"speed":1048576.0,"status":"downloading","eta":-1,"connections":4,"added_at":1750000000,"time_taken":0,"avg_speed":0.0,"rate_limit":1048576,"rate_limit_set":true,"error":"disk quota exceeded on private volume"}]"#;
@@ -488,6 +489,11 @@ async fn connect_parses_full_v12_schema_with_unknown_fields() {
     assert_eq!(parsed[0].rate_limit, Some(1048576));
     assert_eq!(parsed[0].rate_limit_set, Some(true));
     assert!(parsed[0].error.is_none());
+    // v0.13 fields are absent from the older schema and must default safely.
+    assert!(parsed[0].phase.is_none());
+    assert!(!parsed[0].processing);
+    assert!(!parsed[0].processed);
+    assert!(parsed[0].hook_error.is_none());
 
     let (base, server) = spawn_server("200 OK", FULL_SCHEMA_BODY);
     let outcome = SurgeClient::connect(&base, "test-token").await;
@@ -495,6 +501,89 @@ async fn connect_parses_full_v12_schema_with_unknown_fields() {
     let client = outcome.expect("full-schema /list must connect");
     assert_eq!(client.list_downloads().len(), 1);
     assert_eq!(client.list_downloads()[0].eta, -1);
+}
+
+/// Released v0.13.0 `/list` `DownloadStatus` shape while a post-download hook
+/// is running. Note that `completed_ranges` belongs to the `/events` stream
+/// only; `DownloadStatus` never emits it, so it is absent here.
+const V013_LIST_BODY: &str = r#"[{"id":"f-004","url":"https://dl.example.test/delta.bin","filename":"delta.bin","dest_path":"/downloads/delta.bin","total_size":5242880,"downloaded":5242880,"progress":100.0,"speed":0.0,"status":"completed","phase":"finalizing","eta":0,"connections":0,"added_at":1750000000,"time_taken":12,"avg_speed":436906.0,"processing":true,"processed":false}]"#;
+
+/// Released v0.13.0 `/list` shape after a post-download hook failed. The raw
+/// error can include a command line or secret-bearing URL; only the failure
+/// bit may cross IPC.
+const V013_HOOK_FAILURE_BODY: &str = r#"[{"id":"f-005","url":"https://dl.example.test/epsilon.bin","filename":"epsilon.bin","dest_path":"/downloads/epsilon.bin","total_size":5242880,"downloaded":5242880,"progress":100.0,"speed":0.0,"status":"completed","eta":0,"connections":0,"added_at":1750000000,"time_taken":12,"avg_speed":436906.0,"processing":false,"processed":true,"hook_error":"Post-download command failed: sh -c 'curl https://hooks.example.test/run?token=hook-secret-value' exited 1"}]"#;
+
+#[test]
+fn parses_v013_list_processing_fields_without_completed_ranges() {
+    let parsed: Vec<surge_desktop_lib::surge_client::Download> =
+        serde_json::from_str(V013_LIST_BODY).expect("v0.13.0 /list must parse");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].status, "completed");
+    assert_eq!(parsed[0].phase.as_deref(), Some("finalizing"));
+    assert!(parsed[0].processing);
+    assert!(!parsed[0].processed);
+    assert_eq!(parsed[0].total_size, 5242880);
+    assert_eq!(parsed[0].downloaded, 5242880);
+}
+
+#[tokio::test]
+async fn v013_list_exposes_processing_to_the_frontend() {
+    let (base, server) = spawn_server("200 OK", V013_LIST_BODY);
+    let items = surge_desktop_lib::commands::ConnectionManager::default()
+        .connect(&base, "fixture-token")
+        .await
+        .expect("connect");
+    let _ = server.join().expect("server thread panicked");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].status, "completed");
+    assert_eq!(items[0].phase, "finalizing");
+    assert!(items[0].processing);
+    assert!(!items[0].processed);
+    assert!(!items[0].hook_failed);
+}
+
+#[tokio::test]
+async fn v013_hook_failure_is_reduced_to_a_safe_flag() {
+    let parsed: Vec<surge_desktop_lib::surge_client::Download> =
+        serde_json::from_str(V013_HOOK_FAILURE_BODY).expect("failure /list must parse");
+    let debug = format!("{:?}", parsed[0]);
+    assert!(
+        !debug.contains("hook-secret-value") && !debug.contains("Post-download command failed"),
+        "Download Debug must not print the raw hook error"
+    );
+
+    let (base, server) = spawn_server("200 OK", V013_HOOK_FAILURE_BODY);
+    let items = surge_desktop_lib::commands::ConnectionManager::default()
+        .connect(&base, "fixture-token")
+        .await
+        .expect("connect");
+    let _ = server.join().expect("server thread panicked");
+
+    assert_eq!(items.len(), 1);
+    assert!(!items[0].processing);
+    assert!(items[0].processed);
+    assert!(items[0].hook_failed);
+    // No phase in this fixture (older shape with only the failure fields).
+    assert_eq!(items[0].phase, "completed");
+
+    let serialized = serde_json::to_string(&items).expect("queue items must serialize");
+    assert!(
+        serialized.contains("\"hookFailed\":true"),
+        "frontend needs the sanitized hook failure bit"
+    );
+    for marker in [
+        "hook-secret-value",
+        "Post-download command failed",
+        "curl",
+        "hook_error",
+        "hookError",
+    ] {
+        assert!(
+            !serialized.contains(marker),
+            "queue payload leaked raw hook failure text via {marker:?}"
+        );
+    }
 }
 
 fn spawn_chunked_server(
@@ -777,6 +866,12 @@ async fn connection_manager_connect_maps_queue_and_redacts_secrets() {
     assert!(items.len() == 1, "expected exactly one queue item");
     assert!(items[0].name == "file.iso", "queue item name mismatch");
     assert!(items[0].status == "active", "queue item status mismatch");
+    // Older daemons omit v0.13 phase/processing fields; they must default
+    // safely instead of breaking the schema.
+    assert_eq!(items[0].phase, "active", "absent phase fallback mismatch");
+    assert!(!items[0].processing);
+    assert!(!items[0].processed);
+    assert!(!items[0].hook_failed);
     assert!(items[0].bytes_done == 250, "queue item bytes_done mismatch");
     assert!(
         items[0].bytes_total == 1000,
@@ -792,6 +887,14 @@ async fn connection_manager_connect_maps_queue_and_redacts_secrets() {
     assert!(
         serialized.contains("\"speedBps\""),
         "queue payload must expose speedBps"
+    );
+    assert!(
+        serialized.contains("\"phase\"") && serialized.contains("\"processing\""),
+        "queue payload must expose sanitized lifecycle fields"
+    );
+    assert!(
+        serialized.contains("\"hookFailed\":false"),
+        "queue payload must expose the sanitized hook failure bit"
     );
     assert!(
         !serialized.contains("signed-secret"),
@@ -847,7 +950,7 @@ async fn connection_manager_list_downloads_requeries_daemon() {
     );
 }
 
-/// Sequential loopback helper for released v0.12.4 control routes.
+/// Sequential loopback helper for released v0.13.0 control routes.
 /// Serves `GET /list` then one authenticated control `POST`.
 /// Owns both `String` bodies; each accept is bounded by `accept_one`'s
 /// existing 5s deadline.
@@ -1147,7 +1250,7 @@ fn read_request_with_body(stream: &mut TcpStream) -> CapturedDownload {
     }
 }
 
-/// Sequential loopback helper for released Surge v0.12.4 `POST /download`.
+/// Sequential loopback helper for released Surge v0.13.0 `POST /download`.
 /// Serves `GET /list` then one authenticated `POST /download`.
 /// Each accept is bounded by `accept_one`'s existing 5s deadline.
 fn spawn_connect_then_download(

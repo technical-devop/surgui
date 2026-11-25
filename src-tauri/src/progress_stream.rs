@@ -1,14 +1,17 @@
 //! Truthful near-real-time queue progress from the pinned Surge `/events` SSE
 //! stream.
 //!
-//! The released Surge v0.12.4 daemon exposes an authenticated
+//! The released Surge v0.13.0 daemon exposes an authenticated
 //! `GET /events` endpoint returning `text/event-stream`. Progress frames arrive
 //! roughly every 150 ms carrying a flat JSON object with a numeric `type`
 //! (`1` = progress), `download_id`, and optional `downloaded`, `total` and
 //! `speed`. Zero values are omitted by Go's `omitempty`, so an absent numeric
-//! field means zero, not "keep the previous value". The stream has no replay,
-//! no heartbeat and no full queue metadata; an authoritative `/list` snapshot
-//! is still required for lifecycle/reconnect resynchronisation.
+//! field means zero, not "keep the previous value". v0.13.0 progress frames
+//! also carry chunk bitmaps, per-chunk progress and `completed_ranges`; those
+//! can make one JSON line large, so the frame/line bounds below cover the
+//! released daemon while unknown fields remain ignored. The stream has no
+//! replay, no heartbeat and no full queue metadata; an authoritative `/list`
+//! snapshot is still required for lifecycle/reconnect resynchronisation.
 //!
 //! This module only projects validated, sanitized values. Raw frames, headers,
 //! credentials and transport errors never leave it.
@@ -32,11 +35,24 @@ pub const LIFECYCLE_EVENT: &str = "surge://lifecycle";
 pub const STREAM_STATE_EVENT: &str = "surge://stream";
 
 /// Largest line accepted inside an SSE frame.
-const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+///
+/// v0.13.0 encodes the whole event JSON on one `data:` line. Large downloads
+/// include a chunk bitmap, a full per-chunk progress array and
+/// `completed_ranges`, so the old 64 KiB line / 256 KiB frame bounds were
+/// exceeded by valid released frames. 8 MiB per line/frame covers realistic
+/// default-chunk downloads (a 100 GiB alternating-chunk frame is ~1.4 MiB; a
+/// 500 GiB one is ~7.3 MiB); larger frames still fail closed and fall back to
+/// polling.
+const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// Largest accumulated `data:` payload for one event.
-const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
+const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Largest pending unparsed buffer.
-const MAX_SSE_BUFFER_BYTES: usize = MAX_SSE_FRAME_BYTES + MAX_SSE_LINE_BYTES;
+///
+/// `data:` payloads accumulate in `SseParser::data`, not here, so the pending
+/// line buffer only needs room for one maximum line plus a split CRLF
+/// terminator. Keeping it separate from the frame bound avoids retaining an
+/// unused 16 MiB while still accepting a complete maximum-size line.
+const MAX_SSE_BUFFER_BYTES: usize = MAX_SSE_LINE_BYTES + 2;
 /// Largest event name accepted from the SSE `event:` field.
 const MAX_SSE_EVENT_BYTES: usize = 1024;
 /// Largest download id projected to the renderer.
@@ -154,6 +170,10 @@ pub enum SseError {
 /// unknown fields are ignored per the SSE contract.
 pub struct SseParser {
     buffer: Vec<u8>,
+    /// Next buffer byte not yet inspected for a line terminator. Without this
+    /// cursor a large unterminated line is rescanned from the start on every
+    /// transport chunk, turning one 8 MiB line into quadratic CPU work.
+    scan: usize,
     event: Option<String>,
     data: Vec<u8>,
     has_data: bool,
@@ -169,6 +189,7 @@ impl SseParser {
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
+            scan: 0,
             event: None,
             data: Vec::new(),
             has_data: false,
@@ -197,7 +218,16 @@ impl SseParser {
                 return Ok(());
             }
             if self.buffer.len() > MAX_SSE_LINE_BYTES {
-                return Err(SseError::Oversized);
+                // A maximum-size line whose CRLF terminator is split across
+                // transport chunks legitimately buffers MAX + 1 bytes (content
+                // plus a trailing CR) while awaiting the LF. Anything else
+                // beyond MAX is an actual oversized line and stays rejected so
+                // the bound is not weakened.
+                if self.buffer.len() > MAX_SSE_LINE_BYTES + 1
+                    || self.buffer.last() != Some(&b'\r')
+                {
+                    return Err(SseError::Oversized);
+                }
             }
         }
         Ok(())
@@ -207,14 +237,52 @@ impl SseParser {
     where
         F: FnMut(SseFrame) -> bool,
     {
-        while let Some((line_end, consumed)) = find_line_end(&self.buffer) {
-            let line: Vec<u8> = self.buffer.drain(..line_end).collect();
-            self.buffer.drain(..consumed - line_end);
-            if !self.process_line(&line, emit)? {
-                return Ok(false);
-            }
+        if self.buffer.is_empty() {
+            self.scan = 0;
+            return Ok(true);
         }
-        Ok(true)
+
+        // Process every complete line in place, then compact the buffer once.
+        // This avoids both a per-line copy and a per-line memmove of the tail.
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let mut consumed = 0usize;
+        // Start of the current (possibly still-incomplete) line. This is not
+        // the same as `scan` after a partial line has already been inspected.
+        let mut line_start = 0usize;
+        let result = loop {
+            let current_start = line_start;
+            let (line_end, line_consumed) = match find_line_end(&buffer[self.scan..]) {
+                Some((line_end, line_consumed)) => {
+                    (self.scan + line_end, self.scan + line_consumed)
+                }
+                None => {
+                    // Everything available has been inspected. Keep a
+                    // trailing CR rescan point because it may be the first
+                    // half of a CRLF split across transport chunks.
+                    self.scan = if current_start < buffer.len() && buffer.last() == Some(&b'\r') {
+                        buffer.len().saturating_sub(1)
+                    } else {
+                        buffer.len()
+                    };
+                    break Ok(true);
+                }
+            };
+
+            consumed = line_consumed;
+            self.scan = line_consumed;
+            line_start = line_consumed;
+            match self.process_line(&buffer[current_start..line_end], emit) {
+                Ok(true) => {}
+                Ok(false) => break Ok(false),
+                Err(error) => break Err(error),
+            }
+        };
+        if consumed > 0 {
+            buffer.drain(..consumed);
+            self.scan = self.scan.saturating_sub(consumed);
+        }
+        self.buffer = buffer;
+        result
     }
 
     /// Flush a trailing unterminated line at EOF and dispatch any pending
@@ -226,6 +294,7 @@ impl SseParser {
     {
         if !self.buffer.is_empty() {
             let mut line = std::mem::take(&mut self.buffer);
+            self.scan = 0;
             if line.ends_with(b"\r") {
                 line.pop();
             }
@@ -233,6 +302,7 @@ impl SseParser {
                 return Ok(());
             }
         }
+        self.scan = 0;
         let _ = self.dispatch(&mut emit)?;
         Ok(())
     }
@@ -344,6 +414,17 @@ struct EventEnvelope {
     speed: Option<f64>,
     #[serde(default)]
     resync_required: Option<bool>,
+    /// v0.13.0 `EventSystem` lifecycle fields. They are only used to decide
+    /// whether the frontend should re-read the authoritative `/list` snapshot;
+    /// their values (especially `hook_error`) are never projected.
+    #[serde(default)]
+    processing: Option<bool>,
+    #[serde(default)]
+    moving: Option<bool>,
+    #[serde(default)]
+    hook_error: Option<String>,
+    #[serde(default)]
+    phase: Option<String>,
 }
 
 /// Validated action derived from one frame.
@@ -379,6 +460,21 @@ pub fn project_frame(frame: &SseFrame) -> Result<FrameAction, SseError> {
         11 => {
             if envelope.resync_required.unwrap_or(false) {
                 Ok(FrameAction::Resync)
+            } else if envelope.processing.is_some()
+                || envelope.moving.is_some()
+                || envelope
+                    .hook_error
+                    .as_deref()
+                    .is_some_and(|error| !error.is_empty())
+                || envelope
+                    .phase
+                    .as_deref()
+                    .is_some_and(|phase| !phase.is_empty())
+            {
+                // System events carry post-download processing/move and phase
+                // transitions. Re-read `/list` rather than forwarding the raw
+                // event (its hook error can contain command or secret text).
+                Ok(FrameAction::Lifecycle)
             } else {
                 Ok(FrameAction::Ignore)
             }
@@ -1000,16 +1096,149 @@ mod tests {
 
     #[test]
     fn parser_accepts_large_chunk_of_bounded_frames() {
-        let mut body = String::new();
-        for index in 0..12_000 {
-            body.push_str(&format!(
-                "event: progress\ndata: {{\"type\":1,\"download_id\":\"dl-{index}\"}}\n\n"
-            ));
-        }
+        // A single transport chunk larger than the pending buffer is split into
+        // bounded slices. Use large individual frames so the test also covers
+        // v0.13.0-sized lines without allocating hundreds of thousands of small
+        // frame structs.
+        let payload = "x".repeat(1024 * 1024);
+        let frame_text = format!("event: progress\ndata: {payload}\n\n");
+        let repeats = MAX_SSE_BUFFER_BYTES / frame_text.len() + 1;
+        let body = frame_text.repeat(repeats);
         assert!(body.len() > MAX_SSE_BUFFER_BYTES);
         let frames = collect(&[body.as_bytes()]).expect("large chunk");
-        assert_eq!(frames.len(), 12_000);
+        assert_eq!(frames.len(), repeats);
         assert_eq!(frames[0].event, "progress");
+        assert_eq!(frames[0].data.len(), payload.len());
+    }
+
+    #[test]
+    fn parser_does_not_rescan_a_large_partial_line() {
+        let mut parser = SseParser::new();
+        parser.push(b"data: ", |_| true).expect("prefix");
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..8 {
+            parser.push(&chunk, |_| true).expect("partial line");
+            // The cursor advances past every byte already inspected instead
+            // of restarting at the buffer front on each transport chunk.
+            assert_eq!(parser.scan, parser.buffer.len());
+            assert!(
+                parser.scan >= parser.buffer.len() - 1,
+                "scan cursor must not fall behind the uninspected tail"
+            );
+        }
+        assert!(parser.buffer.len() >= 8 * 64 * 1024);
+        assert!(parser.data.is_empty());
+
+        let mut frames = Vec::new();
+        parser
+            .push(b"\n\n", |frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("line terminator");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), 8 * 64 * 1024);
+        assert_eq!(parser.scan, 0);
+    }
+
+    #[test]
+    fn parser_accepts_a_line_exactly_at_the_bound() {
+        let prefix = b"data: ";
+        let payload_len = MAX_SSE_LINE_BYTES - prefix.len();
+        let mut line = Vec::with_capacity(MAX_SSE_LINE_BYTES + 2);
+        line.extend_from_slice(prefix);
+        line.resize(MAX_SSE_LINE_BYTES, b'x');
+        line.extend_from_slice(b"\n\n");
+        assert_eq!(payload_len, MAX_SSE_LINE_BYTES - prefix.len());
+
+        let mut frames = Vec::new();
+        let mut parser = SseParser::new();
+        parser
+            .push(&line, |frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("maximum-size line");
+        parser
+            .finish(|frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("finish");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), payload_len);
+    }
+
+    #[test]
+    fn parser_accepts_maximum_line_with_split_crlf() {
+        // Exact-size line (MAX_SSE_LINE_BYTES content bytes) whose CRLF
+        // terminator is split across transport chunks: content + CR in one
+        // chunk, LF + dispatch blank line in the next. The intermediate
+        // MAX + 1 buffer (content plus a trailing CR awaiting LF) must not
+        // be mistaken for an oversized line.
+        let prefix = b"data: ";
+        let payload_len = MAX_SSE_LINE_BYTES - prefix.len();
+        let mut content = Vec::with_capacity(MAX_SSE_LINE_BYTES);
+        content.extend_from_slice(prefix);
+        content.resize(MAX_SSE_LINE_BYTES, b'x');
+        assert_eq!(content.len(), MAX_SSE_LINE_BYTES);
+
+        let mut first = content.clone();
+        first.push(b'\r');
+        assert_eq!(first.len(), MAX_SSE_LINE_BYTES + 1);
+
+        let mut parser = SseParser::new();
+        let mut frames = Vec::new();
+        parser
+            .push(&first, |frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("maximum-size line with split CRLF must be accepted");
+        assert!(frames.is_empty(), "no complete line until LF arrives");
+        parser
+            .push(b"\n\n", |frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("split CRLF terminator");
+        parser
+            .finish(|frame| {
+                frames.push(frame);
+                true
+            })
+            .expect("finish");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), payload_len);
+    }
+
+    #[test]
+    fn parser_rejects_oversized_line_even_with_split_crlf() {
+        // One byte beyond the bound is still oversized even when the CRLF is
+        // split: the limit must not be weakened to accommodate the split case.
+        let mut oversized = vec![b'a'; MAX_SSE_LINE_BYTES + 1];
+        oversized.push(b'\r');
+        assert_eq!(oversized.len(), MAX_SSE_LINE_BYTES + 2);
+        let mut parser = SseParser::new();
+        assert_eq!(
+            parser.push(&oversized, |_| true),
+            Err(SseError::Oversized),
+            "MAX + 1 content plus split CR must stay rejected"
+        );
+
+        // Same bound delivered in two chunks: MAX content first (still
+        // incomplete, so accepted), then one more content byte proving the
+        // line is oversized once its CRLF arrives.
+        let mut parser = SseParser::new();
+        let prefix_chunk = vec![b'a'; MAX_SSE_LINE_BYTES];
+        parser
+            .push(&prefix_chunk, |_| true)
+            .expect("incomplete MAX line without terminator");
+        assert_eq!(
+            parser.push(b"a\r\n\n", |_| true),
+            Err(SseError::Oversized),
+            "MAX + 1 content must stay rejected with split terminator"
+        );
     }
 
     #[test]
@@ -1090,6 +1319,89 @@ mod tests {
             }
             other => panic!("expected progress, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_and_projection_accept_v013_completed_ranges_frame() {
+        // v0.13.0 progress frames can carry tens of thousands of ranges; this
+        // frame is well beyond the old 64 KiB line limit and must still be
+        // parsed while the unknown fields are ignored.
+        let mut ranges = String::from("[");
+        for index in 0..20_000 {
+            if index > 0 {
+                ranges.push(',');
+            }
+            ranges.push_str(&format!(
+                r#"{{"offset":{},"length":1048576}}"#,
+                (index as i64) * 2_097_152
+            ));
+        }
+        ranges.push(']');
+        let data = format!(
+            r#"{{"type":1,"download_id":"dl-1","downloaded":5,"total":10,"speed":1.5,"phase":"downloading","processing":false,"hook_error":"","completed_ranges":{ranges}}}"#
+        );
+        let frame_text = format!("event: progress\ndata: {data}\n\n");
+        assert!(frame_text.len() > 256 * 1024);
+        let frames = collect(&[frame_text.as_bytes()]).expect("v0.13.0 frame");
+        assert_eq!(frames.len(), 1);
+        match project_frame(&frames[0]).expect("projection") {
+            FrameAction::Progress(update) => {
+                assert_eq!(update.id, "dl-1");
+                assert_eq!(update.bytes_done, 5);
+                assert_eq!(update.bytes_total, 10);
+            }
+            other => panic!("expected progress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_ignores_v013_processing_and_hook_fields() {
+        match project_frame(&frame(
+            r#"{"type":1,"download_id":"dl-1","downloaded":5,"total":10,"speed":2.0,"processing":true,"processed":false,"hook_error":"post-download failed","phase":"finalizing","completed_ranges":null}"#,
+        ))
+        .expect("projection")
+        {
+            FrameAction::Progress(update) => {
+                assert_eq!(update.bytes_done, 5);
+                assert_eq!(update.bytes_total, 10);
+                assert_eq!(update.speed_bps, 2.0);
+            }
+            other => panic!("expected progress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_turns_v013_system_processing_into_lifecycle_reconcile() {
+        // Processing/move/hook/phase transitions change `/list` fields, so the
+        // frontend must re-read that snapshot. The raw hook error (which can
+        // carry a command or secrets) never enters the projected action.
+        for data in [
+            r#"{"type":11,"download_id":"dl-1","processing":true}"#,
+            r#"{"type":11,"download_id":"dl-1","processing":false}"#,
+            r#"{"type":11,"download_id":"dl-1","moving":true}"#,
+            r#"{"type":11,"download_id":"dl-1","hook_error":"Post-download command failed: secret"}"#,
+            r#"{"type":11,"download_id":"dl-1","phase":"verifying"}"#,
+        ] {
+            assert_eq!(
+                project_frame(&frame(data)).unwrap(),
+                FrameAction::Lifecycle,
+                "system lifecycle field must request reconciliation: {data}"
+            );
+        }
+        assert_eq!(
+            project_frame(&frame(
+                r#"{"type":11,"download_id":"dl-1","processing":null}"#
+            ))
+            .unwrap(),
+            FrameAction::Ignore
+        );
+        assert_eq!(
+            project_frame(&frame(
+                r#"{"type":11,"download_id":"dl-1","hook_error":""}"#
+            ))
+            .unwrap(),
+            FrameAction::Ignore
+        );
     }
 
     #[test]

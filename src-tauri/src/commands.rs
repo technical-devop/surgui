@@ -44,16 +44,28 @@ const MAX_DOWNLOAD_ID_BYTES: usize = 4 * 1024;
 
 /// Sanitized queue row sent to the frontend.
 ///
-/// Only the download id, display filename, normalized status, and numeric
-/// byte/speed metrics leave the process. The Surge `url` (may carry signed
-/// secrets), `dest_path` (private filesystem layout), and `error` (server
-/// text) are never projected. Field names cross the IPC boundary as camelCase.
+/// Only the download id, display filename, normalized status, sanitized
+/// lifecycle state, and numeric byte/speed metrics leave the process. The
+/// Surge `url` (may carry signed secrets), `dest_path` (private filesystem
+/// layout), `error` (server text), and `hook_error` (may contain a shell
+/// command or secret) are never projected. Field names cross the IPC boundary
+/// as camelCase.
 #[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueItemDto {
     pub id: String,
     pub name: String,
     pub status: String,
+    /// Sanitized daemon phase (`queued`, `retrying`, `downloading`,
+    /// `verifying`, `finalizing`, or `unknown`); falls back to the normalized
+    /// status for older daemons that do not emit `phase`.
+    pub phase: String,
+    /// A post-download hook is running.
+    pub processing: bool,
+    /// A post-download hook has finished (successfully or not).
+    pub processed: bool,
+    /// The hook failed. Only this bit is exposed; its error text is not.
+    pub hook_failed: bool,
     pub bytes_done: i64,
     pub bytes_total: i64,
     pub speed_bps: f64,
@@ -62,9 +74,12 @@ pub struct QueueItemDto {
 
 impl fmt::Debug for QueueItemDto {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // id and name can be user-controlled and status is server-controlled,
-        // so only the numeric metrics are safe to print.
+        // id and name can be user-controlled and status/phase are
+        // server-controlled, so only booleans and numeric metrics are safe.
         f.debug_struct("QueueItemDto")
+            .field("processing", &self.processing)
+            .field("processed", &self.processed)
+            .field("hook_failed", &self.hook_failed)
             .field("bytes_done", &self.bytes_done)
             .field("bytes_total", &self.bytes_total)
             .field("speed_bps", &self.speed_bps)
@@ -1889,6 +1904,13 @@ fn project_item(download: &Download) -> QueueItemDto {
         id: download.id.clone(),
         name: download.filename.clone(),
         status: map_status(&download.status).to_string(),
+        phase: map_phase(download.phase.as_deref(), &download.status),
+        processing: download.processing,
+        processed: download.processed,
+        hook_failed: download
+            .hook_error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty()),
         bytes_done,
         bytes_total,
         speed_bps: sanitize_speed(download.speed),
@@ -1914,13 +1936,28 @@ fn sanitize_speed(speed: f64) -> f64 {
 /// Explicit Surge status projection; anything unrecognized becomes `unknown`.
 fn map_status(status: &str) -> &'static str {
     match status {
-        "downloading" => "active",
+        "downloading" | "verifying" => "active",
         "queued" => "queued",
         "paused" => "paused",
         "completed" => "completed",
         "error" => "failed",
         "pausing" => "pausing",
         _ => "unknown",
+    }
+}
+
+/// Sanitize the v0.13.0 `phase` field. Older daemons omit it, so fall back to
+/// the already-normalized status (matching the released CLI). Unknown values
+/// become `unknown` rather than crossing IPC verbatim.
+fn map_phase(phase: Option<&str>, status: &str) -> String {
+    match phase.map(str::trim).filter(|phase| !phase.is_empty()) {
+        Some("queued") => "queued".to_string(),
+        Some("retrying") => "retrying".to_string(),
+        Some("downloading") => "downloading".to_string(),
+        Some("verifying") => "verifying".to_string(),
+        Some("finalizing") => "finalizing".to_string(),
+        Some(_) => "unknown".to_string(),
+        None => map_status(status).to_string(),
     }
 }
 
