@@ -682,6 +682,7 @@ mod windows {
         if !drive.is_ascii_alphabetic() {
             return Err(FileHashError::InvalidPath);
         }
+        let drive = char::from(drive).to_ascii_uppercase();
         if !matches!(components.next(), Some(Component::RootDir)) {
             return Err(FileHashError::InvalidPath);
         }
@@ -695,7 +696,7 @@ mod windows {
         if names.is_empty() {
             return Err(FileHashError::InvalidPath);
         }
-        Ok((drive.to_ascii_uppercase(), names))
+        Ok((drive, names))
     }
 
     fn validate_component(part: &OsStr) -> Result<Vec<u16>, FileHashError> {
@@ -1010,6 +1011,25 @@ mod windows {
             | STATUS_INVALID_PARAMETER => FileHashError::InvalidPath,
             STATUS_NOT_A_DIRECTORY | STATUS_FILE_IS_A_DIRECTORY => FileHashError::NotRegular,
             _ => FileHashError::Io,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_local_path_returns_uppercase_ascii_drive_char() {
+            let (drive, names) =
+                parse_local_path(Path::new(r"c:\Windows\win.ini")).expect("local drive path");
+            assert_eq!(drive, 'C');
+            assert_eq!(names.len(), 2);
+            assert_eq!(
+                parse_local_path(Path::new(r"Z:\temp\file.bin"))
+                    .expect("local drive path")
+                    .0,
+                'Z'
+            );
         }
     }
 }
