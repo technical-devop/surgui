@@ -1234,6 +1234,13 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn windows_rename_denied_by_open_handle(error: &std::io::Error) -> bool {
+        // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+        matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33))
+            || error.kind() == std::io::ErrorKind::PermissionDenied
+    }
+
+    #[cfg(windows)]
     fn windows_symlink_or_skip(
         link: &std::path::Path,
         target: &std::path::Path,
@@ -1677,23 +1684,50 @@ mod tests {
         std::fs::write(&file, &data).expect("write live file");
         let moved = root.join("ancestor-old");
 
+        let mut replaced_during_hash = false;
         let result = hash_file_with_hook(
             &file.to_string_lossy(),
             Some(data.len() as u64),
             &cancel(),
             |observed| {
-                std::fs::rename(&ancestor, &moved).expect("rename ancestor");
-                std::fs::create_dir(&ancestor).expect("create replacement ancestor");
-                std::fs::hard_link(moved.join("live.bin"), ancestor.join("live.bin"))
-                    .expect("hard-link the same file into the replacement ancestor");
                 assert_eq!(observed, file.as_path());
+                match std::fs::rename(&ancestor, &moved) {
+                    Ok(()) => {
+                        std::fs::create_dir(&ancestor).expect("create replacement ancestor");
+                        std::fs::hard_link(moved.join("live.bin"), ancestor.join("live.bin"))
+                            .expect("hard-link the same file into the replacement ancestor");
+                        replaced_during_hash = true;
+                    }
+                    Err(error) if windows_rename_denied_by_open_handle(&error) => {
+                        eprintln!(
+                            "rename of the open Windows ancestor was denied ({error}); \
+                             verifying the open handles are what pin it"
+                        );
+                    }
+                    Err(error) => panic!(
+                        "rename ancestor failed unexpectedly while hash handles were open: \
+                         {error} (os error {:?})",
+                        error.raw_os_error()
+                    ),
+                }
             },
         );
-        assert_eq!(
-            result,
-            Err(FileHashError::Changed),
-            "a replaced Windows ancestor must fail even when the final file object is unchanged"
-        );
+
+        if replaced_during_hash {
+            assert_eq!(
+                result,
+                Err(FileHashError::Changed),
+                "a replaced Windows ancestor must fail even when the final file object is unchanged"
+            );
+        } else {
+            let digests = result
+                .expect("hash must succeed when Windows denied renaming the still-open ancestor");
+            assert_eq!(digests.size, data.len() as u64);
+            std::fs::rename(&ancestor, &moved).expect(
+                "the ancestor must be renameable after all hash handles close; otherwise the \
+                 earlier denial was not caused by those handles",
+            );
+        }
         remove_all_best_effort(&root);
     }
 
