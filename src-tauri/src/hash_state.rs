@@ -1863,10 +1863,10 @@ mod tests {
             panic!("namespace must be created");
         };
         assert!(valid_namespace(&namespace));
-        let path = root.join(HASH_NAMESPACE_FILE);
-        let metadata = std::fs::symlink_metadata(&path).expect("namespace file");
         #[cfg(unix)]
         {
+            let path = root.join(HASH_NAMESPACE_FILE);
+            let metadata = std::fs::symlink_metadata(&path).expect("namespace file");
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }

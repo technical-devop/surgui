@@ -836,7 +836,7 @@ impl HashCoordinator {
         Ok(slot.store.default_enabled())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn record_intents(&self, intents: &[HashIntent]) -> Result<(), BridgeError> {
         self.record_intents_with(intents, &[]).map(|_| ())
     }
@@ -1441,6 +1441,7 @@ struct VerifiedPauseArmed {
 
 #[cfg(test)]
 impl VerifiedPause {
+    #[cfg(target_os = "linux")]
     fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (entered, entered_rx) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
@@ -1455,6 +1456,7 @@ impl VerifiedPause {
         (entered_rx, release)
     }
 
+    #[cfg(target_os = "linux")]
     fn clear(&self) {
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
