@@ -1,4 +1,7 @@
+pub mod automatic_hash;
 pub mod commands;
+pub mod file_hash;
+pub mod hash_state;
 pub mod managed_identity;
 pub mod managed_process;
 pub mod managed_server;
@@ -28,6 +31,12 @@ pub fn run() {
             commands::control_download,
             commands::bulk_control,
             commands::add_download,
+            commands::add_download_with_options,
+            commands::get_automatic_hash_settings,
+            commands::set_automatic_hash_default,
+            commands::set_download_hash_intents,
+            commands::get_download_hashes,
+            commands::refresh_download_hashes,
             commands::list_downloads_snapshot,
             commands::start_progress_stream
         ])

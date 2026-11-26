@@ -63,3 +63,14 @@ export interface BulkUncertainty {
   action: BulkAction;
   message: string;
 }
+
+/**
+ * Persistent, redacted warning for an accepted queued download whose hash
+ * request could not be confirmed as saved. It survives reconnect, is dismissed
+ * individually, and never triggers a retry of the accepted download.
+ */
+export interface HashIntentWarning {
+  /** Locally generated monotonic id; never a daemon/server identifier. */
+  id: number;
+  message: string;
+}

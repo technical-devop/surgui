@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::path::BaseDirectory;
 use tauri::Emitter as _;
 use tauri::Manager as _;
 
+use crate::automatic_hash::{self, HashWorkError};
+use crate::hash_state::{DownloadHashDto, HashIntent, HashStore};
 use crate::managed_server::{ManagedServer, OwnerLifetime, DEFAULT_STARTUP_TIMEOUT};
 use crate::open_location::{
     self, LocationError, LocationLaunch, LocationLauncher, SystemLocationLauncher,
@@ -110,6 +112,45 @@ impl fmt::Debug for QueueSnapshotDto {
             .field("epoch", &self.epoch)
             .field("stream_seq", &self.stream_seq)
             .field("item_count", &self.items.len())
+            .finish()
+    }
+}
+
+/// App-wide automatic-hash preference. The first-run value is `false`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomaticHashSettingsDto {
+    pub default_enabled: bool,
+}
+
+/// One UI-supplied hash binding for a positively acknowledged download id.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HashIntentInput {
+    pub id: String,
+    pub enabled: bool,
+}
+
+/// Result of one `POST /download` with the confirmed queued id preserved.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddReceiptDto {
+    pub status: AddOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// `Some(true)` only when a durable hash intent was confirmed written for
+    /// the accepted queued id. `Some(false)` means the daemon accepted the add
+    /// but the intent write failed, so the file will not be auto-hashed unless
+    /// the UI explicitly rebinds the id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_recorded: Option<bool>,
+}
+
+impl fmt::Debug for AddReceiptDto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AddReceiptDto")
+            .field("status", &self.status)
+            .field("has_id", &self.id.is_some())
             .finish()
     }
 }
@@ -523,6 +564,7 @@ struct RateWriter {
 /// Atomically captured managed writer target. The epoch and pid must still
 /// match when the operation finishes (success or failure) before any result is
 /// allowed to surface as current.
+#[derive(Clone)]
 struct ManagedRateSnapshot {
     client: Arc<SurgeClient>,
     epoch: u64,
@@ -678,6 +720,456 @@ impl Drop for LocationLaunchPermit {
     }
 }
 
+const AUTOMATIC_HASH_FILE: &str = "automatic-hash.json";
+
+fn new_hash_connection_id() -> String {
+    let mut raw = [0u8; 16];
+    if getrandom::fill(&mut raw).is_ok() {
+        let mut out = String::with_capacity(32);
+        for byte in raw {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        return out;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("fallback-{:x}-{:x}", now.as_nanos(), std::process::id())
+}
+
+struct HashSlot {
+    path: Option<PathBuf>,
+    loaded: bool,
+    namespace: Option<String>,
+    store: HashStore,
+}
+
+impl Default for HashSlot {
+    fn default() -> Self {
+        Self {
+            path: None,
+            loaded: false,
+            namespace: None,
+            store: HashStore::load(None),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HashCoordinator {
+    slot: Mutex<HashSlot>,
+    worker: Mutex<HashWorkerState>,
+}
+
+#[derive(Default)]
+struct HashWorkerState {
+    running: bool,
+    dirty: bool,
+    token: Option<Arc<AtomicBool>>,
+}
+
+impl HashCoordinator {
+    fn lock_slot(&self) -> std::sync::MutexGuard<'_, HashSlot> {
+        match self.slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn lock_worker(&self) -> std::sync::MutexGuard<'_, HashWorkerState> {
+        match self.worker.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn ensure_loaded(&self, directory: &Path) -> Result<(), BridgeError> {
+        let path = directory.join(AUTOMATIC_HASH_FILE);
+        let namespace = crate::hash_state::prepare_namespace(directory);
+        let mut slot = self.lock_slot();
+        if slot.loaded
+            && slot.path.as_ref() == Some(&path)
+            && namespace.namespace.is_some()
+            && slot.namespace == namespace.namespace
+        {
+            return Ok(());
+        }
+        let mut store = HashStore::load(Some(path.clone()));
+        store.set_fence(slot.store.fence().wrapping_add(1));
+        // Records from a different (or missing/malformed) namespace can never
+        // be proven to belong to this owned queue, so fail closed before any
+        // result can be served or resumed.
+        let _ = store.invalidate_unprovable(namespace.namespace.as_deref());
+        slot.namespace = namespace.namespace;
+        slot.store = store;
+        slot.path = Some(path);
+        slot.loaded = true;
+        Ok(())
+    }
+
+    fn namespace(&self) -> Option<String> {
+        let slot = self.lock_slot();
+        slot.namespace.clone()
+    }
+
+    fn fence(&self) -> u64 {
+        let slot = self.lock_slot();
+        slot.store.fence()
+    }
+
+    fn default_enabled(&self) -> Result<bool, BridgeError> {
+        let slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        Ok(slot.store.default_enabled())
+    }
+
+    fn set_default_enabled(&self, enabled: bool) -> Result<bool, BridgeError> {
+        let mut slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        slot.store
+            .set_default_enabled(enabled)
+            .map_err(|_| BridgeError::State)?;
+        Ok(slot.store.default_enabled())
+    }
+
+    #[cfg(test)]
+    fn record_intents(&self, intents: &[HashIntent]) -> Result<(), BridgeError> {
+        self.record_intents_with(intents, &[]).map(|_| ())
+    }
+
+    fn record_intents_with(
+        &self,
+        intents: &[HashIntent],
+        provenance: &[(String, crate::hash_state::HashProvenance)],
+    ) -> Result<crate::hash_state::ReconcileCohort, BridgeError> {
+        let mut slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        slot.store
+            .record_intents_with(intents, provenance)
+            .map_err(|_| BridgeError::State)
+    }
+
+    fn visible(&self, namespace: Option<&str>) -> Vec<DownloadHashDto> {
+        let slot = self.lock_slot();
+        namespace
+            .map(|value| slot.store.visible(value))
+            .unwrap_or_default()
+    }
+
+    fn candidates(&self, namespace: &str) -> Vec<crate::hash_state::HashCandidate> {
+        let slot = self.lock_slot();
+        slot.store.candidates(namespace)
+    }
+
+    fn reconcile_cohort(&self) -> crate::hash_state::ReconcileCohort {
+        let slot = self.lock_slot();
+        slot.store.reconcile_cohort()
+    }
+
+    fn reconcile_cohort_and_candidates(
+        &self,
+        namespace: &str,
+        items: &[crate::hash_state::QueueItemIdentity],
+        cohort: &crate::hash_state::ReconcileCohort,
+    ) -> Result<Vec<crate::hash_state::HashCandidate>, BridgeError> {
+        let mut slot = self.lock_slot();
+        slot.store
+            .reconcile_cohort_and_candidates(namespace, items, cohort)
+            .map_err(|_| BridgeError::State)
+    }
+
+    fn completed_for(&self, namespace: &str) -> Vec<crate::hash_state::CompletedHash> {
+        let slot = self.lock_slot();
+        slot.store.completed_for(namespace)
+    }
+
+    fn visible_verified(
+        &self,
+        namespace: &str,
+        verified: &[crate::hash_state::CompletedHash],
+        fence: u64,
+    ) -> Option<Vec<DownloadHashDto>> {
+        let slot = self.lock_slot();
+        slot.store.visible_verified(namespace, verified, fence)
+    }
+
+    fn mark_complete(
+        &self,
+        id: &str,
+        generation: u64,
+        fence: u64,
+        completed: crate::hash_state::HashCompleted,
+    ) -> Result<bool, BridgeError> {
+        let mut slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        slot.store
+            .mark_complete(id, generation, fence, completed)
+            .map_err(|_| BridgeError::State)
+    }
+
+    fn mark_failed(&self, id: &str, generation: u64, fence: u64) -> Result<bool, BridgeError> {
+        let mut slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        slot.store
+            .mark_failed(id, generation, fence)
+            .map_err(|_| BridgeError::State)
+    }
+
+    fn mark_unavailable(&self, id: &str, generation: u64, fence: u64) -> Result<bool, BridgeError> {
+        let mut slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        slot.store
+            .mark_unavailable(id, generation, fence)
+            .map_err(|_| BridgeError::State)
+    }
+
+    fn mark_stale(&self, id: &str, generation: u64, fence: u64) -> Result<bool, BridgeError> {
+        let mut slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        slot.store
+            .mark_stale(id, generation, fence)
+            .map_err(|_| BridgeError::State)
+    }
+
+    fn invalidate_completed(
+        &self,
+        expected: &crate::hash_state::CompletedHash,
+        fence: u64,
+    ) -> Result<bool, BridgeError> {
+        let mut slot = self.lock_slot();
+        if !slot.loaded {
+            return Err(BridgeError::State);
+        }
+        slot.store
+            .invalidate_completed(expected, fence)
+            .map_err(|_| BridgeError::State)
+    }
+
+    fn cancel_current(&self) {
+        {
+            let worker = self.lock_worker();
+            if let Some(token) = worker.token.as_ref() {
+                token.store(true, Ordering::SeqCst);
+            }
+        }
+        // A lifecycle change must immediately fence results from the previous
+        // managed connection, even if the old worker has not observed its
+        // cancellation token yet. This fence is intentionally not persisted.
+        self.lock_slot().store.fence_in_flight();
+    }
+
+    /// Start the single worker or coalesce with the running one. A new token is
+    /// created only when no worker owns the slot.
+    fn start_worker(&self) -> Option<Arc<AtomicBool>> {
+        let mut worker = self.lock_worker();
+        if worker.running {
+            worker.dirty = true;
+            return None;
+        }
+        worker.running = true;
+        worker.dirty = false;
+        let token = Arc::new(AtomicBool::new(false));
+        worker.token = Some(Arc::clone(&token));
+        Some(token)
+    }
+
+    /// Release the worker slot, replacing a cancelled token with a fresh one
+    /// when a trigger raced the exit. This is what lets pending work survive a
+    /// connection switch instead of being dropped with the old token.
+    fn finish_worker(
+        &self,
+        token: &Arc<AtomicBool>,
+        allow_respawn: bool,
+    ) -> Option<Arc<AtomicBool>> {
+        let mut worker = self.lock_worker();
+        worker.running = false;
+        if worker
+            .token
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            worker.token = None;
+        }
+        if !allow_respawn || !worker.dirty {
+            worker.dirty = false;
+            return None;
+        }
+        worker.dirty = false;
+        worker.running = true;
+        let next = Arc::new(AtomicBool::new(false));
+        worker.token = Some(Arc::clone(&next));
+        Some(next)
+    }
+
+    /// Consume the dirty flag set by a concurrent trigger.
+    fn take_dirty(&self) -> bool {
+        let mut worker = self.lock_worker();
+        std::mem::take(&mut worker.dirty)
+    }
+}
+
+fn spawn_hash_worker(
+    state: Arc<Mutex<ConnectionState>>,
+    lifecycle: Arc<ManagedLifecycle>,
+    hashes: Arc<HashCoordinator>,
+    token: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        'worker: loop {
+            // Check cancellation before consuming the dirty flag. A trigger
+            // that raced cancellation must survive into `finish_worker`, which
+            // restarts with a fresh token.
+            if token.load(Ordering::SeqCst) || lifecycle.is_shutting_down() {
+                break 'worker;
+            }
+            let _ = hashes.take_dirty();
+            let snapshot = {
+                let state = match state.lock() {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.managed_rate_snapshot()
+            };
+            let Ok(snapshot) = snapshot else {
+                break 'worker;
+            };
+            let Some(namespace) = hashes.namespace() else {
+                break 'worker;
+            };
+            // Capture the exact cohort before the snapshot request starts.
+            // A record accepted or modified while `/list` is in flight must
+            // never be invalidated by that older response.
+            let cohort = hashes.reconcile_cohort();
+            let candidates = if !cohort.is_empty() {
+                // Revalidate only that cohort against the fresh authenticated
+                // owned-daemon queue before retaining/resuming it.
+                let Ok(downloads) = snapshot.client.refresh().await else {
+                    break 'worker;
+                };
+                let current = {
+                    let state = match state.lock() {
+                        Ok(state) => state,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    !state.shutting_down && state.rate_write_is_current(&snapshot)
+                };
+                if !current {
+                    break 'worker;
+                }
+                let items: Vec<_> = downloads
+                    .iter()
+                    .map(crate::hash_state::QueueItemIdentity::from_download)
+                    .collect();
+                match hashes.reconcile_cohort_and_candidates(&namespace, &items, &cohort) {
+                    Ok(candidates) => candidates,
+                    Err(_) => break 'worker,
+                }
+            } else {
+                hashes.candidates(&namespace)
+            };
+            if candidates.is_empty() {
+                if hashes.take_dirty() {
+                    continue 'worker;
+                }
+                break 'worker;
+            }
+            for candidate in candidates {
+                if token.load(Ordering::SeqCst) || lifecycle.is_shutting_down() {
+                    break 'worker;
+                }
+                let check_state = Arc::clone(&state);
+                let check_token = Arc::clone(&token);
+                let check_snapshot = snapshot.clone();
+                let current = move || {
+                    if check_token.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    match check_state.lock() {
+                        Ok(state) => {
+                            !state.shutting_down && state.rate_write_is_current(&check_snapshot)
+                        }
+                        Err(_) => false,
+                    }
+                };
+                match automatic_hash::hash_one(
+                    &snapshot.client,
+                    &candidate.id,
+                    candidate.added_at,
+                    &candidate.fingerprint,
+                    &token,
+                    current,
+                )
+                .await
+                {
+                    Ok(automatic_hash::HashOneOutcome::Completed(completed)) => {
+                        if hashes
+                            .mark_complete(
+                                &candidate.id,
+                                candidate.generation,
+                                candidate.fence,
+                                completed,
+                            )
+                            .is_err()
+                        {
+                            break 'worker;
+                        }
+                    }
+                    Ok(automatic_hash::HashOneOutcome::Pending) => {}
+                    Ok(automatic_hash::HashOneOutcome::Failed) => {
+                        if hashes
+                            .mark_failed(&candidate.id, candidate.generation, candidate.fence)
+                            .is_err()
+                        {
+                            break 'worker;
+                        }
+                    }
+                    Ok(automatic_hash::HashOneOutcome::Unavailable) => {
+                        if hashes
+                            .mark_unavailable(&candidate.id, candidate.generation, candidate.fence)
+                            .is_err()
+                        {
+                            break 'worker;
+                        }
+                    }
+                    Ok(automatic_hash::HashOneOutcome::Stale) => {
+                        if hashes
+                            .mark_stale(&candidate.id, candidate.generation, candidate.fence)
+                            .is_err()
+                        {
+                            break 'worker;
+                        }
+                    }
+                    Ok(automatic_hash::HashOneOutcome::Cancelled)
+                    | Err(HashWorkError::Daemon)
+                    | Err(HashWorkError::Internal) => break 'worker,
+                }
+            }
+            if hashes.take_dirty() {
+                continue 'worker;
+            }
+            break 'worker;
+        }
+
+        if let Some(next) = hashes.finish_worker(&token, !lifecycle.is_shutting_down()) {
+            spawn_hash_worker(state, lifecycle, hashes, next);
+        }
+    });
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct TestManagedConnection {
@@ -696,6 +1188,7 @@ struct ConnectionState {
     managed: Option<ManagedServer>,
     #[cfg(test)]
     test_managed: Option<TestManagedConnection>,
+    hash_connection_id: Option<String>,
     active: ActiveConnection,
 }
 
@@ -744,6 +1237,28 @@ impl ConnectionState {
         })
     }
 
+    fn hash_daemon_binding(&self) -> Option<crate::hash_state::DaemonBinding> {
+        if self.active != ActiveConnection::Managed {
+            return None;
+        }
+        let connection_id = self.hash_connection_id.clone()?;
+        #[cfg(test)]
+        if let Some(test) = self.test_managed.as_ref() {
+            return Some(crate::hash_state::DaemonBinding {
+                connection_id,
+                daemon_pid: test.pid,
+            });
+        }
+        let server = self.managed.as_ref()?;
+        if server.has_exited() {
+            return None;
+        }
+        Some(crate::hash_state::DaemonBinding {
+            connection_id,
+            daemon_pid: server.pid(),
+        })
+    }
+
     fn managed_location_snapshot(&self) -> Result<ManagedRateSnapshot, BridgeError> {
         if self.active == ActiveConnection::Manual {
             return Err(BridgeError::ManagedConnectionRequired);
@@ -774,6 +1289,7 @@ impl ConnectionState {
 
     fn clear_active(&mut self) {
         self.manual = None;
+        self.hash_connection_id = None;
         self.active = ActiveConnection::None;
         #[cfg(test)]
         {
@@ -911,6 +1427,56 @@ impl Drop for ManagedStartGuard {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct VerifiedPause {
+    inner: std::sync::Mutex<Option<VerifiedPauseArmed>>,
+}
+
+#[cfg(test)]
+struct VerifiedPauseArmed {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl VerifiedPause {
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *inner = Some(VerifiedPauseArmed {
+            entered,
+            release: release_rx,
+        });
+        (entered_rx, release)
+    }
+
+    fn clear(&self) {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *inner = None;
+    }
+
+    fn wait(&self) {
+        let inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(pause) = inner.as_ref() {
+            let _ = pause.entered.send(());
+            let _ = pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }
+}
+
 /// Owns the single active Surge connection and, once started, the single
 /// owned managed daemon.
 ///
@@ -930,6 +1496,11 @@ pub struct ConnectionManager {
     settings_writer: Arc<SettingsWriteGate>,
     location_validation: Arc<LocationValidationGate>,
     location_launch: Arc<LocationLaunchGate>,
+    hashes: Arc<HashCoordinator>,
+    #[cfg(test)]
+    verified_pause: VerifiedPause,
+    #[cfg(test)]
+    record_intents_pause: VerifiedPause,
 }
 
 impl fmt::Debug for ConnectionManager {
@@ -959,9 +1530,10 @@ impl ConnectionManager {
         endpoint: &str,
         token: &str,
     ) -> Result<Vec<QueueItemDto>, BridgeError> {
-        // A replacement connection must never leave the previous stream task
-        // reading (or emitting) in the background.
+        // A replacement connection must never leave the previous stream or
+        // hash worker reading from the superseded daemon.
         self.progress.stop();
+        self.hashes.cancel_current();
         // Hold the lifecycle operation only across taking and retiring the old
         // daemon. If app shutdown has already started, the shutdown path owns
         // any remaining server.
@@ -1028,6 +1600,7 @@ impl ConnectionManager {
         &self,
     ) -> Result<(ManagedStartTicket, Option<ManagedServer>), ManagedError> {
         self.progress.stop();
+        self.hashes.cancel_current();
         let mut state = self.state.lock().map_err(|_| ManagedError::State)?;
         state.begin_managed_start()
     }
@@ -1148,6 +1721,7 @@ impl ConnectionManager {
         {
             state.test_managed = None;
         }
+        state.hash_connection_id = Some(new_hash_connection_id());
         state.active = ActiveConnection::Managed;
         drop(state);
         Ok(cached)
@@ -1169,6 +1743,7 @@ impl ConnectionManager {
         // sees `shutting_down` before finishing or gets cancelled below.
         self.lifecycle.begin_shutdown();
         self.progress.stop();
+        self.hashes.cancel_current();
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -1536,6 +2111,332 @@ impl ConnectionManager {
         Ok(outcome)
     }
 
+    /// Load the persistent automatic-hash state from the app-private managed
+    /// state directory. Missing state starts with the default disabled.
+    fn ensure_hash_state(&self, app: &tauri::AppHandle) -> Result<(), BridgeError> {
+        let directory = resolve_managed_state_dir(app).map_err(|_| BridgeError::State)?;
+        self.hashes.ensure_loaded(&directory)
+    }
+
+    /// Start or coalesce the single bounded hashing worker.
+    fn trigger_hashing(&self) {
+        let hashes = Arc::clone(&self.hashes);
+        let Some(token) = hashes.start_worker() else {
+            return;
+        };
+        spawn_hash_worker(
+            Arc::clone(&self.state),
+            Arc::clone(&self.lifecycle),
+            hashes,
+            token,
+        );
+    }
+
+    fn current_hash_namespace(&self) -> Option<String> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.active != ActiveConnection::Managed {
+            return None;
+        }
+        self.hashes.namespace()
+    }
+
+    /// Enqueue a download and, only for a confirmed accepted id, persist the
+    /// per-download hash intent before triggering the worker.
+    ///
+    /// The intent is bound to the stable per-owned-queue namespace and to the
+    /// authoritative `added_at`/queue-fingerprint provenance read back for the
+    /// acknowledged id. If that association cannot be proven, nothing is
+    /// recorded and `hash_recorded` is false rather than guessing.
+    /// A crash between acceptance and the intent write can lose the intent; no
+    /// retry or exactly-once claim is made.
+    pub async fn add_download_with_options(
+        &self,
+        url: &str,
+        hash: bool,
+    ) -> Result<AddReceiptDto, BridgeError> {
+        let (client, epoch) = self.acquire_active()?;
+        let receipt = client.add_download_receipt(url).await?;
+
+        let binding = {
+            let state = self.state.lock().map_err(|_| BridgeError::State)?;
+            if state.epoch != epoch {
+                return Err(BridgeError::Superseded);
+            }
+            state.hash_daemon_binding()
+        };
+
+        let mut hash_recorded = None;
+        if hash {
+            let Some(id) = receipt.id.as_deref() else {
+                self.trigger_hashing();
+                return Ok(AddReceiptDto {
+                    status: receipt.outcome,
+                    id: receipt.id,
+                    hash_recorded,
+                });
+            };
+            let recorded = match binding {
+                Some(binding) => match client.get_download(id).await {
+                    Ok(download) => {
+                        let current = {
+                            let state = self.state.lock().map_err(|_| BridgeError::State)?;
+                            state.epoch == epoch
+                                && state.hash_daemon_binding().as_ref() == Some(&binding)
+                        };
+                        if current {
+                            match self.hashes.namespace() {
+                                Some(namespace) => {
+                                    let provenance = crate::hash_state::HashProvenance {
+                                        namespace,
+                                        added_at: download.added_at,
+                                        fingerprint: crate::hash_state::queue_fingerprint(
+                                            &download.id,
+                                            download.added_at,
+                                            &download.url,
+                                        ),
+                                    };
+                                    self.hashes
+                                        .record_intents_with(
+                                            &[HashIntent {
+                                                id: id.to_owned(),
+                                                enabled: true,
+                                            }],
+                                            &[(id.to_owned(), provenance)],
+                                        )
+                                        .is_ok()
+                                }
+                                None => false,
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    Err(_) => false,
+                },
+                None => false,
+            };
+            hash_recorded = Some(recorded);
+        }
+        self.trigger_hashing();
+        Ok(AddReceiptDto {
+            status: receipt.outcome,
+            id: receipt.id,
+            hash_recorded,
+        })
+    }
+
+    pub fn automatic_hash_default(&self) -> Result<bool, BridgeError> {
+        self.hashes.default_enabled()
+    }
+
+    pub fn set_automatic_hash_default(&self, enabled: bool) -> Result<bool, BridgeError> {
+        self.hashes.set_default_enabled(enabled)
+    }
+
+    /// Bind UI toggles to the current daemon and the authoritative queue
+    /// records. Enabled ids that cannot be matched uniquely are retained only
+    /// as fail-closed rows (the worker reconciles them to stale), never guessed.
+    pub(crate) async fn record_hash_intents(
+        &self,
+        intents: &[HashIntent],
+    ) -> Result<Vec<DownloadHashDto>, BridgeError> {
+        // Only records that existed before this snapshot request may be
+        // reconciled by its response. Intents recorded by this call are added
+        // to the cohort explicitly below so they can still fail closed.
+        let preexisting = self.hashes.reconcile_cohort();
+        let snapshot = {
+            let state = self.state.lock().map_err(|_| BridgeError::State)?;
+            state.managed_rate_snapshot()?
+        };
+        let downloads = snapshot.client.refresh().await?;
+        let current = {
+            let state = self.state.lock().map_err(|_| BridgeError::State)?;
+            state.rate_write_is_current(&snapshot)
+        };
+        if !current {
+            return Err(BridgeError::Superseded);
+        }
+        let namespace = self.hashes.namespace();
+        let mut provenance = Vec::new();
+        if let Some(namespace) = namespace.as_deref() {
+            for intent in intents.iter().filter(|intent| intent.enabled) {
+                let mut matches = downloads.iter().filter(|download| download.id == intent.id);
+                let Some(download) = matches.next() else {
+                    continue;
+                };
+                if matches.next().is_some() {
+                    continue;
+                }
+                provenance.push((
+                    intent.id.clone(),
+                    crate::hash_state::HashProvenance {
+                        namespace: namespace.to_owned(),
+                        added_at: download.added_at,
+                        fingerprint: crate::hash_state::queue_fingerprint(
+                            &download.id,
+                            download.added_at,
+                            &download.url,
+                        ),
+                    },
+                ));
+            }
+        }
+        let written = self.hashes.record_intents_with(intents, &provenance)?;
+        #[cfg(test)]
+        self.record_intents_pause.wait();
+        // Unprovable enabled intents must not remain pending forever, while a
+        // concurrent record must not be staled by this older snapshot. The
+        // write returned its exact identities+generations, so a replacement
+        // recorded after the write is never included in this cohort.
+        if let Some(namespace) = namespace {
+            let mut cohort = preexisting;
+            cohort.extend(written);
+            let items: Vec<_> = downloads
+                .iter()
+                .map(crate::hash_state::QueueItemIdentity::from_download)
+                .collect();
+            let _ = self
+                .hashes
+                .reconcile_cohort_and_candidates(&namespace, &items, &cohort);
+        }
+        self.trigger_hashing();
+        // Never return persisted complete digests without the verified serve
+        // path; this also covers existing rows the caller did not mention.
+        Ok(self.verified_download_hashes().await)
+    }
+
+    pub fn download_hashes(&self) -> Vec<DownloadHashDto> {
+        let namespace = self.current_hash_namespace();
+        self.hashes.visible(namespace.as_deref())
+    }
+
+    /// Serve only digests whose authoritative queue record and exact file
+    /// identity still match. Any missing, replaced, modified or ambiguous
+    /// record is invalidated before the rows are returned; if the daemon
+    /// cannot be queried, no completed digest is served.
+    pub async fn verified_download_hashes(&self) -> Vec<DownloadHashDto> {
+        let snapshot = {
+            let state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.managed_rate_snapshot()
+        };
+        let Ok(snapshot) = snapshot else {
+            return Vec::new();
+        };
+        // Capture the exact completed cohort and fence before the network
+        // request. A completion persisted while the older `/list` is still in
+        // flight must not be reconciled against (or invalidated by) it.
+        let Some(namespace) = self.hashes.namespace() else {
+            return Vec::new();
+        };
+        let fence = self.hashes.fence();
+        let completed = self.hashes.completed_for(&namespace);
+
+        let Ok(downloads) = snapshot.client.refresh().await else {
+            return Vec::new();
+        };
+        let current = {
+            let state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.rate_write_is_current(&snapshot)
+        };
+        if !current {
+            return Vec::new();
+        }
+        let mut invalid = Vec::new();
+        let mut verified = Vec::new();
+        for record in completed {
+            let mut matches = downloads.iter().filter(|download| download.id == record.id);
+            let Some(download) = matches.next() else {
+                invalid.push(record);
+                continue;
+            };
+            if matches.next().is_some() {
+                invalid.push(record);
+                continue;
+            }
+            let fingerprint = crate::hash_state::queue_fingerprint(
+                &download.id,
+                download.added_at,
+                &download.url,
+            );
+            let record_is_current =
+                download.added_at == record.added_at && fingerprint == record.fingerprint;
+            if !record_is_current {
+                invalid.push(record);
+                continue;
+            }
+            let decision = match automatic_hash::completion_state(&snapshot.client, download).await
+            {
+                Ok(decision) => decision,
+                Err(_) => return Vec::new(),
+            };
+            match decision {
+                automatic_hash::CompletionDecision::Ready => {}
+                automatic_hash::CompletionDecision::Pending => continue,
+                automatic_hash::CompletionDecision::Failed
+                | automatic_hash::CompletionDecision::Unavailable => {
+                    invalid.push(record);
+                    continue;
+                }
+            }
+            let Some(path) = download.dest_path.clone().filter(|path| !path.is_empty()) else {
+                invalid.push(record);
+                continue;
+            };
+            let expected = crate::file_hash::FileIdentity {
+                dev: record.file_dev,
+                ino: record.file_ino,
+                size: record.size,
+                mtime_sec: record.mtime_sec,
+                mtime_nsec: record.mtime_nsec,
+                ctime_sec: record.ctime_sec,
+                ctime_nsec: record.ctime_nsec,
+            };
+            let verified_file = tokio::task::spawn_blocking(move || {
+                crate::file_hash::verify_file_identity(&path, &expected)
+            })
+            .await;
+            if matches!(verified_file, Ok(Ok(()))) {
+                verified.push(record);
+            } else {
+                invalid.push(record);
+            }
+        }
+        for record in invalid {
+            match self.hashes.invalidate_completed(&record, fence) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return Vec::new(),
+            }
+        }
+        #[cfg(test)]
+        self.verified_pause.wait();
+        // Publish under the connection-state lock so the epoch cannot change
+        // between the final check and the exact verified-set projection.
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.shutting_down || !state.rate_write_is_current(&snapshot) {
+            return Vec::new();
+        }
+        let rows = self.hashes.visible_verified(&namespace, &verified, fence);
+        drop(state);
+        rows.unwrap_or_default()
+    }
+
+    pub fn refresh_download_hashes(&self) -> Vec<DownloadHashDto> {
+        self.trigger_hashing();
+        self.download_hashes()
+    }
+
     /// Read the active connection's global download limit in bytes/sec.
     ///
     /// Read-only access is allowed for both owned-managed and manual
@@ -1831,10 +2732,12 @@ impl ConnectionManager {
 
     #[cfg(test)]
     fn install_test_managed(&self, client: Arc<SurgeClient>, pid: u32) -> u64 {
+        self.hashes.cancel_current();
         let mut state = self.state.lock().expect("test state lock");
         state.epoch = state.epoch.wrapping_add(1);
         state.manual = None;
         state.test_managed = Some(TestManagedConnection { client, pid });
+        state.hash_connection_id = Some(new_hash_connection_id());
         state.active = ActiveConnection::Managed;
         state.epoch
     }
@@ -1847,9 +2750,10 @@ impl ConnectionManager {
     /// only hold an `Arc<SurgeClient>` clone, so they observe the new epoch (or
     /// a network error) without stranding state.
     pub fn disconnect(&self) {
-        // Abort the stream before any state change so no read survives the
-        // disconnect.
+        // Abort the stream and hash worker before any state change so no read
+        // survives the disconnect.
         self.progress.stop();
+        self.hashes.cancel_current();
         // The shutdown path owns lifecycle fencing once it starts; it also
         // takes any remaining managed server itself. Registering here keeps a
         // concurrent new start from binding the fixed port mid-retirement.
@@ -2230,7 +3134,11 @@ pub async fn start_managed_surge(
         return Err(ManagedError::Paths);
     }
     let state_dir = resolve_managed_state_dir(&app)?;
-    start_managed_at(&state, &binary, &state_dir, &home_dir).await
+    let result = start_managed_at(&state, &binary, &state_dir, &home_dir).await;
+    if result.is_ok() && state.ensure_hash_state(&app).is_ok() {
+        state.trigger_hashing();
+    }
+    result
 }
 
 #[tauri::command]
@@ -2244,17 +3152,27 @@ pub async fn connect_surge(
 
 #[tauri::command]
 pub async fn list_downloads(
+    app: tauri::AppHandle,
     state: tauri::State<'_, ConnectionManager>,
 ) -> Result<Vec<QueueItemDto>, BridgeError> {
-    state.list_downloads().await
+    let result = state.list_downloads().await;
+    if result.is_ok() && state.ensure_hash_state(&app).is_ok() {
+        state.trigger_hashing();
+    }
+    result
 }
 
 /// Authoritative `/list` snapshot plus the stream cursor for merge fencing.
 #[tauri::command]
 pub async fn list_downloads_snapshot(
+    app: tauri::AppHandle,
     state: tauri::State<'_, ConnectionManager>,
 ) -> Result<QueueSnapshotDto, BridgeError> {
-    state.list_downloads_snapshot().await
+    let result = state.list_downloads_snapshot().await;
+    if result.is_ok() && state.ensure_hash_state(&app).is_ok() {
+        state.trigger_hashing();
+    }
+    result
 }
 
 /// Start the authenticated `/events` progress stream for the current
@@ -2384,6 +3302,101 @@ pub async fn add_download(
     state.add_download(&url).await
 }
 
+/// App-wide automatic-hash preference. Defaults to false on first run and is
+/// persisted atomically in the app-private managed state directory.
+#[tauri::command]
+pub fn get_automatic_hash_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<AutomaticHashSettingsDto, BridgeError> {
+    state.ensure_hash_state(&app)?;
+    Ok(AutomaticHashSettingsDto {
+        default_enabled: state.automatic_hash_default()?,
+    })
+}
+
+/// Persist the app-wide automatic-hash default. It affects the initial state
+/// of the next batch checkbox; it does not retroactively hash existing rows.
+#[tauri::command]
+pub fn set_automatic_hash_default(
+    enabled: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<AutomaticHashSettingsDto, BridgeError> {
+    state.ensure_hash_state(&app)?;
+    Ok(AutomaticHashSettingsDto {
+        default_enabled: state.set_automatic_hash_default(enabled)?,
+    })
+}
+
+/// Bind automatic hashing to positively acknowledged download ids.
+///
+/// The IPC payload contains only daemon ids and booleans, never a filesystem
+/// path. Duplicate ids in one call keep the last value, invalid ids fail
+/// without changing state, and the list is bounded.
+#[tauri::command]
+pub async fn set_download_hash_intents(
+    intents: Vec<HashIntentInput>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<Vec<DownloadHashDto>, BridgeError> {
+    state.ensure_hash_state(&app)?;
+    if intents.len() > crate::hash_state::MAX_HASH_INTENTS_PER_CALL {
+        return Err(BridgeError::InvalidResponse);
+    }
+    let intents: Vec<HashIntent> = intents
+        .into_iter()
+        .map(|intent| HashIntent {
+            id: intent.id,
+            enabled: intent.enabled,
+        })
+        .collect();
+    state.record_hash_intents(&intents).await
+}
+
+/// Current sanitized automatic-hash rows for the owned managed connection.
+/// Results associated with another daemon process are never returned, and a
+/// completed digest is only served after its authoritative queue record and
+/// exact file identity are re-verified.
+#[tauri::command]
+pub async fn get_download_hashes(
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<Vec<DownloadHashDto>, BridgeError> {
+    Ok(state.verified_download_hashes().await)
+}
+
+/// Ask the single bounded worker to make another pass, then return the
+/// re-verified sanitized rows. Hashing itself continues in the background and
+/// never blocks this command.
+#[tauri::command]
+pub async fn refresh_download_hashes(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<Vec<DownloadHashDto>, BridgeError> {
+    if state.ensure_hash_state(&app).is_ok() {
+        state.trigger_hashing();
+        Ok(state.verified_download_hashes().await)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Enqueue a download with the batch checkbox value.
+///
+/// The id is returned only for a positively acknowledged queued add and is the
+/// same id used for the durable hash intent. Pending/duplicate/ambiguous adds
+/// carry no id and are never retried automatically.
+#[tauri::command]
+pub async fn add_download_with_options(
+    url: String,
+    hash: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ConnectionManager>,
+) -> Result<AddReceiptDto, BridgeError> {
+    state.ensure_hash_state(&app)?;
+    state.add_download_with_options(&url, hash).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2407,6 +3420,11 @@ mod tests {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = sandbox_base().join(format!("{tag}-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create sandbox child");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("private sandbox child");
+        }
         dir
     }
 
@@ -4696,6 +5714,1949 @@ mod tests {
             item["dest_path"] = serde_json::Value::String(destination.to_string());
         }
         item
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hash_coordinator_persists_app_default_and_intents() {
+        let root = fresh_dir("hash-coordinator");
+        let coordinator = HashCoordinator::default();
+        coordinator.ensure_loaded(&root).expect("load state");
+        assert!(!coordinator.default_enabled().expect("default"));
+        assert!(coordinator.set_default_enabled(true).expect("set default"));
+
+        let intents = [
+            HashIntent {
+                id: "d-1".into(),
+                enabled: true,
+            },
+            HashIntent {
+                id: "d-1".into(),
+                enabled: false,
+            },
+        ];
+        coordinator
+            .record_intents(&intents)
+            .expect("record intents");
+        assert!(coordinator.candidates("conn-a").is_empty());
+        let visible = coordinator.visible(Some("conn-a"));
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].state, "disabled");
+
+        let reloaded = HashCoordinator::default();
+        reloaded.ensure_loaded(&root).expect("reload state");
+        assert!(reloaded.default_enabled().expect("persisted default"));
+        assert_eq!(reloaded.visible(Some("conn-a"))[0].state, "disabled");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn hash_test_item(
+        id: &str,
+        destination: &str,
+        status: &str,
+        phase: Option<&str>,
+        processing: bool,
+        processed: bool,
+        added_at: i64,
+        total: i64,
+        downloaded: i64,
+    ) -> serde_json::Value {
+        let mut item = serde_json::json!({
+            "id": id,
+            "url": "https://dl.example.test/private-url",
+            "filename": "abc.bin",
+            "total_size": total,
+            "downloaded": downloaded,
+            "progress": 100.0,
+            "speed": 0.0,
+            "status": status,
+            "eta": 0,
+            "processing": processing,
+            "processed": processed,
+            "added_at": added_at,
+            "dest_path": destination,
+        });
+        if let Some(phase) = phase {
+            item["phase"] = serde_json::Value::String(phase.to_owned());
+        }
+        item
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hash_test_fingerprint(id: &str, added_at: i64) -> String {
+        crate::hash_state::queue_fingerprint(id, added_at, "https://dl.example.test/private-url")
+    }
+
+    #[cfg(target_os = "linux")]
+    const HASH_TEST_NO_HOOK: &str = r#"{"categories":{"category_enabled":false,"categories":[]}}"#;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_hashes_completed_download_with_known_digests() {
+        let root = fresh_dir("hash-known");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = automatic_hash::hash_one(
+            &client,
+            "h-1",
+            42,
+            &hash_test_fingerprint("h-1", 42),
+            &cancel,
+            || true,
+        )
+        .await
+        .expect("hash one");
+        match result {
+            automatic_hash::HashOneOutcome::Completed(completed) => {
+                assert_eq!(completed.added_at, 42);
+                assert_eq!(completed.md5, "900150983cd24fb0d6963f7d28e17f72");
+                assert_eq!(
+                    completed.sha256,
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+                assert_eq!(completed.size, 3);
+            }
+            other => panic!("expected completed hashes, got {other:?}"),
+        }
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 5);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_hash_worker_completes_persisted_intent_in_background() {
+        let root = fresh_dir("hash-worker");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let _ = client;
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-1".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-1".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace,
+                        added_at: 42,
+                        fingerprint: hash_test_fingerprint("h-1", 42),
+                    },
+                )],
+            )
+            .expect("record intent");
+        manager.trigger_hashing();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = manager.download_hashes();
+            if let Some(row) = rows.iter().find(|row| row.id == "h-1") {
+                if row.state == "complete" {
+                    assert_eq!(row.md5.as_deref(), Some("900150983cd24fb0d6963f7d28e17f72"));
+                    assert_eq!(
+                        row.sha256.as_deref(),
+                        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+                    );
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hash worker did not publish in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 6);
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_pending_intent_resumes_once_on_the_same_owned_queue() {
+        let root = fresh_dir("hash-restart-pending");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+
+        // First app run saves a pending intent, then exits before hashing.
+        let first = HashCoordinator::default();
+        first.ensure_loaded(&root).expect("load state");
+        let namespace = first.namespace().expect("queue namespace");
+        first
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-1".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-1".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace: namespace.clone(),
+                        added_at: 42,
+                        fingerprint: hash_test_fingerprint("h-1", 42),
+                    },
+                )],
+            )
+            .expect("record pending intent");
+        drop(first);
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("reload hash state");
+        assert_eq!(
+            manager.hashes.namespace().as_deref(),
+            Some(namespace.as_str()),
+            "the same app-private queue must keep its namespace across restart"
+        );
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 5151).await;
+        manager.trigger_hashing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = manager.download_hashes();
+            if rows
+                .iter()
+                .any(|row| row.id == "h-1" && row.state == "complete")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the saved pending intent did not resume after restart"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            6,
+            "restart must hash the pending item exactly once"
+        );
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_result_is_retained_after_restart_only_after_queue_checks() {
+        let root = fresh_dir("hash-restart-complete");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+        ]);
+        let first = ConnectionManager::default();
+        first.hashes.ensure_loaded(&root).expect("load state");
+        let (_client, _epoch) = install_rate_test_managed(&first, &base, 6161).await;
+        let namespace = first.hashes.namespace().expect("queue namespace");
+        first
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-1".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-1".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace,
+                        added_at: 42,
+                        fingerprint: hash_test_fingerprint("h-1", 42),
+                    },
+                )],
+            )
+            .expect("record intent");
+        first.trigger_hashing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while first
+            .download_hashes()
+            .iter()
+            .find(|row| row.id == "h-1")
+            .is_none_or(|row| row.state != "complete")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture did not complete hashing"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        first.hashes.cancel_current();
+        server.join().expect("server thread panicked");
+        drop(first);
+
+        // Restart: a fresh manager/connection/pid sees the completed result
+        // only after the same authoritative queue record is revalidated.
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+        ]);
+        let second = ConnectionManager::default();
+        second.hashes.ensure_loaded(&root).expect("reload state");
+        let (_client, _epoch) = install_rate_test_managed(&second, &base, 7171).await;
+        let rows = second.verified_download_hashes().await;
+        let row = rows.iter().find(|row| row.id == "h-1").expect("row");
+        assert_eq!(row.state, "complete", "matching queue retains the result");
+        assert!(row.md5.is_some());
+        server.join().expect("server thread panicked");
+        drop(second);
+
+        // Restart again with a replaced/removed queue: the saved digest must
+        // fail closed as stale before it is served.
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", "[]".to_string()),
+        ]);
+        let third = ConnectionManager::default();
+        third.hashes.ensure_loaded(&root).expect("reload state");
+        let (_client, _epoch) = install_rate_test_managed(&third, &base, 8181).await;
+        let rows = third.verified_download_hashes().await;
+        let row = rows.iter().find(|row| row.id == "h-1").expect("row");
+        assert_eq!(row.state, "stale");
+        assert!(row.md5.is_none());
+        assert!(row.sha256.is_none());
+        server.join().expect("server thread panicked");
+        third.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_cancelled_before_read_does_not_contact_daemon() {
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Cancelled
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 1, "cancelled work must not fetch /list");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_blocks_completed_finalizing_and_hook_running() {
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            "/tmp/does-not-matter.bin",
+            "completed",
+            Some("finalizing"),
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Pending
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "finalizing must not open or hash the file"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_waits_for_configured_hook_completion() {
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            "/tmp/does-not-matter.bin",
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let hook = serde_json::json!({
+            "categories": {
+                "category_enabled": true,
+                "categories": [{
+                    "name": "All",
+                    "pattern": ".*",
+                    "path": "/tmp",
+                    "post_download_command": "true"
+                }]
+            }
+        })
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+            ("200 OK", hook),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Pending
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_treats_duplicate_and_missing_ids_safely() {
+        let duplicate = serde_json::json!([
+            hash_test_item("h-1", "/tmp/a", "completed", None, false, false, 42, 3, 3),
+            hash_test_item("h-1", "/tmp/a", "completed", None, false, false, 42, 3, 3)
+        ])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", duplicate),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Unavailable
+        );
+        server.join().expect("server thread panicked");
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", "[]".to_string()),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4243).await;
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Stale
+        );
+        server.join().expect("server thread panicked");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_does_not_publish_after_generation_change() {
+        let root = fresh_dir("hash-generation");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let first = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let second = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            43,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", first),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", second),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Stale
+        );
+        server.join().expect("server thread panicked");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_hash_worker_processes_every_pending_candidate() {
+        let root = fresh_dir("hash-multiple-pending");
+        let first_file = root.join("first.bin");
+        let second_file = root.join("second.bin");
+        std::fs::write(&first_file, b"abc").expect("write first fixture");
+        std::fs::write(&second_file, b"abc").expect("write second fixture");
+        let list = serde_json::json!([
+            hash_test_item(
+                "h-1",
+                &first_file.to_string_lossy(),
+                "completed",
+                None,
+                false,
+                false,
+                42,
+                3,
+                3
+            ),
+            hash_test_item(
+                "h-2",
+                &second_file.to_string_lossy(),
+                "completed",
+                None,
+                false,
+                false,
+                43,
+                3,
+                3
+            )
+        ])
+        .to_string();
+        let no_hook = HASH_TEST_NO_HOOK.to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", no_hook.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", no_hook.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", no_hook.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", no_hook),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        let provenance = |id: &str, added_at| {
+            (
+                id.to_owned(),
+                crate::hash_state::HashProvenance {
+                    namespace: namespace.clone(),
+                    added_at,
+                    fingerprint: hash_test_fingerprint(id, added_at),
+                },
+            )
+        };
+        manager
+            .hashes
+            .record_intents_with(
+                &[
+                    HashIntent {
+                        id: "h-1".into(),
+                        enabled: true,
+                    },
+                    HashIntent {
+                        id: "h-2".into(),
+                        enabled: true,
+                    },
+                ],
+                &[provenance("h-1", 42), provenance("h-2", 43)],
+            )
+            .expect("record intents");
+        manager.trigger_hashing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = manager.download_hashes();
+            let done = ["h-1", "h-2"].iter().all(|id| {
+                rows.iter()
+                    .any(|row| row.id == *id && row.state == "complete")
+            });
+            if done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the single worker must finish every pending candidate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 10);
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_worker_only_reconciles_the_cohort_captured_before_list() {
+        let root = fresh_dir("hash-cohort-worker");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let old_list = serde_json::json!([hash_test_item(
+            "h-old",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (third_tx, third_rx) = mpsc::channel();
+        let (release_third_tx, release_third_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut first = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut first));
+            rate_test_write_response(&mut first, "200 OK", RATE_TEST_LIST);
+
+            let mut second = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut second));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            rate_test_write_response(&mut second, "200 OK", &old_list);
+
+            let mut third = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut third));
+            let _ = third_tx.send(());
+            let _ = release_third_rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(third);
+            captured
+        });
+        let base = format!("http://{addr}");
+
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        let provenance = |id: &str, added_at| {
+            (
+                id.to_owned(),
+                crate::hash_state::HashProvenance {
+                    namespace: namespace.clone(),
+                    added_at,
+                    fingerprint: hash_test_fingerprint(id, added_at),
+                },
+            )
+        };
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-old".into(),
+                    enabled: true,
+                }],
+                &[provenance("h-old", 42)],
+            )
+            .expect("record existing intent");
+        manager.trigger_hashing();
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker started its /list request");
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-new".into(),
+                    enabled: true,
+                }],
+                &[provenance("h-new", 43)],
+            )
+            .expect("record a newer intent while /list is in flight");
+        release_tx
+            .send(())
+            .expect("release the older /list snapshot");
+
+        third_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker finished reconciling and started the next request");
+        let new_state = manager
+            .download_hashes()
+            .into_iter()
+            .find(|row| row.id == "h-new")
+            .map(|row| row.state);
+        manager.hashes.cancel_current();
+        release_third_tx.send(()).expect("release the worker");
+        server.join().expect("server thread panicked");
+
+        assert_eq!(
+            new_state.as_deref(),
+            Some("pending"),
+            "an intent added after the /list snapshot must not be invalidated by that snapshot"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hash_worker_slot_is_single_and_restarts_with_a_fresh_token() {
+        let coordinator = HashCoordinator::default();
+        let first = coordinator.start_worker().expect("single worker starts");
+        assert!(
+            coordinator.start_worker().is_none(),
+            "a concurrent trigger must coalesce instead of starting another worker"
+        );
+        coordinator.cancel_current();
+        let second = coordinator
+            .finish_worker(&first, true)
+            .expect("dirty work must survive a cancelled worker");
+        assert!(
+            !second.load(Ordering::SeqCst),
+            "the restarted worker must not inherit the cancelled token"
+        );
+        assert!(coordinator.start_worker().is_none());
+        assert!(coordinator.take_dirty());
+        assert!(coordinator.finish_worker(&second, true).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_rejects_reused_id_with_different_provenance_before_hashing() {
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            "/no/such/file-must-not-be-opened.bin",
+            "completed",
+            None,
+            false,
+            false,
+            99,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Stale,
+            "a reused id with different provenance must never be hashed"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "no file or settings work after a mismatch"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_rechecks_hook_configuration_after_reading() {
+        let root = fresh_dir("hash-hook-recheck");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let hook = serde_json::json!({
+            "categories": {
+                "category_enabled": true,
+                "categories": [{
+                    "name": "All",
+                    "pattern": ".*",
+                    "path": "/tmp",
+                    "post_download_command": "true"
+                }]
+            }
+        })
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list),
+            ("200 OK", hook),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await
+            .expect("hash one"),
+            automatic_hash::HashOneOutcome::Pending,
+            "a hook that became applicable must block publication"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 5);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn automatic_hash_fails_closed_when_the_post_hash_hook_config_is_malformed() {
+        let root = fresh_dir("hash-hook-malformed");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list),
+            ("200 OK", r#"{"categories":{}}"#.to_string()),
+        ]);
+        let (client, _epoch) =
+            install_rate_test_managed(&ConnectionManager::default(), &base, 4242).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            automatic_hash::hash_one(
+                &client,
+                "h-1",
+                42,
+                &hash_test_fingerprint("h-1", 42),
+                &cancel,
+                || true
+            )
+            .await,
+            Err(automatic_hash::HashWorkError::Daemon),
+            "malformed hook settings must not publish a digest"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 5);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_download_with_hash_binds_fast_completion_to_the_acknowledged_provenance() {
+        let root = fresh_dir("hash-add-fast");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let item = hash_test_item(
+            "fast-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3,
+        );
+        let status_object = item.to_string();
+        let list = serde_json::json!([item]).to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            (
+                "200 OK",
+                r#"{"status":"queued","id":"fast-1","filename":"abc.bin"}"#.to_string(),
+            ),
+            ("200 OK", status_object),
+            ("200 OK", list.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let receipt = manager
+            .add_download_with_options("https://dl.example.test/abc.bin", true)
+            .await
+            .expect("add");
+        assert_eq!(receipt.status, AddOutcome::Queued);
+        assert_eq!(receipt.id.as_deref(), Some("fast-1"));
+        assert_eq!(receipt.hash_recorded, Some(true));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = manager.download_hashes();
+            if let Some(row) = rows.iter().find(|row| row.id == "fast-1") {
+                if row.state == "complete" {
+                    assert_eq!(row.md5.as_deref(), Some("900150983cd24fb0d6963f7d28e17f72"));
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fast completion was not bound to the acknowledged id"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 8);
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum HashVerification {
+        FileRemoved,
+        FileReplaced,
+        QueueRemoved,
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn completed_hash_fixture(
+        tag: &str,
+        verification: HashVerification,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        thread::JoinHandle<Vec<RateTestCaptured>>,
+        ConnectionManager,
+    ) {
+        let root = fresh_dir(tag);
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let verification_body = match verification {
+            HashVerification::QueueRemoved => "[]".to_string(),
+            HashVerification::FileRemoved | HashVerification::FileReplaced => list.clone(),
+        };
+        let mut responses = vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", list),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+            ("200 OK", verification_body),
+        ];
+        if !matches!(verification, HashVerification::QueueRemoved) {
+            responses.push(("200 OK", HASH_TEST_NO_HOOK.to_string()));
+        }
+        let (base, server) = rate_test_spawn_scripted(responses);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-1".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-1".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace,
+                        added_at: 42,
+                        fingerprint: hash_test_fingerprint("h-1", 42),
+                    },
+                )],
+            )
+            .expect("record intent");
+        manager.trigger_hashing();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager
+            .download_hashes()
+            .iter()
+            .find(|row| row.id == "h-1")
+            .is_none_or(|row| row.state != "complete")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture did not complete hashing"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (root, file, server, manager)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn seed_completed_hash(
+        manager: &ConnectionManager,
+        root: &Path,
+        id: &str,
+        added_at: i64,
+        destination: &Path,
+    ) -> String {
+        manager.hashes.ensure_loaded(root).expect("load hash state");
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: id.into(),
+                    enabled: true,
+                }],
+                &[(
+                    id.into(),
+                    crate::hash_state::HashProvenance {
+                        namespace: namespace.clone(),
+                        added_at,
+                        fingerprint: hash_test_fingerprint(id, added_at),
+                    },
+                )],
+            )
+            .expect("record bound intent");
+        let candidate = manager
+            .hashes
+            .candidates(&namespace)
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .expect("candidate");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let size = std::fs::metadata(destination)
+            .expect("fixture metadata")
+            .len();
+        let digests =
+            crate::file_hash::hash_file(&destination.to_string_lossy(), Some(size), &cancel)
+                .expect("hash fixture");
+        assert!(
+            manager
+                .hashes
+                .mark_complete(
+                    id,
+                    candidate.generation,
+                    candidate.fence,
+                    crate::hash_state::HashCompleted {
+                        added_at,
+                        md5: digests.md5,
+                        sha256: digests.sha256,
+                        size: digests.size,
+                        mtime_sec: digests.mtime_sec,
+                        mtime_nsec: digests.mtime_nsec,
+                        ctime_sec: digests.ctime_sec,
+                        ctime_nsec: digests.ctime_nsec,
+                        file_dev: digests.file_dev,
+                        file_ino: digests.file_ino,
+                    },
+                )
+                .expect("complete fixture"),
+            "fixture completion must publish"
+        );
+        namespace
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hash_row<'a>(rows: &'a [DownloadHashDto], id: &str) -> &'a DownloadHashDto {
+        rows.iter().find(|row| row.id == id).expect("row remains")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_not_served_complete(row: &DownloadHashDto) {
+        assert_ne!(row.state, "complete");
+        assert!(row.md5.is_none());
+        assert!(row.sha256.is_none());
+        assert!(row.bytes.is_none());
+        assert!(row.result_version.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn verified_hashes_do_not_serve_completed_rows_still_finalizing_or_verifying() {
+        for phase in ["finalizing", "verifying"] {
+            let root = fresh_dir("hash-verify-phase");
+            let file = root.join("abc.bin");
+            std::fs::write(&file, b"abc").expect("write fixture");
+            let destination = file.to_string_lossy().into_owned();
+            let list = serde_json::json!([hash_test_item(
+                "h-1",
+                &destination,
+                "completed",
+                Some(phase),
+                false,
+                false,
+                42,
+                3,
+                3
+            )])
+            .to_string();
+            let (base, server) = rate_test_spawn_scripted(vec![
+                ("200 OK", RATE_TEST_LIST.to_string()),
+                ("200 OK", list),
+            ]);
+            let manager = ConnectionManager::default();
+            manager
+                .hashes
+                .ensure_loaded(&root)
+                .expect("load hash state");
+            let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+            seed_completed_hash(&manager, &root, "h-1", 42, &file);
+
+            let rows = manager.verified_download_hashes().await;
+            assert_not_served_complete(hash_row(&rows, "h-1"));
+            let captured = server.join().expect("server thread panicked");
+            assert_eq!(captured.len(), 2, "{phase} must not fetch hook settings");
+            manager.hashes.cancel_current();
+            remove_all_best_effort(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn verified_hashes_respect_current_hook_applicability() {
+        let root = fresh_dir("hash-verify-hook");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let hook = serde_json::json!({
+            "categories": {
+                "category_enabled": true,
+                "categories": [{
+                    "name": "All",
+                    "pattern": ".*",
+                    "path": "/tmp",
+                    "post_download_command": "true"
+                }]
+            }
+        })
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+            ("200 OK", hook),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-1", 42, &file);
+
+        let rows = manager.verified_download_hashes().await;
+        assert_not_served_complete(hash_row(&rows, "h-1"));
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 3);
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn verified_hashes_recheck_changed_hook_configuration() {
+        let root = fresh_dir("hash-verify-hook-change");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            false,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let hook = serde_json::json!({
+            "categories": {
+                "category_enabled": true,
+                "categories": [{
+                    "name": "All",
+                    "pattern": ".*",
+                    "path": "/tmp",
+                    "post_download_command": "true"
+                }]
+            }
+        })
+        .to_string();
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", HASH_TEST_NO_HOOK.to_string()),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-1", 42, &file);
+        let rows = manager.verified_download_hashes().await;
+        let first = hash_row(&rows, "h-1");
+        assert_eq!(first.state, "complete");
+        assert!(first.md5.is_some());
+        server.join().expect("server thread panicked");
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+            ("200 OK", hook),
+        ]);
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4343).await;
+        let rows = manager.verified_download_hashes().await;
+        assert_not_served_complete(hash_row(&rows, "h-1"));
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 3);
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn verified_hashes_fail_closed_on_malformed_or_failed_hook_settings() {
+        for (status, body) in [
+            ("200 OK", r#"{"categories":{}}"#.to_string()),
+            ("500 Internal Server Error", "{}".to_string()),
+        ] {
+            let root = fresh_dir("hash-verify-hook-failure");
+            let file = root.join("abc.bin");
+            std::fs::write(&file, b"abc").expect("write fixture");
+            let destination = file.to_string_lossy().into_owned();
+            let list = serde_json::json!([hash_test_item(
+                "h-1",
+                &destination,
+                "completed",
+                None,
+                false,
+                false,
+                42,
+                3,
+                3
+            )])
+            .to_string();
+            let (base, server) = rate_test_spawn_scripted(vec![
+                ("200 OK", RATE_TEST_LIST.to_string()),
+                ("200 OK", list),
+                (status, body),
+            ]);
+            let manager = ConnectionManager::default();
+            manager
+                .hashes
+                .ensure_loaded(&root)
+                .expect("load hash state");
+            let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+            seed_completed_hash(&manager, &root, "h-1", 42, &file);
+
+            let rows = manager.verified_download_hashes().await;
+            assert!(rows.is_empty(), "unvalidated settings must serve no rows");
+            let captured = server.join().expect("server thread panicked");
+            assert_eq!(captured.len(), 3);
+            manager.hashes.cancel_current();
+            remove_all_best_effort(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_strip_a_record_completed_after_the_snapshot() {
+        let root = fresh_dir("hash-verify-concurrent");
+        let first_file = root.join("first.bin");
+        let second_file = root.join("second.bin");
+        std::fs::write(&first_file, b"abc").expect("write first fixture");
+        std::fs::write(&second_file, b"xyz").expect("write second fixture");
+        let first_destination = first_file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &first_destination,
+            "completed",
+            None,
+            false,
+            true,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let namespace = seed_completed_hash(&manager, &root, "h-1", 42, &first_file);
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-2".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-2".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace,
+                        added_at: 43,
+                        fingerprint: hash_test_fingerprint("h-2", 43),
+                    },
+                )],
+            )
+            .expect("record later intent");
+        let later = manager
+            .hashes
+            .candidates(&manager.hashes.namespace().expect("namespace"))
+            .into_iter()
+            .find(|candidate| candidate.id == "h-2")
+            .expect("later candidate");
+        let (entered_rx, release_tx) = manager.verified_pause.arm();
+        let serve = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.verified_download_hashes().await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("validation reached the publication barrier");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let size = std::fs::metadata(&second_file)
+            .expect("fixture metadata")
+            .len();
+        let digests =
+            crate::file_hash::hash_file(&second_file.to_string_lossy(), Some(size), &cancel)
+                .expect("hash later fixture");
+        assert!(manager
+            .hashes
+            .mark_complete(
+                "h-2",
+                later.generation,
+                later.fence,
+                crate::hash_state::HashCompleted {
+                    added_at: 43,
+                    md5: digests.md5,
+                    sha256: digests.sha256,
+                    size: digests.size,
+                    mtime_sec: digests.mtime_sec,
+                    mtime_nsec: digests.mtime_nsec,
+                    ctime_sec: digests.ctime_sec,
+                    ctime_nsec: digests.ctime_nsec,
+                    file_dev: digests.file_dev,
+                    file_ino: digests.file_ino,
+                },
+            )
+            .expect("complete later record"));
+        release_tx.send(()).expect("release publication");
+        let rows = serve.await.expect("serve task");
+        manager.verified_pause.clear();
+        server.join().expect("server thread panicked");
+
+        let first = hash_row(&rows, "h-1");
+        assert_eq!(first.state, "complete");
+        assert!(first.md5.is_some());
+        assert_not_served_complete(hash_row(&rows, "h-2"));
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_do_not_invalidate_completions_after_the_list_snapshot() {
+        let root = fresh_dir("hash-verify-list-snapshot");
+        let old_file = root.join("old.bin");
+        let new_file = root.join("new.bin");
+        std::fs::write(&old_file, b"abc").expect("write old fixture");
+        std::fs::write(&new_file, b"xyz").expect("write new fixture");
+        let old_destination = old_file.to_string_lossy().into_owned();
+        // `processed: true` skips the hook settings request so the only gated
+        // request is the authoritative `/list` read itself.
+        let old_list = serde_json::json!([hash_test_item(
+            "h-old",
+            &old_destination,
+            "completed",
+            None,
+            false,
+            true,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut first = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut first));
+            rate_test_write_response(&mut first, "200 OK", RATE_TEST_LIST);
+
+            // Hold the authoritative `/list` response while a newer completion
+            // is persisted, so the response is genuinely older than that record.
+            let mut second = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut second));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            rate_test_write_response(&mut second, "200 OK", &old_list);
+            captured
+        });
+        let base = format!("http://{addr}");
+
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-old", 42, &old_file);
+
+        let serve = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.verified_download_hashes().await }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("validation started its /list request");
+
+        // A new add can complete (and record its digest) while the older
+        // `/list` response is still in flight. It must not be part of the
+        // snapshot that this response is allowed to invalidate.
+        seed_completed_hash(&manager, &root, "h-new", 43, &new_file);
+        release_tx
+            .send(())
+            .expect("release the older /list snapshot");
+
+        let rows = serve.await.expect("serve task");
+        server.join().expect("server thread panicked");
+        manager.hashes.cancel_current();
+
+        let old = hash_row(&rows, "h-old");
+        assert_eq!(old.state, "complete");
+        assert!(old.md5.is_some());
+        let new = hash_row(&rows, "h-new");
+        assert_ne!(
+            new.state, "stale",
+            "an older /list must not invalidate a completion created after the snapshot"
+        );
+        assert_not_served_complete(new);
+        let stored = manager
+            .download_hashes()
+            .into_iter()
+            .find(|row| row.id == "h-new")
+            .expect("new record remains");
+        assert_eq!(
+            stored.state, "complete",
+            "the fresh digest must remain stored until its own verification pass"
+        );
+        assert!(stored.md5.is_some());
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_strip_everything_after_an_epoch_change_during_validation() {
+        let root = fresh_dir("hash-verify-epoch");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            true,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-1", 42, &file);
+        let (entered_rx, release_tx) = manager.verified_pause.arm();
+        let serve = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.verified_download_hashes().await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("validation reached the publication barrier");
+
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        release_tx.send(()).expect("release publication");
+        let rows = serve.await.expect("serve task");
+        manager.verified_pause.clear();
+        server.join().expect("server thread panicked");
+
+        assert!(
+            rows.iter().all(|row| row.state != "complete"),
+            "an epoch change during validation must not publish old digests"
+        );
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_hash_intents_never_returns_unverified_completed_digests() {
+        let root = fresh_dir("hash-intents-verified");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            true,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", list),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-1", 42, &file);
+        std::fs::remove_file(&file).expect("remove completed file");
+        manager.lifecycle.begin_shutdown();
+
+        let rows = manager
+            .record_hash_intents(&[])
+            .await
+            .expect("record and serve verified rows");
+        assert_stale_after_verification(rows);
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 3);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_hash_intents_reconciles_only_the_transaction_cohort() {
+        let root = fresh_dir("hash-intents-cohort");
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            "/tmp/not-opened.bin",
+            "downloading",
+            None,
+            false,
+            false,
+            42,
+            3,
+            1
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list.clone()),
+            ("200 OK", list),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        // Stop the background worker from fetching `/list` or hashing; this
+        // test only exercises the synchronous intent transaction.
+        manager.lifecycle.begin_shutdown();
+
+        let (entered_rx, release_tx) = manager.record_intents_pause.arm();
+        let rebind = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .record_hash_intents(&[HashIntent {
+                        id: "h-1".into(),
+                        enabled: true,
+                    }])
+                    .await
+            }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("record_hash_intents entered the cohort barrier");
+
+        // Replace the same id with a newer generation while the older list
+        // snapshot is still held. The replacement must not enter the cohort
+        // this call is allowed to reconcile against that older response.
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-1".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-1".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace: namespace.clone(),
+                        added_at: 99,
+                        fingerprint: crate::hash_state::queue_fingerprint(
+                            "h-1",
+                            99,
+                            "https://dl.example.test/private-url",
+                        ),
+                    },
+                )],
+            )
+            .expect("concurrent rebind");
+        release_tx
+            .send(())
+            .expect("release the older /list snapshot");
+
+        let rows = rebind
+            .await
+            .expect("record task")
+            .expect("record and serve verified rows");
+        manager.record_intents_pause.clear();
+        server.join().expect("server thread panicked");
+
+        let candidate = manager
+            .hashes
+            .candidates(&namespace)
+            .into_iter()
+            .find(|candidate| candidate.id == "h-1");
+        let candidate = candidate.expect("the newer rebind must remain eligible for hashing");
+        assert_eq!(
+            candidate.added_at, 99,
+            "the concurrently rebound provenance must survive the older list"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.id == "h-1")
+            .expect("row remains");
+        assert_ne!(
+            row.state, "stale",
+            "an intervening rebind must not be invalidated by the older list"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_stale_after_verification(rows: Vec<DownloadHashDto>) {
+        let row = rows
+            .iter()
+            .find(|row| row.id == "h-1")
+            .expect("row remains");
+        assert_eq!(row.state, "stale");
+        assert!(row.md5.is_none());
+        assert!(row.sha256.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_invalidate_a_removed_file() {
+        let (root, file, server, manager) =
+            completed_hash_fixture("hash-verify-removed", HashVerification::FileRemoved).await;
+        std::fs::remove_file(&file).expect("remove completed file");
+        let rows = manager.verified_download_hashes().await;
+        assert_stale_after_verification(rows);
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 8);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_invalidate_a_replaced_file_and_removed_queue_record() {
+        let (root, file, server, manager) =
+            completed_hash_fixture("hash-verify-replaced", HashVerification::FileReplaced).await;
+        std::fs::write(&file, b"xyz").expect("replace file contents");
+        let rows = manager.verified_download_hashes().await;
+        assert_stale_after_verification(rows);
+        server.join().expect("server thread panicked");
+        remove_all_best_effort(&root);
+
+        let (root, _file, server, manager) =
+            completed_hash_fixture("hash-verify-queue", HashVerification::QueueRemoved).await;
+        let rows = manager.verified_download_hashes().await;
+        assert_stale_after_verification(rows);
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 7);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn add_receipt_preserves_queued_id_and_withholds_approval_id() {
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            (
+                "200 OK",
+                r#"{"status":"queued","id":"download-id-1","filename":"new.bin"}"#.to_string(),
+            ),
+        ]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let receipt = client
+            .add_download_receipt("https://dl.example.test/new.bin")
+            .await
+            .expect("accepted add");
+        assert_eq!(receipt.outcome, AddOutcome::Queued);
+        assert_eq!(receipt.id.as_deref(), Some("download-id-1"));
+        server.join().expect("server thread panicked");
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            (
+                "202 Accepted",
+                r#"{"status":"pending_approval","id":"approval-request-1"}"#.to_string(),
+            ),
+        ]);
+        let client = SurgeClient::connect(&base, "test-token")
+            .await
+            .expect("connect");
+        let receipt = client
+            .add_download_receipt("https://dl.example.test/pending.bin")
+            .await
+            .expect("pending add");
+        assert_eq!(receipt.outcome, AddOutcome::PendingApproval);
+        assert_eq!(receipt.id, None, "approval ids must never bind an intent");
+        server.join().expect("server thread panicked");
     }
 
     #[cfg(target_os = "linux")]

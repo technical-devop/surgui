@@ -40,7 +40,12 @@
   let endpoint = $state("");
   let token = $state("");
   let addUrl = $state("");
-  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, batch: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, maxConcurrent: null, maxConcurrentLoading: false, maxConcurrentSaving: false, maxConcurrentError: null, maxConcurrentUnconfirmed: false, maxConcurrentRestartPending: false, locationOpeningId: null, locationError: null, locationErrorId: null, bulkAction: null, bulkSummary: null, bulkUncertainties: [], bulkUncertaintyOverflow: 0 });
+  let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, batch: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, maxConcurrent: null, maxConcurrentLoading: false, maxConcurrentSaving: false, maxConcurrentError: null, maxConcurrentUnconfirmed: false, maxConcurrentRestartPending: false, locationOpeningId: null, locationError: null, locationErrorId: null, bulkAction: null, bulkSummary: null, bulkUncertainties: [], bulkUncertaintyOverflow: 0, hashIntentWarnings: [], hashIntentWarningOverflow: 0, hashDefaultEnabled: null, hashDefaultLoading: false, hashDefaultSaving: false, hashDefaultError: null, hashes: [], hashesLoading: false, hashError: null });
+  // Per-batch hash choice. Initialized from the persisted default; the user
+  // may override per batch without changing the default. Snapshotted once at
+  // submission so an in-flight toggle cannot retarget the running batch.
+  let hashForBatch = $state(false);
+  let hashBatchDirty = $state(false);
   let rateDraft = $state("");
   let rateDirty = $state(false);
   let rateTouched = $state(false);
@@ -138,6 +143,15 @@
   const bulkSummary = $derived(snapshot.bulkSummary ?? null);
   const bulkUncertainties = $derived(snapshot.bulkUncertainties ?? []);
   const bulkUncertaintyOverflow = $derived(snapshot.bulkUncertaintyOverflow ?? 0);
+  const hashIntentWarnings = $derived(snapshot.hashIntentWarnings ?? []);
+  const hashIntentWarningOverflow = $derived(snapshot.hashIntentWarningOverflow ?? 0);
+  const hashDefaultEnabled = $derived(snapshot.hashDefaultEnabled ?? null);
+  const hashDefaultLoading = $derived(snapshot.hashDefaultLoading === true);
+  const hashDefaultSaving = $derived(snapshot.hashDefaultSaving === true);
+  const hashDefaultError = $derived(snapshot.hashDefaultError ?? null);
+  const hashes = $derived(snapshot.hashes ?? []);
+  const hashesLoading = $derived(snapshot.hashesLoading === true);
+  const hashError = $derived(snapshot.hashError ?? null);
 
   // Load the managed limit once per connection epoch. The draft lives in the
   // UI so list polls never overwrite an in-progress edit. tryClaim gates the
@@ -238,6 +252,59 @@
       if (busy || queued === 0) return;
       addUrl = mergeRecoverableLines(addUrl, pendingRecoveryLines);
       pendingRecoveryLines = [];
+    });
+  });
+
+  // Load the persisted hash default once per connection epoch. Reconciles
+  // after reconnect/startup so a stale default never persists.
+  $effect(() => {
+    const phase = snapshot.phase;
+    untrack(() => {
+      if (!isTauri || !controller) return;
+      if (phase !== "connected") return;
+      if (!controller.tryClaimHashDefaultAutoLoad()) return;
+      void controller.loadHashDefault();
+    });
+  });
+
+  // The per-batch checkbox starts from the persisted default. A user override
+  // is kept until the batch is submitted; an in-flight batch is never
+  // retargeted by a late default load.
+  $effect(() => {
+    const def = snapshot.hashDefaultEnabled;
+    const running = batchRunning;
+    untrack(() => {
+      if (hashBatchDirty) return;
+      if (running) return;
+      if (def === null || def === undefined) return;
+      hashForBatch = def;
+    });
+  });
+
+  // Load visible hashes once per managed connection; manual connections stay
+  // empty so another daemon's digests can never read as the current state.
+  $effect(() => {
+    const phase = snapshot.phase;
+    const managed = snapshot.managed === true;
+    const known = snapshot.hashes;
+    untrack(() => {
+      if (!isTauri || !controller) return;
+      if (phase !== "connected" || !managed) return;
+      if (known !== undefined && known !== null && known.length > 0) return;
+      if (snapshot.hashesLoading === true) return;
+      void controller.loadHashes();
+    });
+  });
+
+  // Clear per-batch override when leaving connected so a stale choice never
+  // looks like the new daemon's default. The persisted default itself stays
+  // cached and is reloaded on the next connection.
+  $effect(() => {
+    const phase = snapshot.phase;
+    untrack(() => {
+      if (phase !== "connected") {
+        hashBatchDirty = false;
+      }
     });
   });
 
@@ -473,6 +540,7 @@
     maxConcurrentDraft = "";
     maxConcurrentDirty = false;
     maxConcurrentTouched = false;
+    hashBatchDirty = false;
     void activeController?.disconnect();
     pullRecoveries(activeController);
     restoreRecoveredDraft();
@@ -505,6 +573,36 @@
     void controller.loadMaxConcurrent();
   }
 
+  function handleHashRetry() {
+    if (!controller) return;
+    if (!isConnected) return;
+    void controller.loadHashDefault();
+  }
+
+  function handleHashesRefresh() {
+    if (!controller) return;
+    if (!isConnected || !isManaged) return;
+    void controller.refreshHashes();
+  }
+
+  async function handleHashDefaultSave() {
+    if (!isTauri || !controller) return;
+    if (!isConnected || hashDefaultSaving || hashDefaultLoading) return;
+    // Persist the current per-batch choice as the default for future batches.
+    // The in-flight batch keeps its snapshotted value.
+    const activeController = controller;
+    const epoch = activeController.connectionEpoch();
+    const ok = await activeController.setHashDefault(hashForBatch);
+    if (controller !== activeController) return;
+    if (epoch !== activeController.connectionEpoch()) return;
+    if (ok) {
+      untrack(() => {
+        hashBatchDirty = false;
+      });
+      void activeController.loadHashes();
+    }
+  }
+
   const showManagedRetry = $derived(
     snapshot.phase === "error" || (snapshot.phase === "offline" && managedAutoStarted),
   );
@@ -533,6 +631,16 @@
     controller?.dismissBulkUncertaintyOverflow();
   }
 
+  function handleDismissHashIntentWarning(id: number) {
+    if (!isTauri) return;
+    controller?.dismissHashIntentWarning(id);
+  }
+
+  function handleDismissHashIntentWarningOverflow() {
+    if (!isTauri) return;
+    controller?.dismissHashIntentWarningOverflow();
+  }
+
   async function handleAdd(event: SubmitEvent) {
     event.preventDefault();
     if (!isTauri || !controller) return;
@@ -542,8 +650,11 @@
     const activeController = controller;
     const operationId = ++addOperationSeq;
     const epoch = activeController.connectionEpoch();
+    // Snapshot the per-batch hash choice once; the running batch keeps this
+    // value even if the checkbox or default changes mid-batch.
+    const hashSnapshot = hashForBatch;
     addUrl = "";
-    const result = await activeController.addBatch(input);
+    const result = await activeController.addBatch(input, hashSnapshot);
     // A reconnect, a newer submission or a disposed controller makes this
     // result stale; the resolver returns null and leaves the input untouched.
     // Accepted, pending and duplicate links are complete. Recoverable lines
@@ -564,6 +675,14 @@
     // resolver, but its full original lines are preserved separately. Restore
     // them only through the non-overwriting merge effect above.
     pullRecoveries(activeController);
+    // The next batch starts again from the persisted default.
+    untrack(() => {
+      hashBatchDirty = false;
+      const def = snapshot.hashDefaultEnabled;
+      if (def !== null && def !== undefined) hashForBatch = def;
+    });
+    // A newly queued batch may carry hash intents; reconcile visible rows.
+    if (isManaged) void activeController.refreshHashes();
   }
 </script>
 
@@ -706,6 +825,46 @@
               aria-describedby="add-url-help"
             ></textarea>
             <p class="field-help" id="add-url-help">One HTTP(S) URL per line. Up to {MAX_BATCH_LINES} per batch, sent one at a time through the normal add path. Repeated exact links are sent once per batch; daemon duplicates are reported. Failed, unconfirmed, invalid and unattempted links stay here. The field locks while a batch runs. You can edit offline; submitting needs a connection.</p>
+          </div>
+          <div class="field hash-field">
+            <label class="hash-check" for="hash-batch">
+              <input
+                id="hash-batch"
+                type="checkbox"
+                class="hash-input"
+                bind:checked={hashForBatch}
+                onchange={() => { hashBatchDirty = true; }}
+                disabled={!isManaged || !isConnected || addBusy}
+              />
+              <span class="hash-check-text">Compute MD5 + SHA-256 for this batch</span>
+            </label>
+            {#if !isManaged}
+              <p class="field-help" id="hash-batch-help">Available only on the bundled daemon connection. Digests identify file content, not trust or safety.</p>
+            {:else}
+              <p class="field-help" id="hash-batch-help">Hashes each queued download after it finishes. Digests identify file content, not trust or safety. {#if hashDefaultEnabled !== null}Default for future batches: {hashDefaultEnabled ? "on" : "off"}.{/if}</p>
+            {/if}
+            {#if hashDefaultLoading}
+              <p class="add-feedback" role="status">Loading hashing default…</p>
+            {:else if hashDefaultError}
+              <p class="conn-error" role="alert">{hashDefaultError}</p>
+              <div class="add-actions">
+                <button type="button" class="btn" onclick={handleHashRetry}>
+                  Retry loading default
+                </button>
+              </div>
+            {:else if isManaged && isConnected}
+              <div class="add-actions">
+                <button
+                  type="button"
+                  class="btn"
+                  onclick={handleHashDefaultSave}
+                  disabled={hashDefaultSaving || addBusy}
+                  aria-busy={hashDefaultSaving ? "true" : undefined}
+                >
+                  {hashDefaultSaving ? "Saving…" : "Save choice as default"}
+                </button>
+              </div>
+            {/if}
           </div>
           <div class="add-actions">
             <button
@@ -877,6 +1036,14 @@
       bulkUncertaintyOverflow={bulkUncertaintyOverflow}
       onDismissBulkUncertainty={handleDismissBulkUncertainty}
       onDismissBulkUncertaintyOverflow={handleDismissBulkUncertaintyOverflow}
+      hashIntentWarnings={hashIntentWarnings}
+      hashIntentWarningOverflow={hashIntentWarningOverflow}
+      onDismissHashIntentWarning={handleDismissHashIntentWarning}
+      onDismissHashIntentWarningOverflow={handleDismissHashIntentWarningOverflow}
+      hashes={hashes}
+      hashesLoading={hashesLoading}
+      hashError={hashError}
+      onRefreshHashes={handleHashesRefresh}
     />
   {/if}
 </main>
@@ -1183,6 +1350,52 @@
 
   .add-field {
     flex: 1 1 auto;
+  }
+
+  .hash-field {
+    border-top: 1px solid var(--color-rule);
+    padding-top: var(--space-sm);
+  }
+
+  .hash-check {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-xs);
+    min-height: var(--control-h);
+    cursor: pointer;
+    min-width: 0;
+  }
+
+  .hash-check-text {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-ink);
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+
+  .hash-input {
+    width: 1.125rem;
+    height: 1.125rem;
+    flex: none;
+    margin-top: 0.125rem;
+    accent-color: var(--color-accent);
+  }
+
+  .hash-input:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .hash-check:has(.hash-input:disabled) {
+    cursor: not-allowed;
+  }
+
+  .hash-check:has(.hash-input:disabled) .hash-check-text {
+    color: var(--color-neutral);
   }
 
   .url-lines {

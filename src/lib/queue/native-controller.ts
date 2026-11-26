@@ -4,6 +4,7 @@ import type {
   BulkSummary,
   BulkUncertainty,
   DownloadStatus,
+  HashIntentWarning,
   QueueItem,
 } from "./types.ts";
 import {
@@ -23,6 +24,7 @@ import {
   sanitizeSnapshotPayload,
   sanitizeStreamState,
 } from "./progress.ts";
+import { sanitizeDownloadHashes, type DownloadHash } from "./hashes.ts";
 
 export type NativePhase = "offline" | "connecting" | "connected" | "error";
 
@@ -150,6 +152,23 @@ export interface NativeState {
   bulkUncertaintyOverflow?: number;
   /** Near-real-time stream status; polling always continues regardless. */
   streamState?: "off" | "starting" | "live" | "fallback";
+  /** Persisted automatic-hash default; null until loaded. False on first run. */
+  hashDefaultEnabled?: boolean | null;
+  hashDefaultLoading?: boolean;
+  hashDefaultSaving?: boolean;
+  hashDefaultError?: string | null;
+  /**
+   * Bounded persistent warnings for accepted queued downloads whose requested
+   * hash intent was not confirmed as saved. Each survives reconnect and is
+   * dismissed individually; the accepted download is never retried.
+   */
+  hashIntentWarnings?: HashIntentWarning[];
+  /** Count of unresolved hash-intent warnings omitted from the bounded list. */
+  hashIntentWarningOverflow?: number;
+  /** Sanitized hash rows for the current managed connection; empty on manual. */
+  hashes?: DownloadHash[];
+  hashesLoading?: boolean;
+  hashError?: string | null;
 }
 
 export type InvokeFn = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -338,6 +357,11 @@ const MAX_BULK_RESULTS = 100_000;
 const MAX_BULK_ID_LENGTH = 1024;
 /** Bounded number of independent unresolved bulk notices retained for display. */
 const MAX_BULK_UNCERTAINTIES = 5;
+/** Bounded number of independent unresolved hash-intent warnings retained. */
+const MAX_HASH_INTENT_WARNINGS = 5;
+
+const HASH_INTENT_UNSAVED_MESSAGE =
+  "The hash request was not saved for an accepted queued download. The download was accepted; hashing may not run automatically. It was not retried automatically.";
 
 const BULK_FALLBACK =
   "Bulk action could not be completed. Downloads may have changed; the queue keeps refreshing periodically. Not retried automatically.";
@@ -599,7 +623,16 @@ export class NativeQueueController {
     bulkSummary: null,
     bulkUncertainties: [],
     bulkUncertaintyOverflow: 0,
+    hashIntentWarnings: [],
+    hashIntentWarningOverflow: 0,
     streamState: "off",
+    hashDefaultEnabled: null,
+    hashDefaultLoading: false,
+    hashDefaultSaving: false,
+    hashDefaultError: null,
+    hashes: [],
+    hashesLoading: false,
+    hashError: null,
   };
 
   private epoch = 0;
@@ -638,6 +671,7 @@ export class NativeQueueController {
   private bulkEpoch: number | null = null;
   private bulkSeq = 0;
   private bulkUncertaintySeq = 0;
+  private hashIntentWarningSeq = 0;
   /**
    * Connection epoch that produced the currently displayed bulk summary. Used
    * to describe an unresolved outcome without blaming a previous connection
@@ -671,6 +705,13 @@ export class NativeQueueController {
   private batchRecoverySeq = 0;
   private locationEpoch: number | null = null;
   private locationSeq = 0;
+  private hashDefaultSeq = 0;
+  private hashDefaultLoadPromise: Promise<void> | null = null;
+  private hashDefaultLoadEpoch: number | null = null;
+  private hashDefaultAutoLoadEpoch: number | null = null;
+  private hashLoadSeq = 0;
+  private hashLoadPromise: Promise<void> | null = null;
+  private hashLoadEpoch: number | null = null;
   private invoke: InvokeFn;
   private onChange: OnChangeFn;
   private pollMs: number;
@@ -840,7 +881,18 @@ export class NativeQueueController {
         ...notice,
       })),
       bulkUncertaintyOverflow: this.state.bulkUncertaintyOverflow ?? 0,
+      hashIntentWarnings: (this.state.hashIntentWarnings ?? []).map((notice) => ({
+        ...notice,
+      })),
+      hashIntentWarningOverflow: this.state.hashIntentWarningOverflow ?? 0,
       streamState: this.state.streamState ?? "off",
+      hashDefaultEnabled: this.state.hashDefaultEnabled ?? null,
+      hashDefaultLoading: this.state.hashDefaultLoading ?? false,
+      hashDefaultSaving: this.state.hashDefaultSaving ?? false,
+      hashDefaultError: this.state.hashDefaultError ?? null,
+      hashes: (this.state.hashes ?? []).map((row) => ({ ...row })),
+      hashesLoading: this.state.hashesLoading ?? false,
+      hashError: this.state.hashError ?? null,
     });
   }
 
@@ -894,6 +946,48 @@ export class NativeQueueController {
     this.emit();
   }
 
+  /**
+   * Record one bounded, redacted warning for an accepted queued download whose
+   * requested hash intent was not confirmed. Warnings are independent, survive
+   * reconnect, and are removed only by explicit dismissal — never by a retry.
+   */
+  private recordHashIntentWarning(): void {
+    const notices = this.state.hashIntentWarnings ?? [];
+    notices.push({
+      id: ++this.hashIntentWarningSeq,
+      message: HASH_INTENT_UNSAVED_MESSAGE,
+    });
+    if (notices.length > MAX_HASH_INTENT_WARNINGS) {
+      const omitted = notices.length - MAX_HASH_INTENT_WARNINGS;
+      notices.splice(0, omitted);
+      this.state.hashIntentWarningOverflow =
+        (this.state.hashIntentWarningOverflow ?? 0) + omitted;
+    }
+    this.state.hashIntentWarnings = notices;
+    this.emit();
+  }
+
+  /** Dismiss one persistent hash-intent warning explicitly. */
+  dismissHashIntentWarning(id: number): void {
+    if (this.disposed) return;
+    const notices = this.state.hashIntentWarnings ?? [];
+    const next = notices.filter((notice) => notice.id !== id);
+    if (next.length === notices.length) return;
+    this.state.hashIntentWarnings = next;
+    this.emit();
+  }
+
+  /**
+   * Acknowledge the hash-intent overflow summary on its own. Retained notices
+   * are independent and are never removed by this action.
+   */
+  dismissHashIntentWarningOverflow(): void {
+    if (this.disposed) return;
+    if ((this.state.hashIntentWarningOverflow ?? 0) === 0) return;
+    this.state.hashIntentWarningOverflow = 0;
+    this.emit();
+  }
+
   private resetBulkState(): void {
     this.noteBulkUncertainty();
     this.bulkEpoch = null;
@@ -926,6 +1020,254 @@ export class NativeQueueController {
     this.state.maxConcurrentError = this.maxConcurrentPoisoned
       ? MAX_CONCURRENT_UNCONFIRMED_MESSAGE
       : null;
+  }
+
+  private resetHashState(): void {
+    // Epoch-fenced visibility: a new connection starts with no rows so a
+    // previous daemon's digests can never read as the new daemon's state.
+    // The persisted default stays cached; it is reloaded per connection.
+    this.state.hashes = [];
+    this.state.hashesLoading = false;
+    this.state.hashError = null;
+    this.hashLoadPromise = null;
+    this.hashLoadEpoch = null;
+  }
+
+  private hashErrorMessage(err: unknown, fallback: string): string {
+    const text = extractCodeText(err).toLowerCase();
+    if (text.includes("managedconnectionrequired")) return "Hashing needs the bundled daemon connection.";
+    if (text.includes("notconnected")) return "Not connected to a daemon.";
+    if (text.includes("invalidresponse")) return "Daemon returned an unexpected hash response.";
+    if (text.includes("timeout")) return "Hash state timed out. Try again.";
+    if (text.includes("network")) return "Cannot reach the daemon for hash state.";
+    if (/\bstate\b/.test(text)) return "Hash state unavailable. Try again.";
+    return fallback;
+  }
+
+  private sanitizeHashDefault(raw: unknown): boolean {
+    const r = (raw ?? {}) as Record<string, unknown>;
+    // Backend serializes as { defaultEnabled }; accept camelCase only.
+    if (typeof r.defaultEnabled === "boolean") return r.defaultEnabled;
+    throw "invalidResponse";
+  }
+
+  tryClaimHashDefaultAutoLoad(): boolean {
+    if (this.disposed) return false;
+    if (this.state.phase !== "connected") return false;
+    if (this.hashDefaultAutoLoadEpoch === this.epoch) return false;
+    this.hashDefaultAutoLoadEpoch = this.epoch;
+    return true;
+  }
+
+  async loadHashDefault(): Promise<void> {
+    if (this.disposed) return;
+    if (this.state.phase !== "connected") return;
+    if (this.hashDefaultLoadPromise !== null && this.hashDefaultLoadEpoch === this.epoch) {
+      return this.hashDefaultLoadPromise;
+    }
+    const epoch = this.epoch;
+    const seq = (this.hashDefaultSeq += 1);
+    const task = this.executeLoadHashDefault(epoch, seq);
+    this.hashDefaultLoadPromise = task;
+    this.hashDefaultLoadEpoch = epoch;
+    return task.then(
+      () => {
+        if (this.hashDefaultLoadPromise === task) {
+          this.hashDefaultLoadPromise = null;
+          this.hashDefaultLoadEpoch = null;
+        }
+      },
+      () => {
+        if (this.hashDefaultLoadPromise === task) {
+          this.hashDefaultLoadPromise = null;
+          this.hashDefaultLoadEpoch = null;
+        }
+      },
+    );
+  }
+
+  private async executeLoadHashDefault(epoch: number, seq: number): Promise<void> {
+    if (this.disposed) return;
+    this.state.hashDefaultLoading = true;
+    this.state.hashDefaultError = null;
+    this.emit();
+    let raw: unknown;
+    try {
+      raw = await this.invoke("get_automatic_hash_settings");
+    } catch (err) {
+      if (epoch !== this.epoch || this.disposed) return;
+      if (seq !== this.hashDefaultSeq) return;
+      if (isSuperseded(err)) return;
+      this.state.hashDefaultError = this.hashErrorMessage(err, "Could not load the hashing default.");
+      this.state.hashDefaultLoading = false;
+      this.emit();
+      return;
+    }
+    if (epoch !== this.epoch || this.disposed) return;
+    if (seq !== this.hashDefaultSeq) return;
+    let value: boolean;
+    try {
+      value = this.sanitizeHashDefault(raw);
+    } catch (err) {
+      this.state.hashDefaultError = this.hashErrorMessage(err, "Could not load the hashing default.");
+      this.state.hashDefaultLoading = false;
+      this.emit();
+      return;
+    }
+    if (epoch !== this.epoch || this.disposed) return;
+    if (seq !== this.hashDefaultSeq) return;
+    this.state.hashDefaultEnabled = value;
+    this.state.hashDefaultError = null;
+    this.state.hashDefaultLoading = false;
+    this.emit();
+  }
+
+  async setHashDefault(enabled: boolean): Promise<boolean> {
+    if (this.disposed) return false;
+    if (this.state.phase !== "connected") return false;
+    if (typeof enabled !== "boolean") return false;
+    const epoch = this.epoch;
+    this.state.hashDefaultSaving = true;
+    this.state.hashDefaultError = null;
+    this.emit();
+    try {
+      const raw = await this.invoke("set_automatic_hash_default", { enabled });
+      if (epoch !== this.epoch || this.disposed) return false;
+      const value = this.sanitizeHashDefault(raw);
+      if (epoch !== this.epoch || this.disposed) return false;
+      this.state.hashDefaultEnabled = value;
+      this.state.hashDefaultError = null;
+      this.state.hashDefaultSaving = false;
+      this.emit();
+      return true;
+    } catch (err) {
+      if (epoch !== this.epoch || this.disposed) return false;
+      if (isSuperseded(err)) return false;
+      this.state.hashDefaultError = this.hashErrorMessage(err, "Could not save the hashing default.");
+      this.state.hashDefaultSaving = false;
+      this.emit();
+      return false;
+    }
+  }
+
+  async loadHashes(): Promise<void> {
+    if (this.disposed) return;
+    if (this.state.phase !== "connected") return;
+    // Manual connections never surface another daemon's digests.
+    if (!this.state.managed) {
+      this.state.hashes = [];
+      this.state.hashError = null;
+      this.state.hashesLoading = false;
+      this.emit();
+      return;
+    }
+    if (this.hashLoadPromise !== null && this.hashLoadEpoch === this.epoch) {
+      return this.hashLoadPromise;
+    }
+    const epoch = this.epoch;
+    const seq = (this.hashLoadSeq += 1);
+    const task = this.executeLoadHashes(epoch, seq, "get_download_hashes");
+    this.hashLoadPromise = task;
+    this.hashLoadEpoch = epoch;
+    return task.then(
+      () => {
+        if (this.hashLoadPromise === task) {
+          this.hashLoadPromise = null;
+          this.hashLoadEpoch = null;
+        }
+      },
+      () => {
+        if (this.hashLoadPromise === task) {
+          this.hashLoadPromise = null;
+          this.hashLoadEpoch = null;
+        }
+      },
+    );
+  }
+
+  async refreshHashes(): Promise<void> {
+    if (this.disposed) return;
+    if (this.state.phase !== "connected") return;
+    if (!this.state.managed) {
+      this.state.hashes = [];
+      this.state.hashError = null;
+      this.state.hashesLoading = false;
+      this.emit();
+      return;
+    }
+    const epoch = this.epoch;
+    const seq = (this.hashLoadSeq += 1);
+    await this.executeLoadHashes(epoch, seq, "refresh_download_hashes");
+  }
+
+  private async executeLoadHashes(epoch: number, seq: number, command: string): Promise<void> {
+    if (this.disposed) return;
+    this.state.hashesLoading = true;
+    this.emit();
+    let raw: unknown;
+    try {
+      raw = await this.invoke(command);
+    } catch (err) {
+      if (epoch !== this.epoch || this.disposed) return;
+      if (seq !== this.hashLoadSeq) return;
+      if (isSuperseded(err)) return;
+      this.state.hashError = this.hashErrorMessage(err, "Could not load hashes.");
+      this.state.hashesLoading = false;
+      this.emit();
+      return;
+    }
+    if (epoch !== this.epoch || this.disposed) return;
+    if (seq !== this.hashLoadSeq) return;
+    // Manual connections never retain digests, even if a late managed
+    // response arrives after a connection switch.
+    if (!this.state.managed) {
+      this.state.hashes = [];
+      this.state.hashError = null;
+      this.state.hashesLoading = false;
+      this.emit();
+      return;
+    }
+    const rows = sanitizeDownloadHashes(raw);
+    if (epoch !== this.epoch || this.disposed) return;
+    if (seq !== this.hashLoadSeq) return;
+    this.state.hashes = rows;
+    this.state.hashError = null;
+    this.state.hashesLoading = false;
+    this.emit();
+  }
+
+  async setHashIntents(intents: Array<{ id: string; enabled: boolean }>): Promise<boolean> {
+    if (this.disposed) return false;
+    if (this.state.phase !== "connected") return false;
+    if (!Array.isArray(intents) || intents.length > 100) return false;
+    for (const intent of intents) {
+      if (intent === null || typeof intent !== "object") return false;
+      const row = intent as Record<string, unknown>;
+      if (typeof row.id !== "string" || row.id.length === 0) return false;
+      if (typeof row.enabled !== "boolean") return false;
+    }
+    const epoch = this.epoch;
+    try {
+      const raw = await this.invoke("set_download_hash_intents", {
+        intents: intents.map((intent) => ({ id: intent.id, enabled: intent.enabled })),
+      });
+      if (epoch !== this.epoch || this.disposed) return false;
+      if (!this.state.managed) {
+        this.state.hashes = [];
+        this.emit();
+        return true;
+      }
+      this.state.hashes = sanitizeDownloadHashes(raw);
+      this.state.hashError = null;
+      this.emit();
+      return true;
+    } catch (err) {
+      if (epoch !== this.epoch || this.disposed) return false;
+      if (isSuperseded(err)) return false;
+      this.state.hashError = this.hashErrorMessage(err, "Could not update hash choices.");
+      this.emit();
+      return false;
+    }
   }
 
   private stopTimer(): void {
@@ -1271,6 +1613,7 @@ export class NativeQueueController {
     this.state.addOutcome = null;
     this.state.batch = null;
     this.resetMaxConcurrentState();
+    this.resetHashState();
     this.state.managed = false;
     this.state.rateLimitBps = null;
     this.state.rateLoading = false;
@@ -1356,6 +1699,7 @@ export class NativeQueueController {
     this.state.addOutcome = null;
     this.state.batch = null;
     this.resetMaxConcurrentState();
+    this.resetHashState();
     this.state.managed = false;
     this.state.rateLimitBps = null;
     this.state.rateLoading = false;
@@ -1417,6 +1761,7 @@ export class NativeQueueController {
     this.state.addOutcome = null;
     this.state.batch = null;
     this.resetMaxConcurrentState();
+    this.resetHashState();
     this.state.managed = false;
     this.state.rateLimitBps = null;
     this.state.rateLoading = false;
@@ -1508,6 +1853,7 @@ export class NativeQueueController {
       this.state.addOutcome = null;
       this.state.batch = null;
       this.resetMaxConcurrentState();
+      this.resetHashState();
       this.state.managed = true;
       this.state.rateLimitBps = null;
       this.state.rateLoading = false;
@@ -1831,7 +2177,8 @@ export class NativeQueueController {
   private async addAttempt(
     url: string,
     reportError: boolean,
-    onAck?: (outcome: AddOutcome) => void,
+    onAck?: (outcome: AddOutcome, hashWarning?: string) => void,
+    hashEnabled?: boolean,
   ): Promise<AddAttempt> {
     if (this.disposed) return { kind: "stopped", code: "disposed" };
     if (this.state.phase !== "connected") return { kind: "stopped", code: "notconnected" };
@@ -1845,7 +2192,15 @@ export class NativeQueueController {
     try {
       let raw: unknown;
       try {
-        raw = await this.invoke("add_download", { url });
+        // Per-batch hash choice is snapshotted once at submission. When the
+        // caller passes an explicit boolean, use the options IPC so the
+        // durable intent is bound to the confirmed queued id. Legacy callers
+        // without a snapshot keep the single-add route unchanged.
+        if (typeof hashEnabled === "boolean") {
+          raw = await this.invoke("add_download_with_options", { url, hash: hashEnabled });
+        } else {
+          raw = await this.invoke("add_download", { url });
+        }
       } catch (err) {
         if (this.disposed) return { kind: "stopped", code: "disposed" };
         if (epoch !== this.epoch || this.addEpoch !== epoch) {
@@ -1872,7 +2227,20 @@ export class NativeQueueController {
       if (epoch !== this.epoch || this.addEpoch !== epoch) {
         return { kind: "ambiguous", code: "superseded" };
       }
-      const outcome = typeof raw === "string" ? raw : "";
+      // New IPC returns { status, id?, hashRecorded? }; legacy returns a bare
+      // status string. Only the status is used for batch outcomes — ids never
+      // enter display state, and pending/duplicate carry no download id by
+      // contract. The hash flag only decides whether the accepted queued
+      // download needs a bounded warning; it never enters a message as data.
+      let outcome = "";
+      let hashRecorded: unknown;
+      if (typeof raw === "string") {
+        outcome = raw;
+      } else if (raw !== null && typeof raw === "object") {
+        const receipt = raw as Record<string, unknown>;
+        if (typeof receipt.status === "string") outcome = receipt.status;
+        hashRecorded = receipt.hashRecorded;
+      }
       if (!KNOWN_ADD_OUTCOMES.has(outcome)) {
         if (reportError) {
           this.state.addOutcome = null;
@@ -1881,7 +2249,13 @@ export class NativeQueueController {
         return { kind: "ambiguous", code: "invalidresponse" };
       }
       const accepted = outcome as AddOutcome;
-      onAck?.(accepted);
+      // A queued add that explicitly requested hashing but did not persist the
+      // intent leaves the accepted download without automatic hashing. Record
+      // one bounded, redacted warning; the accepted download is never retried.
+      const hashUnsaved =
+        hashEnabled === true && accepted === "queued" && hashRecorded !== true;
+      if (hashUnsaved) this.recordHashIntentWarning();
+      onAck?.(accepted, hashUnsaved ? HASH_INTENT_UNSAVED_MESSAGE : undefined);
       this.state.addOutcome = accepted;
       this.state.error = null;
       if (accepted !== "queued") return { kind: "ok", outcome: accepted };
@@ -1922,8 +2296,11 @@ export class NativeQueueController {
    * are never sent. Any disconnect, definitive connection failure, or
    * unconfirmed request stops the batch; remaining links stay unattempted and
    * are returned for the input box. No link is ever retried automatically.
+   * When `hashEnabled` is an explicit boolean it is snapshotted once for the
+   * whole batch and sent via `add_download_with_options`; legacy callers
+   * without a snapshot keep the single-add route unchanged.
    */
-  async addBatch(input: string): Promise<BatchResult> {
+  async addBatch(input: string, hashEnabled?: boolean): Promise<BatchResult> {
     const plan = planUrlLines(input);
     if (plan.length === 0) return { results: [], recoverable: [] };
     if (this.disposed) {
@@ -2036,16 +2413,21 @@ export class NativeQueueController {
         let acknowledged = false;
         let attempt: AddAttempt;
         try {
-          attempt = await this.addAttempt(entry.url, false, (outcome) => {
-            // Commit the definitive acknowledgement before the adoption
-            // refresh. If reconnect happens while that refresh is pending, the
-            // link is already recorded as accepted, so recovery cannot mark it
-            // uncertain or offer it for resend.
-            context.inFlight = false;
-            context.nextIndex = index + 1;
-            acknowledged = true;
-            push(this.batchResult(entry, outcome));
-          });
+          attempt = await this.addAttempt(
+            entry.url,
+            false,
+            (outcome, hashWarning) => {
+              // Commit the definitive acknowledgement before the adoption
+              // refresh. If reconnect happens while that refresh is pending, the
+              // link is already recorded as accepted, so recovery cannot mark it
+              // uncertain or offer it for resend.
+              context.inFlight = false;
+              context.nextIndex = index + 1;
+              acknowledged = true;
+              push(this.batchResult(entry, outcome, undefined, hashWarning));
+            },
+            hashEnabled,
+          );
         } finally {
           context.inFlight = false;
         }
@@ -2654,6 +3036,7 @@ export class NativeQueueController {
     this.state.addOutcome = null;
     this.state.batch = null;
     this.resetMaxConcurrentState();
+    this.resetHashState();
     this.state.managed = false;
     this.state.rateLimitBps = null;
     this.state.rateLoading = false;
@@ -2705,6 +3088,7 @@ export class NativeQueueController {
     this.batchIdentity = null;
     this.state.batch = null;
     this.resetMaxConcurrentState();
+    this.resetHashState();
     this.locationEpoch = null;
     this.state.managed = false;
     this.state.rateLoading = false;

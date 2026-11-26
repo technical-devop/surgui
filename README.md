@@ -24,6 +24,12 @@ affiliated with it. It targets the Surge v0.13.0 API. The app bundles a patched 
   bytes), where `0` means unlimited. Managed bundled-daemon connection only; if a
   write's outcome cannot be confirmed, speed control stays disabled until the
   app restarts.
+- **Automatic MD5 + SHA-256**: an optional per-batch checkbox (backed by an
+  app-wide persistent default that starts `false`) hashes each positively
+  acknowledged queued download after the managed daemon fully finalizes it and
+  any post-download hook has finished. Both full digests are shown. This is
+  available only on the owned bundled managed-daemon connection. See
+  [Automatic MD5 + SHA-256](#automatic-md5--sha-256-managed-daemon-only).
 - **Daemon max simultaneous downloads**: reads and saves
   `network.max_concurrent_downloads` (1–10; daemon default 3). Saving requires
   the bundled managed-daemon connection. The setting is persisted by the daemon,
@@ -196,6 +202,129 @@ connection before starting a broadly-listening server.
   unconfirmed write disables this control until the app restarts, independent of
   the speed-limit control.
 
+## Automatic MD5 + SHA-256 (managed daemon only)
+
+The batch submission form has one optional hash checkbox. Its initial state is
+the persisted app-wide default, which is `false` until the user changes it. The
+default affects future batches only; it does not retroactively hash existing
+rows. Per-batch choices are otherwise independent.
+
+The backend binds hashing to the **confirmed queued download id**, not to a URL,
+filename, or queue difference. It also persists a random per-owned-queue
+namespace anchored to the authenticated app-private managed state directory,
+plus the daemon-reported `added_at` (zero when v0.13 omits it) and a stable
+queue fingerprint read back from that daemon. The namespace deliberately does
+not depend on the ephemeral
+connection id or process id, so the exact same persistent managed queue resumes
+after an app restart. A `202 pending_approval` response carries an
+approval-request id rather than a download id, and a duplicate has no new id, so
+neither is bound. An ambiguous add is never retried automatically. If the association or provenance
+cannot be proven, the intent is not recorded and `hashRecorded` is false instead
+of guessing another download with the same id. If the app crashes after the
+daemon acknowledges the add but before the intent file write is durable, the add
+can succeed without a hash intent; this is an unavoidable two-party
+acknowledgement window, and the feature does not claim exactly-once processing.
+The add response reports whether the intent was durably recorded.
+
+Only the owned bundled managed daemon is eligible. Manual/remote connections
+are never hashed. A single bounded background worker makes an authenticated
+`GET /list` and requires exactly one row with the bound id. It hashes only when
+the daemon record is `completed`, its phase is not `verifying` or `finalizing`,
+and it is not `moving`, `file_missing`, or `processing`. If a post-download hook
+applies to the download (using the same released v0.13.0 category selection as
+the daemon), the hook must also have finished (`processed`). Completed rows that
+are still finalizing remain waiting. The daemon-provided destination is never
+accepted from the UI.
+
+The file is opened read-only and never written. On Linux each component is
+opened relative to the previous directory with `O_NOFOLLOW`; the final regular
+file is pinned before it is read and every ancestor-directory identity is
+recorded. After the read, the path is reopened component-by-component from the
+root, descriptor-relative and no-follow, and each ancestor identity plus the
+final file identity, size, mtime, and change time (`ctime`) must match. This
+rejects a replaced
+ancestor even when the original inode is hard-linked into the new path. The
+mount is checked against the same conservative local-filesystem allowlist used
+by the open-location feature.
+
+On Windows the path must be a drive-letter path on a fixed local drive.
+UNC, verbatim, device, drive-relative, alternate-stream, reserved-device, and
+trailing-dot/space names are rejected before any file is opened. The drive root
+is pinned, then each component is opened with `NtCreateFile` relative to the
+previously opened directory handle using `FILE_OPEN_REPARSE_POINT`. Every
+opened component is checked for reparse tags (symbolic links, junctions, mount
+points, or any other reparse point), directory/file type, disk-backed (non-
+network) file type, and offline/recall attributes; any uncertainty fails
+closed. The final regular file is read from that same handle. After the read,
+the handle identity, size, mtime, and NTFS change time are rechecked, then the
+drive root and every component are reopened and compared with the originally
+pinned identities. A replaced root, ancestor, or final file fails even if the original
+file object remains reachable through the old handle.
+
+Both digests are streamed in one pass over the same opened handle with a fixed
+64 KiB buffer. The daemon record (same id, `added_at`, destination, size,
+completion state, hook state), managed daemon ownership, and connection
+epoch/pid are rechecked before publication, and the post-download hook
+configuration is read again after hashing. A changed or replaced file, replaced
+ancestor, duplicate id, unsafe path, stale intent generation, removed record,
+changed daemon, or malformed hook settings fails closed without publishing
+digests. When completed rows are served, the authoritative `/list` record, the
+same completion/hook rules, and the exact persisted file identity (including
+change time) are re-verified first; a removed/replaced file or removed/changed
+queue record is invalidated to `stale` before any digest is returned. Rows that
+completed or changed while that validation was paused are not published with
+digests, and the `set_download_hash_intents` response goes through the same
+verified serve path instead of returning stored values directly.
+
+Only sanitized states (`pending`, `complete`, `failed`, `unavailable`, `stale`,
+`disabled`), whole lowercase hex digests, and byte counts cross IPC. Raw paths,
+URLs, tokens, daemon errors, category commands, and hook errors never do.
+Results are associated with the stable per-owned-queue namespace, not an
+ephemeral connection id or process id. A replaced/new managed queue, a different
+namespace, a reused id with different provenance, or missing/malformed
+namespace metadata fails closed as `stale`; it is never rebound by id alone. A
+new app lifecycle for the exact same persistent managed queue resumes saved
+pending work and retains completed digests only after a fresh `/list` record and
+the exact file identity are revalidated. A separate in-process lifecycle fence
+still prevents old in-flight work from publishing after disconnect/reconnect.
+
+State is stored in a bounded, versioned JSON file in the app-private managed
+state directory, alongside a separate random namespace file created with
+private permissions. Both writes use a same-directory temporary file, fsync,
+atomic rename, and a directory fsync on Linux. The namespace is independent of
+the persisted default preference, so a missing/corrupt queue namespace cannot
+erase the user's default. Missing state means disabled and empty. Malformed or
+unsupported-version state fails safe to disabled/empty rather than guessing.
+Duplicate ids in one binding call keep the last value, and the record count is
+bounded.
+
+Metadata checks cannot prove immutability against a same-user actor that
+mutates a file during the read, replaces an ancestor after the final descriptor
+check, or deliberately restores its size, mtime, and change time afterwards.
+Including ctime catches ordinary same-size rewrites that restore only mtime, but
+a privileged or same-user actor with the tools and timing to restore all
+metadata cannot be fully excluded. These checks reduce the race window and reject
+every detectable change, but they are not a cryptographic guarantee. On Linux the pinned handle is reopened through `/proc/self/fd`; if
+procfs is unavailable the hash fails closed. On Windows the pinned
+`FILE_OPEN_REPARSE_POINT` component chain and the post-read re-walk narrow the
+same race window; neither platform claims cryptographic immutability.
+
+### IPC contract
+
+- `add_download_with_options(url, hash)` → `{ status, id?, hashRecorded? }`.
+  `id` and `hashRecorded` are present only for a confirmed queued add when
+  `hash` was requested. `status` remains `queued`, `pendingApproval`, or
+  `duplicate` for compatibility.
+- `get_automatic_hash_settings()` → `{ defaultEnabled }`.
+- `set_automatic_hash_default(enabled)` → `{ defaultEnabled }`.
+- `set_download_hash_intents([{ id, enabled }])` → current sanitized rows,
+  re-verified through the same serve path (never stored digests directly).
+  Accepts only daemon ids and booleans; at most 100 intents per call.
+- `get_download_hashes()` → current daemon's sanitized rows, re-verified
+  against the authoritative queue record and exact file identity first.
+- `refresh_download_hashes()` → asks the single worker for another pass and
+  returns the re-verified currently visible rows.
+
 ### Where files land
 
 Downloads are written on the **daemon host**, not the machine running the GUI. With
@@ -261,6 +390,19 @@ configuration as the source of truth.
   `src/lib/queue/*.test.ts`), `npm run build` (vite build).
 - Rust, from `src-tauri/`: `cargo fmt --check`, `cargo test`,
   `cargo clippy --all-targets -- -D warnings`.
+- Automatic-hash Rust tests cover known MD5/SHA-256 vectors, zero-byte and
+  multi-buffer files, unsafe paths, same-size modification and replacement,
+  the v0.13 completion/finalizing/hook matrix, duplicate and missing ids,
+  stale intent generations, stable per-queue namespace/provenance binding,
+  pending resume after restart, fail-closed serving after file/queue removal
+  or replacement, the disabled app default with rollback-safe atomic
+  persistence, malformed hook settings, cancellation, and the single bounded
+  worker. Windows-cfg filesystem tests cover a nested
+  regular local path, nonlocal/device/verbatim and dangerous names,
+  symbolic-link, junction/reparse, replaced-ancestor, mutation/replacement
+  during hashing, cancellation, and identity/descriptor stability. The Windows
+  link tests explicitly skip only when the test account lacks symlink/junction
+  creation privilege.
 - Windows CI: the manual workflow above (`.github/workflows/windows-build.yml`)
   runs those same frontend and Rust checks on `windows-latest` and then builds
   the NSIS setup EXE, uploaded as a 7-day artifact. A green run covers checks

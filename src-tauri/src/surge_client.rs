@@ -103,6 +103,8 @@ pub struct Download {
     #[serde(default)]
     pub phase: Option<String>,
     #[serde(default)]
+    pub category_override: Option<String>,
+    #[serde(default)]
     pub processing: bool,
     #[serde(default)]
     pub processed: bool,
@@ -385,6 +387,28 @@ pub enum AddOutcome {
     PendingApproval,
     /// HTTP 409: rejected as an already-known duplicate.
     Duplicate,
+}
+
+/// Positive acknowledgment from `POST /download`, including the queued
+/// download id the daemon assigned.
+///
+/// Only a confirmed HTTP 200 `queued` response carries `id`. A 202
+/// `pending_approval` id is an approval-request id, not a download id, and a
+/// 409 duplicate has no new id, so both keep `id == None`. The id is never
+/// logged through `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AddReceipt {
+    pub outcome: AddOutcome,
+    pub id: Option<String>,
+}
+
+impl fmt::Debug for AddReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AddReceipt")
+            .field("outcome", &self.outcome)
+            .field("has_id", &self.id.is_some())
+            .finish()
+    }
 }
 
 /// Released `POST /download` request body.
@@ -800,6 +824,118 @@ async fn get_settings_rate_limit(
     parse_rate_limit_json(value)
 }
 
+async fn get_post_download_hook_applies(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    filename: &str,
+    category_override: Option<&str>,
+) -> Result<bool, ConnectError> {
+    let response = client
+        .get(format!("{}/settings", base_url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(map_send_error)?;
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(ConnectError::Unauthorized);
+    }
+    if status != StatusCode::OK {
+        return Err(ConnectError::InvalidResponse);
+    }
+    let bytes = read_bounded_body(response).await?;
+    let settings: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ConnectError::InvalidResponse)?;
+    post_download_hook_applies_from_settings(&settings, filename, category_override)
+}
+
+fn command_from_category(category: &serde_json::Value) -> Result<Option<&str>, ConnectError> {
+    let object = category.as_object().ok_or(ConnectError::InvalidResponse)?;
+    let Some(name) = object.get("name") else {
+        return Err(ConnectError::InvalidResponse);
+    };
+    if !name.is_string() {
+        return Err(ConnectError::InvalidResponse);
+    }
+    match object.get("post_download_command") {
+        None => Ok(Some("")),
+        Some(serde_json::Value::String(command)) => Ok(Some(command.as_str())),
+        Some(_) => Err(ConnectError::InvalidResponse),
+    }
+}
+
+fn post_download_hook_applies_from_settings(
+    settings: &serde_json::Value,
+    filename: &str,
+    category_override: Option<&str>,
+) -> Result<bool, ConnectError> {
+    // An absent or malformed category container is not proof that no hook
+    // exists. Fail closed instead of silently treating it as "no hook".
+    let categories = settings
+        .get("categories")
+        .ok_or(ConnectError::InvalidResponse)?;
+    let category_object = categories
+        .as_object()
+        .ok_or(ConnectError::InvalidResponse)?;
+    let categories = category_object
+        .get("categories")
+        .and_then(|categories| categories.as_array())
+        .ok_or(ConnectError::InvalidResponse)?;
+
+    if let Some(override_name) = category_override {
+        for category in categories {
+            let object = category.as_object().ok_or(ConnectError::InvalidResponse)?;
+            let name = object
+                .get("name")
+                .and_then(|name| name.as_str())
+                .ok_or(ConnectError::InvalidResponse)?;
+            if name != override_name {
+                continue;
+            }
+            let command = command_from_category(category)?.unwrap_or_default();
+            return Ok(!command.trim().is_empty());
+        }
+        // The daemon definitively selects no category for an unknown override.
+        return Ok(false);
+    }
+
+    let enabled = match category_object
+        .get("category_enabled")
+        .ok_or(ConnectError::InvalidResponse)?
+    {
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(value) => value.as_i64().is_some_and(|value| value != 0),
+        _ => return Err(ConnectError::InvalidResponse),
+    };
+    if !enabled || filename.is_empty() {
+        return Ok(false);
+    }
+    for category in categories {
+        let object = category.as_object().ok_or(ConnectError::InvalidResponse)?;
+        let name = object
+            .get("name")
+            .and_then(|name| name.as_str())
+            .ok_or(ConnectError::InvalidResponse)?;
+        let _ = name;
+        let pattern = match object.get("pattern") {
+            None => "",
+            Some(serde_json::Value::String(pattern)) => pattern.as_str(),
+            Some(_) => return Err(ConnectError::InvalidResponse),
+        }
+        .trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        let regex = regex::Regex::new(pattern).map_err(|_| ConnectError::InvalidResponse)?;
+        if regex.is_match(filename) {
+            let command = command_from_category(category)?.unwrap_or_default();
+            return Ok(!command.trim().is_empty());
+        }
+    }
+    Ok(false)
+}
+
 /// Case-insensitive match against the exact released duplicate-rejection
 /// message.
 fn is_duplicate_message(message: &str) -> bool {
@@ -1175,6 +1311,18 @@ impl SurgeClient {
     /// bounded before the outcome is verified. Request URL, token, response
     /// body, `id`, `filename` and reqwest errors never appear in an error.
     pub async fn add_download(&self, url: &str) -> Result<AddOutcome, ConnectError> {
+        self.add_download_receipt(url)
+            .await
+            .map(|receipt| receipt.outcome)
+    }
+
+    /// Enqueue a download and preserve the positively acknowledged id.
+    ///
+    /// The returned id is present only for a confirmed HTTP 200 `queued`
+    /// acknowledgment. Pending-approval and duplicate responses stay
+    /// unassociated so callers cannot bind a hash request to an id that is not
+    /// a download id. No request is retried on an ambiguous response.
+    pub async fn add_download_receipt(&self, url: &str) -> Result<AddReceipt, ConnectError> {
         validate_download_url(url)?;
         let body = serde_json::to_vec(&AddRequest {
             url,
@@ -1203,8 +1351,15 @@ impl SurgeClient {
             serde_json::from_slice(&bytes).map_err(|_| ConnectError::InvalidResponse)?;
         match status {
             StatusCode::OK => {
-                if parsed.status.as_deref() == Some("queued") && has_nonempty_id(&parsed.id) {
-                    Ok(AddOutcome::Queued)
+                if parsed.status.as_deref() == Some("queued") {
+                    let id = parsed
+                        .id
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or(ConnectError::InvalidResponse)?;
+                    Ok(AddReceipt {
+                        outcome: AddOutcome::Queued,
+                        id: Some(id),
+                    })
                 } else {
                     Err(ConnectError::InvalidResponse)
                 }
@@ -1213,7 +1368,10 @@ impl SurgeClient {
                 if parsed.status.as_deref() == Some("pending_approval")
                     && has_nonempty_id(&parsed.id)
                 {
-                    Ok(AddOutcome::PendingApproval)
+                    Ok(AddReceipt {
+                        outcome: AddOutcome::PendingApproval,
+                        id: None,
+                    })
                 } else {
                     Err(ConnectError::InvalidResponse)
                 }
@@ -1222,12 +1380,72 @@ impl SurgeClient {
                 if parsed.status.as_deref() == Some("error")
                     && parsed.message.as_deref().is_some_and(is_duplicate_message)
                 {
-                    Ok(AddOutcome::Duplicate)
+                    Ok(AddReceipt {
+                        outcome: AddOutcome::Duplicate,
+                        id: None,
+                    })
                 } else {
                     Err(ConnectError::InvalidResponse)
                 }
             }
         }
+    }
+
+    /// Read one authoritative queue record by its acknowledged id.
+    ///
+    /// This is the stable provenance source used when a hash intent is first
+    /// bound: the daemon response carries the immutable `added_at` value that
+    /// must still match when the worker later hashes the file. Only the
+    /// authenticated origin is contacted and the body is bounded.
+    pub async fn get_download(&self, id: &str) -> Result<Download, ConnectError> {
+        if id.is_empty() || id.len() > 4 * 1024 || id.chars().any(char::is_control) {
+            return Err(ConnectError::InvalidResponse);
+        }
+        let mut url = Url::parse(&self.base_url).map_err(|_| ConnectError::InvalidResponse)?;
+        url.set_path("/download");
+        url.query_pairs_mut().append_pair("id", id);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(map_send_error)?;
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(ConnectError::Unauthorized);
+        }
+        if status != StatusCode::OK {
+            return Err(ConnectError::InvalidResponse);
+        }
+        let bytes = read_bounded_body(response).await?;
+        let download: Download =
+            serde_json::from_slice(&bytes).map_err(|_| ConnectError::InvalidResponse)?;
+        if download.id != id {
+            return Err(ConnectError::InvalidResponse);
+        }
+        Ok(download)
+    }
+
+    /// Whether a post-download hook is configured for this filename.
+    ///
+    /// This mirrors the released v0.13.0 category selection used before a hook
+    /// is started. Only a boolean leaves this method; category names, patterns,
+    /// commands and raw settings are never returned or logged. A malformed
+    /// settings document fails closed as an invalid response.
+    pub async fn post_download_hook_applies(
+        &self,
+        filename: &str,
+        category_override: Option<&str>,
+    ) -> Result<bool, ConnectError> {
+        get_post_download_hook_applies(
+            &self.client,
+            &self.base_url,
+            &self.token,
+            filename,
+            category_override,
+        )
+        .await
     }
 
     /// Read the live global download limit from the pinned `/settings` route.
@@ -1785,5 +2003,66 @@ mod tests {
             !request_reached,
             "no HTTP request may reach an untrusted listener"
         );
+    }
+    #[test]
+    fn hook_detection_matches_released_category_contract() {
+        let settings = serde_json::json!({
+            "categories": {
+                "category_enabled": true,
+                "categories": [
+                    {"name": "Videos", "pattern": r"(?i)\.mp4$", "path": "/v", "post_download_command": "run"},
+                    {"name": "Other", "pattern": r".*", "path": "/o", "post_download_command": ""}
+                ]
+            }
+        });
+        assert!(
+            post_download_hook_applies_from_settings(&settings, "movie.MP4", None)
+                .expect("valid settings")
+        );
+        assert!(
+            !post_download_hook_applies_from_settings(&settings, "document.pdf", None)
+                .expect("valid settings")
+        );
+        assert!(
+            !post_download_hook_applies_from_settings(&settings, "movie.mp4", Some("Missing"))
+                .expect("unknown override is a definitive no-hook")
+        );
+        assert!(
+            post_download_hook_applies_from_settings(&settings, "movie.mp4", Some("Videos"))
+                .expect("valid settings")
+        );
+
+        let disabled = serde_json::json!({
+            "categories": {
+                "category_enabled": false,
+                "categories": [{"name": "Videos", "pattern": r".*", "path": "/v", "post_download_command": "run"}]
+            }
+        });
+        assert!(
+            !post_download_hook_applies_from_settings(&disabled, "movie.mp4", None)
+                .expect("disabled categories are a definitive no-hook")
+        );
+        assert!(
+            post_download_hook_applies_from_settings(&disabled, "movie.mp4", Some("Videos"))
+                .expect("an explicit override still selects the category")
+        );
+
+        for malformed in [
+            serde_json::json!({"categories": "malformed"}),
+            serde_json::json!({}),
+            serde_json::json!({"categories": {}}),
+            serde_json::json!({"categories": {"category_enabled": true}}),
+            serde_json::json!({"categories": {"category_enabled": "true", "categories": []}}),
+            serde_json::json!({"categories": {"category_enabled": true, "categories": ["bad"]}}),
+            serde_json::json!({"categories": {"category_enabled": true, "categories": [{"pattern": ".*"}]}}),
+            serde_json::json!({"categories": {"category_enabled": true, "categories": [{"name": "Bad", "pattern": "("}]}}),
+            serde_json::json!({"categories": {"category_enabled": true, "categories": [{"name": "Bad", "pattern": ".*", "post_download_command": 7}]}}),
+        ] {
+            assert_eq!(
+                post_download_hook_applies_from_settings(&malformed, "movie.mp4", None),
+                Err(ConnectError::InvalidResponse),
+                "malformed hook settings must fail closed: {malformed}"
+            );
+        }
     }
 }

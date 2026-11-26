@@ -321,6 +321,11 @@ impl LocationLauncher for SystemLocationLauncher {
 /// traversal components. The existing file must be a regular file, and neither
 /// it nor any ancestor may be a symlink/reparse point. The platform mount check
 /// then fails closed for unrecognized/network filesystems.
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_local_mount_for_hash(path: &Path) -> Result<(), LocationError> {
+    platform::validate_local_mount(path)
+}
+
 pub(crate) fn containing_directory_for_completed_file(
     path: &str,
 ) -> Result<PathBuf, LocationError> {
@@ -425,7 +430,7 @@ mod platform {
             .ok_or(LocationError::Unavailable)
     }
 
-    fn validate_local_mount(path: &Path) -> Result<(), LocationError> {
+    pub(super) fn validate_local_mount(path: &Path) -> Result<(), LocationError> {
         let mountinfo =
             std::fs::read("/proc/self/mountinfo").map_err(|_| LocationError::NonLocal)?;
         validate_mountinfo_for_path(&mountinfo, path)

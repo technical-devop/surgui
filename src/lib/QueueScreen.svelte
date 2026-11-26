@@ -1,7 +1,9 @@
 <script lang="ts">
   import { filterQueue, formatEta, formatSizePair, formatSpeed, groupByStatus, lifecycleLabel, lifecycleSuffix, progressRatio } from "./queue/queue";
-  import type { BulkAction, BulkSummary, BulkUncertainty, QueueItem, StatusFilter } from "./queue/types";
+  import type { BulkAction, BulkSummary, BulkUncertainty, HashIntentWarning, QueueItem, StatusFilter } from "./queue/types";
   import { STATUS_ORDER } from "./queue/types";
+  import { findDownloadHash, hashCopyValue, hashDisplayForRow, isHashComplete } from "./queue/hashes";
+  import type { DownloadHash } from "./queue/hashes";
   import { untrack } from "svelte";
   import logoUrl from "../assets/surge-logo.webp";
 
@@ -23,6 +25,14 @@
     bulkUncertaintyOverflow = 0,
     onDismissBulkUncertainty = undefined,
     onDismissBulkUncertaintyOverflow = undefined,
+    hashIntentWarnings = [],
+    hashIntentWarningOverflow = 0,
+    onDismissHashIntentWarning = undefined,
+    onDismissHashIntentWarningOverflow = undefined,
+    hashes = [],
+    hashesLoading = false,
+    hashError = null,
+    onRefreshHashes = undefined,
   }: {
     items: QueueItem[];
     mode: "offline" | "sample" | "native";
@@ -41,7 +51,49 @@
     bulkUncertaintyOverflow?: number;
     onDismissBulkUncertainty?: (id: number) => void;
     onDismissBulkUncertaintyOverflow?: () => void;
+    hashIntentWarnings?: HashIntentWarning[];
+    hashIntentWarningOverflow?: number;
+    onDismissHashIntentWarning?: (id: number) => void;
+    onDismissHashIntentWarningOverflow?: () => void;
+    hashes?: DownloadHash[];
+    hashesLoading?: boolean;
+    hashError?: string | null;
+    onRefreshHashes?: () => void;
   } = $props();
+
+  let copiedKind = $state<"md5" | "sha256" | null>(null);
+  let copyError = $state<string | null>(null);
+
+  async function copyDigest(value: string, kind: "md5" | "sha256") {
+    if (!value) return;
+    copyError = null;
+    try {
+      const nav = globalThis.navigator as unknown as { clipboard?: { writeText: (t: string) => Promise<void> } } | undefined;
+      if (nav?.clipboard?.writeText) {
+        await nav.clipboard.writeText(value);
+      } else {
+        // Fallback for non-secure contexts: selectable text remains; report
+        // that automatic copy is unavailable rather than failing silently.
+        copyError = "Automatic copy unavailable — select the digest manually.";
+        copiedKind = null;
+        return;
+      }
+      copiedKind = kind;
+    } catch {
+      copyError = "Copy failed — select the digest manually.";
+      copiedKind = null;
+    }
+  }
+
+  // Clear copy feedback when the selection moves so a stale “Copied” never
+  // reads as the new row's state.
+  $effect(() => {
+    const _sel = selectedId;
+    untrack(() => {
+      copiedKind = null;
+      copyError = null;
+    });
+  });
 
   let rows = $state<QueueItem[]>(items.map((i) => ({ ...i })));
   let query = $state("");
@@ -322,6 +374,44 @@
     </section>
   {/if}
 
+  {#if hashIntentWarnings.length > 0 || hashIntentWarningOverflow > 0}
+    <section class="bulk-uncertainty-region" aria-label="Unresolved hash requests">
+      {#each hashIntentWarnings as warning (warning.id)}
+        <div class="bulk-uncertain">
+          <p class="bulk-uncertain-text" role="status" aria-live="polite">{warning.message}</p>
+          {#if onDismissHashIntentWarning}
+            <button
+              type="button"
+              class="btn"
+              aria-label="Dismiss hash request warning"
+              onclick={() => onDismissHashIntentWarning(warning.id)}
+            >
+              Dismiss
+            </button>
+          {/if}
+        </div>
+      {/each}
+      {#if hashIntentWarningOverflow > 0}
+        <div class="bulk-uncertain-overflow-row">
+          <p class="bulk-uncertain-overflow" role="status">
+            {hashIntentWarningOverflow} additional unresolved hash {hashIntentWarningOverflow === 1 ? "request is" : "requests are"}
+            not listed here. Hashing may not run automatically for them; none were retried automatically.
+          </p>
+          {#if onDismissHashIntentWarningOverflow}
+            <button
+              type="button"
+              class="btn"
+              aria-label="Dismiss overflowed hash warnings"
+              onclick={() => onDismissHashIntentWarningOverflow()}
+            >
+              Dismiss
+            </button>
+          {/if}
+        </div>
+      {/if}
+    </section>
+  {/if}
+
   <div class="split">
     <section class="pane list-pane" aria-label="Downloads">
       <span class="pane-ticks" aria-hidden="true"></span>
@@ -464,6 +554,76 @@
             <div class="fact-error"><dt>Error</dt><dd>{sel.error}</dd></div>
           {/if}
         </dl>
+        {@const hashRow = mode === "native" ? findDownloadHash(hashes, sel.id) : null}
+        {#if mode === "native"}
+          <section class="hash-section" aria-label="Automatic hashes for {sel.name}">
+            {#if !isManaged}
+              <p class="control-pending" role="note">Hashing needs the bundled daemon connection. Digests identify file content, not trust or safety.</p>
+            {:else if hashError}
+              <p class="control-pending" role="alert">{hashError}</p>
+              {#if onRefreshHashes}
+                <div class="detail-actions">
+                  <button type="button" class="btn" onclick={() => onRefreshHashes?.()} disabled={hashesLoading}>
+                    {hashesLoading ? "Refreshing…" : "Refresh hashes"}
+                  </button>
+                </div>
+              {/if}
+            {:else if hashRow === null}
+              <p class="control-pending" role="note">No hash requested for this download. Digests identify file content, not trust or safety.</p>
+              {#if onRefreshHashes}
+                <div class="detail-actions">
+                  <button type="button" class="btn" onclick={() => onRefreshHashes?.()} disabled={hashesLoading}>
+                    {hashesLoading ? "Refreshing…" : "Refresh hashes"}
+                  </button>
+                </div>
+              {/if}
+            {:else if hashRow.state === "complete" && isHashComplete(hashRow)}
+              <p class="control-pending" role="status">Hashes complete. Digests identify file content, not trust or safety.</p>
+              <dl class="facts hash-facts">
+                <div class="hash-row">
+                  <dt>MD5</dt>
+                  <dd class="hash-value">{hashCopyValue(hashRow, "md5")}</dd>
+                </div>
+                <div class="hash-actions">
+                  <button
+                    type="button"
+                    class="btn"
+                    aria-label={`Copy MD5 for ${sel.name}`}
+                    onclick={() => copyDigest(hashCopyValue(hashRow, "md5"), "md5")}
+                  >
+                    {copiedKind === "md5" ? "Copied" : "Copy MD5"}
+                  </button>
+                </div>
+                <div class="hash-row">
+                  <dt>SHA-256</dt>
+                  <dd class="hash-value">{hashCopyValue(hashRow, "sha256")}</dd>
+                </div>
+                <div class="hash-actions">
+                  <button
+                    type="button"
+                    class="btn"
+                    aria-label={`Copy SHA-256 for ${sel.name}`}
+                    onclick={() => copyDigest(hashCopyValue(hashRow, "sha256"), "sha256")}
+                  >
+                    {copiedKind === "sha256" ? "Copied" : "Copy SHA-256"}
+                  </button>
+                </div>
+              </dl>
+              {#if copyError}
+                <p class="control-pending" role="alert">{copyError}</p>
+              {/if}
+            {:else}
+              <p class="control-pending" role="status">{hashDisplayForRow(hashRow, sel.status, true) ?? "Hash state unknown."} Digests identify file content, not trust or safety.</p>
+              {#if onRefreshHashes}
+                <div class="detail-actions">
+                  <button type="button" class="btn" onclick={() => onRefreshHashes?.()} disabled={hashesLoading}>
+                    {hashesLoading ? "Refreshing…" : "Refresh hashes"}
+                  </button>
+                </div>
+              {/if}
+            {/if}
+          </section>
+        {/if}
         <div class="detail-actions">
           {#if mode === "sample"}
             {#each actionsFor(sel) as a (a.label)}
@@ -1419,6 +1579,33 @@
     font-variant-numeric: tabular-nums;
     overflow-wrap: anywhere;
     min-width: 0;
+  }
+
+  .hash-section {
+    margin-top: var(--space-md);
+    border-top: 1px solid var(--color-rule);
+    padding-top: var(--space-sm);
+    min-width: 0;
+  }
+
+  .hash-facts {
+    margin-top: var(--space-sm);
+  }
+
+  .hash-row dd.hash-value {
+    user-select: text;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+    min-width: 0;
+  }
+
+  .hash-actions {
+    border-top: none !important;
+    padding-top: 0 !important;
+  }
+
+  .hash-actions .btn {
+    min-width: max-content;
   }
 
   .fact-error dt,
