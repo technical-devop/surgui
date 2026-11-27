@@ -901,7 +901,7 @@ impl HashCoordinator {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn set_persistence_fault(&self, fault: Option<crate::hash_persistence::FaultConfig>) {
         let mut guard = match self.persistence_fault.lock() {
             Ok(guard) => guard,
@@ -1261,7 +1261,7 @@ impl HashCoordinator {
         self.record_intents_with(intents, &[]).map(|_| ())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn record_intents_with(
         &self,
         intents: &[HashIntent],
@@ -1377,7 +1377,7 @@ impl HashCoordinator {
 
     /// Test-only helper that simulates a lifecycle change without an epoch
     /// transition. Production transitions must use the atomic path instead.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn cancel_current(&self) {
         let _lifecycle = self.lock_lifecycle();
         self.cancel_worker();
@@ -3703,7 +3703,7 @@ impl ConnectionManager {
     /// Simulate the owned managed child exiting without a connection
     /// transition. The epoch and hash fence deliberately stay unchanged, so
     /// readers must not mistake the loss for a lifecycle supersession.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn mark_test_managed_exited(&self) {
         let mut state = self.state.lock().expect("test state lock");
         if let Some(test) = state.test_managed.as_mut() {

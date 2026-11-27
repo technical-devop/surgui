@@ -96,12 +96,12 @@ fn record_persist_diagnostic(message: String) {
 
 /// Test-only access to the last sanitized persistence diagnostic observed on
 /// this thread. It never carries paths, credentials, state bytes, or payloads.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn last_persist_diagnostic() -> Option<String> {
     LAST_PERSIST_DIAGNOSTIC.with(|slot| slot.borrow().clone())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn clear_persist_diagnostic() {
     LAST_PERSIST_DIAGNOSTIC.with(|slot| {
         *slot.borrow_mut() = None;
@@ -950,7 +950,7 @@ impl PersistenceDomain {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_fault(&self, fault: Option<FaultConfig>) -> Result<(), PersistenceError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         match self.inner.tx.try_send(Command::SetFault {
@@ -1503,7 +1503,7 @@ impl Reaper {
         });
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn take_next(&self) -> Option<ReapJob> {
         let mut inner = match self.inner.lock() {
             Ok(guard) => guard,
@@ -1609,7 +1609,7 @@ fn wait_confirmed(child: &mut Child) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn drain_reaper<W>(reaper: &Reaper, mut wait: W)
 where
     W: FnMut(&mut Child) -> std::io::Result<std::process::ExitStatus>,
@@ -2283,6 +2283,7 @@ fn acquire_directory_lock(directory: &Path) -> Result<DirectoryLock, LockError> 
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .map_err(|_| LockError::Unavailable)?;
         lock_windows(&file).map_err(|busy| {
@@ -2939,6 +2940,7 @@ fn fault_point(fault: &Option<FaultConfig>, point: &str) -> Result<(), ()> {
 mod tests {
     use super::*;
 
+    #[cfg(all(test, target_os = "linux"))]
     fn serialize_helper_process_tests() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         match LOCK.lock() {
