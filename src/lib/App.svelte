@@ -843,9 +843,9 @@
           onclick={() => selectTab("settings")}
         >
           <svg class="tab-gear" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-            <g fill="none" stroke="currentColor" stroke-width="1.4">
+            <g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+              <path d="M14.06 6.71 L14.06 9.29 L11.7 9.53 L13.2 11.38 L11.38 13.2 L9.53 11.7 L9.29 14.06 L6.71 14.06 L6.47 11.7 L4.62 13.2 L2.8 11.38 L4.3 9.53 L1.94 9.29 L1.94 6.71 L4.3 6.47 L2.8 4.62 L4.62 2.8 L6.47 4.3 L6.71 1.94 L9.29 1.94 L9.53 4.3 L11.38 2.8 L13.2 4.62 L11.7 6.47 Z" />
               <circle cx="8" cy="8" r="2.2" />
-              <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2L3.4 12.6" />
             </g>
           </svg>
           Settings
@@ -933,9 +933,7 @@
               placeholder="https://example.com/file.iso"
               bind:value={addUrl}
               disabled={addBusy}
-              aria-describedby="add-url-help"
             ></textarea>
-            <p class="field-help" id="add-url-help">One HTTP(S) URL per line. Up to {MAX_BATCH_LINES} per batch, sent one at a time through the normal add path. Repeated exact links are sent once per batch; daemon duplicates are reported. Failed, unconfirmed, invalid and unattempted links stay here. The field locks while a batch runs. You can edit offline; submitting needs a connection.</p>
           </div>
           <div class="field hash-field">
             <div class="hash-controls">
@@ -1823,11 +1821,6 @@
     .conn-error,
     .conn-actions {
       grid-column: 1 / -1;
-    }
-    .add-form {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: end;
     }
   }
 
