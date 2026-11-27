@@ -1,4 +1,4 @@
-# Surge Desktop
+# Surgui
 
 Unofficial desktop GUI for Surge, the download daemon. Built with Tauri + Svelte.
 
@@ -290,13 +290,43 @@ still prevents old in-flight work from publishing after disconnect/reconnect.
 
 State is stored in a bounded, versioned JSON file in the app-private managed
 state directory, alongside a separate random namespace file created with
-private permissions. Both writes use a same-directory temporary file, fsync,
-atomic rename, and a directory fsync on Linux. The namespace is independent of
-the persisted default preference, so a missing/corrupt queue namespace cannot
-erase the user's default. Missing state means disabled and empty. Malformed or
-unsupported-version state fails safe to disabled/empty rather than guessing.
-Duplicate ids in one binding call keep the last value, and the record count is
-bounded.
+private permissions. Writes use a same-directory temporary file, fsync, an
+atomic rename, and a directory fsync on Linux. Publication uses a two-phase
+durable marker: `pending` is synced before the rename, `durable` after the new
+state and directory entry are synced, and `acked` only after the caller proves
+the lifecycle still authorizes the write. An unacknowledged `pending` or
+`durable` marker makes the next owner fail closed; a stale lifecycle aborts
+before `acked`, so a successor never accepts obsolete authority. An `acked`
+marker records an authorized durable state whose unlink was not durable, and a
+successor may accept that state. Consequently a lost reply after authorization
+can make an operation visible after restart even though the caller saw an
+unconfirmed error; this is deliberately not an exactly-once promise. A pending
+marker is never treated as confirmation, and no manual removal is required or
+recommended. The namespace is independent of the persisted default preference,
+so a missing/corrupt queue namespace cannot erase the user's default. Missing
+state means disabled and empty. Malformed or unsupported-version state fails
+safe to disabled/empty rather than guessing. Duplicate ids in one binding call
+keep the last value, and the record count is bounded.
+
+The advisory lock protects only owners that honor it. An older build or another
+writer that ignores the lock can interleave with a cooperating owner; a
+check-then-rename cannot close that window. Mixed old/new versions running at
+the same time are not claimed to be safe. Directory durability is implemented
+for Linux; the Windows path is compiled but not runtime-validated in this
+environment; macOS and other platforms have no implemented directory-durability
+primitive, so automatic hash persistence fails closed there before creating
+namespace metadata. macOS is therefore intentionally unsupported for this
+feature rather than silently assuming directory durability. The helper fallback
+that re-executes the main binary is also not packaging-validated. A
+non-filesystem global initialization guard is taken before the helper performs
+any path lookup, so successor helper processes, including lexical or symlink
+aliases of the same directory, fail closed instead of accumulating behind an
+uninterruptible preparation wait. This guard is not keyed by the supplied path
+and does not extend across different Linux users or network namespaces, or
+across Windows logon sessions. The per-directory advisory lock still serializes
+cooperating owners that share the directory. An operation already stuck in such
+a kernel wait cannot be cancelled and can keep the guard until the kernel
+returns.
 
 Metadata checks cannot prove immutability against a same-user actor that
 mutates a file during the read, replaces an ancestor after the final descriptor
@@ -345,8 +375,9 @@ configuration as the source of truth.
   `clippy --all-targets -- -D warnings`, then
   `npm run tauri build -- --bundles nsis`.
 - Output: unsigned NSIS setup EXE uploaded as artifact
-  `surge-desktop-windows-x64-exe` from `src-tauri/target/release/bundle/nsis/*.exe`,
-  retained **7 days** then auto-deleted by Actions.
+  `surgui-windows-x64-exe` from `src-tauri/target/release/bundle/nsis/*.exe`,
+  retained **7 days** then auto-deleted by Actions. NSIS upgrade compatibility
+  from a previous install under the old product name is not tested and not claimed.
 
 ## Linux build (manual only)
 
@@ -360,9 +391,9 @@ configuration as the source of truth.
 - Steps: frontend check / test / build, then Rust `fmt --check` / `test` /
   `clippy --all-targets -- -D warnings`, then
   `npm run tauri build -- --bundles deb,appimage`.
-- Output: unsigned `.deb` uploaded as artifact `surge-desktop-linux-x64-deb` from
+- Output: unsigned `.deb` uploaded as artifact `surgui-linux-x64-deb` from
   `src-tauri/target/release/bundle/deb/*.deb`, and an AppImage uploaded as
-  `surge-desktop-linux-x64-appimage` from
+  `surgui-linux-x64-appimage` from
   `src-tauri/target/release/bundle/appimage/*.AppImage`, both retained
   **7 days** then auto-deleted by Actions.
 
@@ -371,17 +402,19 @@ configuration as the source of truth.
 - The setup EXE is **unsigned**. Windows SmartScreen may warn about an unrecognized
   app or unknown publisher; that is expected. Only install artifacts built from a
   trusted commit in this repository.
-- On Linux, install the `.deb` with `sudo apt install ./surge-desktop_*.deb` (or
+- On Linux, install the `.deb` with `sudo apt install ./surgui_*.deb` (or
   `dpkg -i` plus `apt -f install`), or run the AppImage directly after
   `chmod +x`. Both are **unsigned**; this is expected, the same as the Windows
   EXE. The AppImage needs a FUSE-capable environment (or run it with
   `--appimage-extract-and-run`).
 - No GitHub Release is published automatically. Publication happens by hand, only
   after an EXE smoke test passes.
-- MSI installations are not upgraded in place by the setup EXE. If Surge
-  Desktop is currently installed as an MSI, uninstall it first (Windows → Apps
-  & features, or accept any NSIS installer prompt to remove it) before running
-  the setup EXE. This only removes the GUI install, not files downloaded by
+- MSI installations are not upgraded in place by the setup EXE. If Surgui
+  (previously installed under the old product name) is currently installed,
+  uninstall it first (Windows → Apps & features, or accept any NSIS installer
+  prompt to remove it) before running the setup EXE. NSIS upgrade
+  compatibility from a previous install under the old product name has not been tested
+  and is not claimed. This only removes the GUI install, not files downloaded by
   the separate Surge daemon.
 
 ## Verification
@@ -395,9 +428,11 @@ configuration as the source of truth.
   the v0.13 completion/finalizing/hook matrix, duplicate and missing ids,
   stale intent generations, stable per-queue namespace/provenance binding,
   pending resume after restart, fail-closed serving after file/queue removal
-  or replacement, the disabled app default with rollback-safe atomic
-  persistence, malformed hook settings, cancellation, and the single bounded
-  worker. Windows-cfg filesystem tests cover a nested
+  or replacement, the disabled app default with fail-closed atomic
+  persistence (including pending/durable/acked markers, stale-lifecycle abort,
+  lost-reply durability, marker-cleanup failure, durable restart recovery,
+  pre-lock helper blocking, and reaper wakeup/spawn-failure paths), malformed
+  hook settings, cancellation, and the single bounded worker. Windows-cfg filesystem tests cover a nested
   regular local path, nonlocal/device/verbatim and dangerous names,
   symbolic-link, junction/reparse, replaced-ancestor, mutation/replacement
   during hashing, cancellation, and identity/descriptor stability. The Windows

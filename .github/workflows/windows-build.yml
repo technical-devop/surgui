@@ -103,7 +103,7 @@ jobs:
       - name: Upload NSIS setup artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: surge-desktop-windows-x64-exe
+          name: surgui-windows-x64-exe
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 7

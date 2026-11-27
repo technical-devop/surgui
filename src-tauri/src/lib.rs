@@ -1,6 +1,7 @@
 pub mod automatic_hash;
 pub mod commands;
 pub mod file_hash;
+pub mod hash_persistence;
 pub mod hash_state;
 pub mod managed_identity;
 pub mod managed_process;
@@ -16,6 +17,9 @@ use tauri::Manager as _;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Some(code) = hash_persistence::run_helper_from_env() {
+        std::process::exit(code);
+    }
     let app = tauri::Builder::default()
         .manage(ConnectionManager::default())
         .invoke_handler(tauri::generate_handler![

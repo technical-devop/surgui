@@ -152,11 +152,23 @@ export interface NativeState {
   bulkUncertaintyOverflow?: number;
   /** Near-real-time stream status; polling always continues regardless. */
   streamState?: "off" | "starting" | "live" | "fallback";
-  /** Persisted automatic-hash default; null until loaded. False on first run. */
+  /**
+   * Persisted automatic-hash default; null until loaded. False on first run.
+   * Also null after an ambiguous save: no read can prove a timed-out write will
+   * not commit later, so the value stays unknown for this controller and every
+   * controller sharing this module store. An explicit per-batch override
+   * remains available.
+   */
   hashDefaultEnabled?: boolean | null;
   hashDefaultLoading?: boolean;
   hashDefaultSaving?: boolean;
   hashDefaultError?: string | null;
+  /**
+   * True after any ambiguous default write. The control is disabled for this
+   * controller and every controller sharing this module store across every
+   * connection epoch; no reload clears it.
+   */
+  hashDefaultUnconfirmed?: boolean;
   /**
    * Bounded persistent warnings for accepted queued downloads whose requested
    * hash intent was not confirmed as saved. Each survives reconnect and is
@@ -187,6 +199,55 @@ const STREAM_STATE_EVENT = "surge://stream";
 const RECONCILE_RETRY_MS = [300, 750, 1500, 3000];
 /** Bounded time allowed for event-listener registration before connecting. */
 const DEFAULT_LISTENER_TIMEOUT_MS = 2000;
+/**
+ * Single-timer propagation cadence while an active/completed download still
+ * has a pending hash row. This never starts hashing: it only reloads rows
+ * through the verified serve path, with bounded backoff. A completion observed
+ * in an authoritative queue read may additionally ask the existing worker for
+ * one pass.
+ */
+const DEFAULT_HASH_REFRESH_MS = 2000;
+/** Bound automatic propagation so a paused/stalled row cannot poll forever. */
+const DEFAULT_HASH_AUTO_MAX_ATTEMPTS = 12;
+const MAX_HASH_REFRESH_DELAY_MS = 30_000;
+const HASH_AUTO_STOPPED_MESSAGE =
+  "Automatic hash refresh paused after repeated checks. Refresh hashes to try again.";
+/**
+ * HashUnconfirmed means the daemon's persisted hash state is quarantined, so
+ * the reply is authoritative only about uncertainty. The message is a constant:
+ * it never echoes the backend payload, never names a marker file and never
+ * suggests deleting anything or retrying blindly. Downloads are untouched by
+ * hash-state quarantine, and the rows last confirmed by this controller stay.
+ */
+const HASH_UNCONFIRMED_MESSAGE =
+  "Hash state could not be confirmed. Existing downloads are unaffected.";
+/**
+ * A write may have committed even though its reply was lost. The default stays
+ * unavailable for automatic batch use until a read proves the saved value;
+ * an explicit per-batch choice remains the availability escape hatch.
+ */
+const HASH_DEFAULT_UNCERTAIN_MESSAGE =
+  "The saved hashing default could not be confirmed. New batches will not use it until a read proves the saved value; a per-batch choice is still available.";
+const HASH_DEFAULT_UNCERTAIN_MANUAL_MESSAGE =
+  "The saved hashing default could not be confirmed. New batches will not use it until a read proves the saved value; per-batch hashing is available only on the bundled daemon connection.";
+/**
+ * A timed-out or otherwise ambiguous write may still commit after any read,
+ * even one returning the attempted value. There is no backend completion fence
+ * exposed here, so the uncertainty lasts for the life of this module's shared
+ * store.
+ */
+const HASH_DEFAULT_UNCONFIRMED_MESSAGE =
+  "The saved hashing default could not be confirmed after a save. Changing it is disabled until the app restarts to avoid unsafe writes; a per-batch choice is still available.";
+const HASH_DEFAULT_UNCONFIRMED_MANUAL_MESSAGE =
+  "The saved hashing default could not be confirmed after a save. Changing it is disabled until the app restarts to avoid unsafe writes; per-batch hashing is available only on the bundled daemon connection.";
+
+function hashDefaultUncertainMessage(managed: boolean): string {
+  return managed ? HASH_DEFAULT_UNCERTAIN_MESSAGE : HASH_DEFAULT_UNCERTAIN_MANUAL_MESSAGE;
+}
+
+function hashDefaultUnconfirmedMessage(managed: boolean): string {
+  return managed ? HASH_DEFAULT_UNCONFIRMED_MESSAGE : HASH_DEFAULT_UNCONFIRMED_MANUAL_MESSAGE;
+}
 const TRANSIENT_REFRESH_CODES: ReadonlySet<string> = new Set([
   "network",
   "timeout",
@@ -350,6 +411,10 @@ function classifyAddError(err: unknown): "stopped" | "failed" | "ambiguous" {
 
 function isSettingsUnconfirmed(err: unknown): boolean {
   return extractCodeText(err).toLowerCase().includes("settingsunconfirmed");
+}
+
+function isHashUnconfirmed(err: unknown): boolean {
+  return extractCodeText(err).toLowerCase().includes("hashunconfirmed");
 }
 
 const KNOWN_BULK_ACTIONS: ReadonlySet<string> = new Set(["pauseAll", "resumeAll"]);
@@ -572,6 +637,103 @@ interface RefreshResult {
   code: string | null;
 }
 
+/**
+ * One hash-intent write while it is pending. Reads capture these records at
+ * issue time so a read that overlapped a write is never treated as more
+ * authoritative than the write's committed response. The record itself is
+ * removed from the map when the write settles; any read still holding it can
+ * then tell that its snapshot may predate the commit.
+ */
+interface HashWriteRecord {
+  order: number;
+  settled: boolean;
+  followUpCommand: string | null;
+  /** Issue-order wave shared by intent writes that overlap in time. */
+  waveId: number;
+}
+
+/**
+ * One bounded settlement wave for concurrent intent writes. A post-write read
+ * is issued only after the final write in the wave settles, so a read cannot
+ * supersede a still-pending write's committed response.
+ */
+interface HashWriteWave {
+  id: number;
+  writes: number;
+  settled: number;
+  overlapped: boolean;
+  followUpCommand: string | null;
+  /** A write in this wave failed, so its committed state is unconfirmed. */
+  failed: boolean;
+}
+
+interface HashWaveSettlement {
+  final: boolean;
+  needsRead: boolean;
+  followUpCommand: string | null;
+  /** Any write in this wave failed; the final read must not hide its error. */
+  hadFailure: boolean;
+}
+
+/**
+ * One automatic-hash default mutation while it is pending. The persisted
+ * default is app-wide, so there is at most one write in flight across every
+ * connection epoch and mode; a late settlement is treated as sharing the same
+ * uncertain store.
+ */
+interface HashDefaultWriteRecord {
+  order: number;
+  epoch: number;
+  target: boolean;
+  settled: boolean;
+  /** Controller that issued the write; used to keep its own UI authoritative. */
+  owner: object;
+}
+
+interface HashDefaultStoreEvent {
+  kind: "started" | "settled";
+  record: HashDefaultWriteRecord;
+}
+
+type HashDefaultStoreListener = (event: HashDefaultStoreEvent) => void;
+
+/**
+ * The persisted hash default belongs to the backend, not to one controller.
+ * Every controller in this JS module shares this lock and poison so a second
+ * instance cannot write while another write is pending or after uncertainty.
+ * Live controllers are also notified so their cached default is invalidation,
+ * not reused to drive an implicit batch. This does not coordinate separate
+ * webviews, processes or naive clients; the backend remains the single writer
+ * and must enforce one owner.
+ */
+export interface HashDefaultStoreCoordinator {
+  pendingWrites: Map<number, HashDefaultWriteRecord>;
+  writeSeq: number;
+  generation: number;
+  uncertain: boolean;
+  listeners: Set<HashDefaultStoreListener>;
+}
+
+function createHashDefaultStoreCoordinator(): HashDefaultStoreCoordinator {
+  return {
+    pendingWrites: new Map(),
+    writeSeq: 0,
+    generation: 0,
+    uncertain: false,
+    listeners: new Set(),
+  };
+}
+
+const sharedHashDefaultStoreCoordinator = createHashDefaultStoreCoordinator();
+
+export function resetSharedHashDefaultStoreForTests(): void {
+  const store = sharedHashDefaultStoreCoordinator;
+  store.pendingWrites.clear();
+  store.writeSeq = 0;
+  store.generation = 0;
+  store.uncertain = false;
+}
+
 interface ActiveBatchContext {
   epoch: number;
   identity: number;
@@ -630,6 +792,7 @@ export class NativeQueueController {
     hashDefaultLoading: false,
     hashDefaultSaving: false,
     hashDefaultError: null,
+    hashDefaultUnconfirmed: false,
     hashes: [],
     hashesLoading: false,
     hashError: null,
@@ -682,6 +845,8 @@ export class NativeQueueController {
   private bulkReconcilePending = false;
   private addEpoch: number | null = null;
   private managedEpoch: number | null = null;
+  /** Epoch whose connection targets the persisted managed default store. */
+  private managedStoreEpoch: number | null = null;
   private refreshPromise: Promise<RefreshResult> | null = null;
   private refreshEpoch: number | null = null;
   private refreshSeq = 0;
@@ -708,10 +873,40 @@ export class NativeQueueController {
   private hashDefaultSeq = 0;
   private hashDefaultLoadPromise: Promise<void> | null = null;
   private hashDefaultLoadEpoch: number | null = null;
+  /**
+   * Shared across every controller in this module. Reads capture it at issue
+   * time; every mutation by any controller starts and settles into a new
+   * generation, so a read that began before a write settled cannot overwrite
+   * that write outcome even across controller instances.
+   */
+  private hashDefaultStore: HashDefaultStoreCoordinator;
+  private readonly hashDefaultOwner = {};
+  private hashDefaultStoreListener: HashDefaultStoreListener;
+  private hashDefaultLoadGeneration = 0;
   private hashDefaultAutoLoadEpoch: number | null = null;
+  private hashAutoLoadEpoch: number | null = null;
   private hashLoadSeq = 0;
   private hashLoadPromise: Promise<void> | null = null;
   private hashLoadEpoch: number | null = null;
+  private hashWaveSeq = 0;
+  private hashActiveWave: HashWriteWave | null = null;
+  private hashAutoTimer: ReturnType<typeof setTimeout> | null = null;
+  private hashRefreshMs: number;
+  private hashAutoMaxAttempts: number;
+  private hashAutoAttempts = 0;
+  /** Per-epoch hash command counter; auto propagation never overlaps a read. */
+  private hashCommandsInFlight = new Map<number, number>();
+  /** Id+generation completions already given one worker pass this connection. */
+  private hashCompletionRequested = new Set<string>();
+  /** Completions whose worker pass has not been issued yet (kept on deferral). */
+  private hashCompletionCandidates = new Set<string>();
+  /** Shared issue order for reads and intent writes; stale applies are fenced. */
+  private hashOrderSeq = 0;
+  private hashAppliedSeq = 0;
+  /** Highest issue order whose applied rows are authoritative post-write state. */
+  private hashAuthoritativeSeq = 0;
+  /** Pending intent writes by issue order for the current connection epoch. */
+  private hashPendingWrites = new Map<number, HashWriteRecord>();
   private invoke: InvokeFn;
   private onChange: OnChangeFn;
   private pollMs: number;
@@ -721,7 +916,13 @@ export class NativeQueueController {
     onChange: OnChangeFn,
     pollMs = 5000,
     listen?: ListenFn,
-    options?: { reconcileRetryMs?: number[]; listenerTimeoutMs?: number },
+    options?: {
+      reconcileRetryMs?: number[];
+      listenerTimeoutMs?: number;
+      hashRefreshMs?: number;
+      hashAutoMaxAttempts?: number;
+      hashDefaultStore?: HashDefaultStoreCoordinator;
+    },
   ) {
     this.invoke = invoke;
     this.onChange = onChange;
@@ -733,6 +934,21 @@ export class NativeQueueController {
       typeof listenerTimeout === "number" && Number.isFinite(listenerTimeout) && listenerTimeout > 0
         ? listenerTimeout
         : DEFAULT_LISTENER_TIMEOUT_MS;
+    const hashRefreshMs = options?.hashRefreshMs;
+    this.hashRefreshMs =
+      typeof hashRefreshMs === "number" && Number.isFinite(hashRefreshMs) && hashRefreshMs > 0
+        ? hashRefreshMs
+        : DEFAULT_HASH_REFRESH_MS;
+    const hashAutoMaxAttempts = options?.hashAutoMaxAttempts;
+    this.hashAutoMaxAttempts =
+      typeof hashAutoMaxAttempts === "number" &&
+      Number.isFinite(hashAutoMaxAttempts) &&
+      hashAutoMaxAttempts > 0
+        ? Math.floor(hashAutoMaxAttempts)
+        : DEFAULT_HASH_AUTO_MAX_ATTEMPTS;
+    this.hashDefaultStore = options?.hashDefaultStore ?? sharedHashDefaultStoreCoordinator;
+    this.hashDefaultStoreListener = (event) => this.onSharedHashDefaultEvent(event);
+    this.hashDefaultStore.listeners.add(this.hashDefaultStoreListener);
   }
 
   /** Monotonic connection epoch; changes on every connect/managed start/disconnect. */
@@ -890,6 +1106,7 @@ export class NativeQueueController {
       hashDefaultLoading: this.state.hashDefaultLoading ?? false,
       hashDefaultSaving: this.state.hashDefaultSaving ?? false,
       hashDefaultError: this.state.hashDefaultError ?? null,
+      hashDefaultUnconfirmed: this.state.hashDefaultUnconfirmed ?? false,
       hashes: (this.state.hashes ?? []).map((row) => ({ ...row })),
       hashesLoading: this.state.hashesLoading ?? false,
       hashError: this.state.hashError ?? null,
@@ -1022,18 +1239,404 @@ export class NativeQueueController {
       : null;
   }
 
+  private hashDefaultPoisoned(): boolean {
+    return this.hashDefaultStore.uncertain;
+  }
+
+  private activeHashDefaultPoisonMessage(): string {
+    return hashDefaultUnconfirmedMessage(this.state.managed === true);
+  }
+
+  private activeHashDefaultUncertainMessage(): string {
+    return hashDefaultUncertainMessage(this.state.managed === true);
+  }
+
+  private hashDefaultGenerationFor(): number {
+    return this.hashDefaultStore.generation;
+  }
+
+  private bumpHashDefaultGeneration(): void {
+    this.hashDefaultStore.generation += 1;
+  }
+
+  /**
+   * The persisted default is app-wide, so a pending write on any connection
+   * also blocks reads and writes on every other connection.
+   */
+  private hasPendingHashDefaultWrite(): boolean {
+    return this.hashDefaultStore.pendingWrites.size > 0;
+  }
+
+  /**
+   * Notify every live controller in this module about a shared default mutation.
+   * The writer keeps its own state authoritative; everyone else invalidates the
+   * cached baseline so it can never drive an implicit batch. Disposed listeners
+   * are removed in dispose(), so this set holds no stale controller references.
+   */
+  private publishHashDefaultStoreEvent(event: HashDefaultStoreEvent): void {
+    for (const listener of [...this.hashDefaultStore.listeners]) {
+      try {
+        listener(event);
+      } catch {
+        // A listener must never break the controller that owns the write.
+      }
+    }
+  }
+
+  private onSharedHashDefaultEvent(event: HashDefaultStoreEvent): void {
+    if (this.disposed) return;
+    // The initiating controller updates its own visible state and return value.
+    if (event.record.owner === this.hashDefaultOwner) return;
+    if (event.kind === "started") {
+      if (this.state.hashDefaultSaving === true) return;
+      this.state.hashDefaultSaving = true;
+      this.emit();
+      return;
+    }
+    let changed = false;
+    const pending = this.hasPendingHashDefaultWrite();
+    if (this.state.hashDefaultSaving !== pending) {
+      this.state.hashDefaultSaving = pending;
+      changed = true;
+    }
+    // A shared write settled, so this controller's cached default may predate
+    // its commit even when the reply acknowledged success. Require a fresh read
+    // before the value can drive an implicit batch again.
+    if (this.state.hashDefaultEnabled !== null) {
+      this.state.hashDefaultEnabled = null;
+      changed = true;
+    }
+    if (this.hashDefaultPoisoned()) {
+      if (this.state.hashDefaultUnconfirmed !== true) {
+        this.state.hashDefaultUnconfirmed = true;
+        changed = true;
+      }
+      const message = this.activeHashDefaultPoisonMessage();
+      if (this.state.hashDefaultError !== message) {
+        this.state.hashDefaultError = message;
+        changed = true;
+      }
+    } else {
+      if (this.state.hashDefaultUnconfirmed !== false) {
+        this.state.hashDefaultUnconfirmed = false;
+        changed = true;
+      }
+      if (this.state.hashDefaultError !== null) {
+        this.state.hashDefaultError = null;
+        changed = true;
+      }
+    }
+    if (changed) this.emit();
+  }
+
+  private clearHashDefaultLoadingForLatest(seq: number): void {
+    if (seq !== this.hashDefaultSeq) return;
+    this.state.hashDefaultLoading = false;
+    this.emit();
+  }
+
+  private refreshHashDefaultSaving(): void {
+    this.state.hashDefaultSaving = this.hashDefaultStore.pendingWrites.size > 0;
+  }
+
+  private settleHashDefaultWrite(
+    record: HashDefaultWriteRecord,
+    ambiguous = false,
+  ): void {
+    if (record.settled) return;
+    record.settled = true;
+    if (this.hashDefaultStore.pendingWrites.get(record.order) === record) {
+      this.hashDefaultStore.pendingWrites.delete(record.order);
+    }
+    // Uncertainty is a property of the shared store, not of this controller's
+    // lifetime: an error that arrives after dispose must still block every
+    // other controller before their next IPC.
+    if (ambiguous) this.hashDefaultStore.uncertain = true;
+    // Any read that began before this settlement is now stale, even when it
+    // is still in flight and the epoch itself has not changed.
+    this.bumpHashDefaultGeneration();
+    this.publishHashDefaultStoreEvent({ kind: "settled", record });
+  }
+
+  private invalidateHashDefaultBaseline(message: string): void {
+    this.state.hashDefaultEnabled = null;
+    this.state.hashDefaultError = message;
+  }
+
   private resetHashState(): void {
     // Epoch-fenced visibility: a new connection starts with no rows so a
     // previous daemon's digests can never read as the new daemon's state.
-    // The persisted default stays cached; it is reloaded per connection.
+    // The persisted default is also unconfirmed in every new epoch: keeping a
+    // cached value would let a batch be submitted from a default that changed
+    // externally while this app was disconnected. It must be re-read on the
+    // current epoch before it can resolve a batch (an explicit per-batch
+    // override is still allowed). An ambiguous save stays unknown here too.
+    this.stopHashAutoRefresh();
+    this.hashCompletionRequested.clear();
+    this.hashCompletionCandidates.clear();
+    this.hashAutoAttempts = 0;
+    this.hashPendingWrites.clear();
+    this.hashActiveWave = null;
     this.state.hashes = [];
     this.state.hashesLoading = false;
     this.state.hashError = null;
+    this.state.hashDefaultEnabled = null;
+    this.state.hashDefaultLoading = false;
+    this.state.hashDefaultSaving = this.hasPendingHashDefaultWrite();
+    this.state.hashDefaultUnconfirmed = this.hashDefaultPoisoned();
+    this.state.hashDefaultError = this.hashDefaultPoisoned()
+      ? this.activeHashDefaultPoisonMessage()
+      : null;
+    this.hashDefaultLoadPromise = null;
+    this.hashDefaultLoadEpoch = null;
     this.hashLoadPromise = null;
     this.hashLoadEpoch = null;
   }
 
+  private stopHashAutoRefresh(): void {
+    if (this.hashAutoTimer !== null) {
+      clearTimeout(this.hashAutoTimer);
+      this.hashAutoTimer = null;
+    }
+  }
+
+  private beginHashCommand(epoch: number): void {
+    this.hashCommandsInFlight.set(epoch, (this.hashCommandsInFlight.get(epoch) ?? 0) + 1);
+  }
+
+  private endHashCommand(epoch: number): void {
+    const next = (this.hashCommandsInFlight.get(epoch) ?? 1) - 1;
+    if (next <= 0) this.hashCommandsInFlight.delete(epoch);
+    else this.hashCommandsInFlight.set(epoch, next);
+  }
+
+  private hashCommandInFlight(epoch: number): boolean {
+    return (this.hashCommandsInFlight.get(epoch) ?? 0) > 0;
+  }
+
+  private captureHashWriteOverlap(): HashWriteRecord[] {
+    return [...this.hashPendingWrites.values()];
+  }
+
+  private noteHashReadOverlap(overlaps: HashWriteRecord[], command: string): void {
+    for (const record of overlaps) record.followUpCommand = command;
+    const wave = this.hashActiveWave;
+    if (wave !== null && overlaps.length > 0) {
+      wave.overlapped = true;
+      wave.followUpCommand = command;
+    }
+  }
+
+  private hashReadOverlappedSettledWrite(overlaps: HashWriteRecord[]): boolean {
+    return overlaps.some((record) => record.settled);
+  }
+
+  private settleHashWrite(record: HashWriteRecord, failed = false): HashWaveSettlement {
+    record.settled = true;
+    if (this.hashPendingWrites.get(record.order) === record) {
+      this.hashPendingWrites.delete(record.order);
+    }
+    const wave = this.hashActiveWave;
+    if (wave === null || wave.id !== record.waveId) {
+      return { final: false, needsRead: false, followUpCommand: null, hadFailure: failed };
+    }
+    if (failed) wave.failed = true;
+    wave.settled += 1;
+    if (wave.settled < wave.writes) {
+      return { final: false, needsRead: false, followUpCommand: null, hadFailure: wave.failed };
+    }
+    // The final write in the wave closes it. Concurrent writes, any read that
+    // overlapped the wave, and any failed write (whose committed state is
+    // uncertain) require one authoritative post-write read.
+    this.hashActiveWave = null;
+    return {
+      final: true,
+      needsRead: wave.writes > 1 || wave.overlapped || wave.failed,
+      followUpCommand: wave.followUpCommand,
+      hadFailure: wave.failed,
+    };
+  }
+
+  /**
+   * Only a pending row whose download can actually advance is propagated.
+   * A paused/pausing/queued download would otherwise poll forever without the
+   * backend ever being able to finish the hash.
+   */
+  private hasActivePendingHashes(): boolean {
+    const pendingIds = new Set(
+      (this.state.hashes ?? []).filter((row) => row.state === "pending").map((row) => row.id),
+    );
+    if (pendingIds.size === 0) return false;
+    for (const item of this.state.items) {
+      if (!pendingIds.has(item.id)) continue;
+      if (item.status === "active" || item.status === "completed") return true;
+    }
+    return false;
+  }
+
+  private hashRefreshDelay(): number {
+    const factor = 2 ** Math.min(this.hashAutoAttempts, 5);
+    return Math.min(this.hashRefreshMs * factor, MAX_HASH_REFRESH_DELAY_MS);
+  }
+
+  private resetHashAutoBudget(): void {
+    this.hashAutoAttempts = 0;
+  }
+
+  private stopHashAutoWithRecovery(): void {
+    this.stopHashAutoRefresh();
+    if (this.state.hashError !== null) return;
+    this.state.hashesLoading = false;
+    this.state.hashError = HASH_AUTO_STOPPED_MESSAGE;
+    this.emit();
+  }
+
+  /**
+   * Keep at most one propagation timer for the current managed connection.
+   * It exists only while an active download or completed row still has a
+   * pending hash. Attempts are bounded with backoff; exhaustion stops the
+   * timer but surfaces an explicit manual-refresh recovery state.
+   */
+  private scheduleHashAutoRefresh(epoch = this.epoch): void {
+    if (this.disposed || epoch !== this.epoch) return;
+    if (this.state.phase !== "connected" || this.state.managed !== true) {
+      this.stopHashAutoRefresh();
+      return;
+    }
+    if (!this.hasActivePendingHashes()) {
+      this.stopHashAutoRefresh();
+      this.resetHashAutoBudget();
+      return;
+    }
+    if (this.state.hashError !== null) {
+      this.stopHashAutoRefresh();
+      return;
+    }
+    if (this.hashAutoAttempts >= this.hashAutoMaxAttempts) {
+      this.stopHashAutoWithRecovery();
+      return;
+    }
+    if (this.hashAutoTimer !== null) return;
+    this.hashAutoTimer = setTimeout(() => {
+      this.hashAutoTimer = null;
+      if (this.disposed || epoch !== this.epoch) return;
+      if (this.state.phase !== "connected" || this.state.managed !== true) return;
+      if (this.state.hashError !== null || !this.hasActivePendingHashes()) {
+        this.scheduleHashAutoRefresh(epoch);
+        return;
+      }
+      void this.runHashAutoRefresh(epoch);
+    }, this.hashRefreshDelay());
+  }
+
+  private async runHashAutoRefresh(epoch: number): Promise<void> {
+    if (this.disposed || epoch !== this.epoch) return;
+    if (this.hashCommandInFlight(epoch)) {
+      this.scheduleHashAutoRefresh(epoch);
+      return;
+    }
+    const pending = this.hashLoadPromise;
+    if (pending !== null && this.hashLoadEpoch === epoch) {
+      await pending.then(
+        () => {},
+        () => {},
+      );
+      if (this.disposed || epoch !== this.epoch) return;
+      this.scheduleHashAutoRefresh(epoch);
+      return;
+    }
+    // Reload only. Computation is the backend worker's job; this path never
+    // infers digests or starts/retries downloads.
+    this.hashAutoAttempts += 1;
+    await this.loadHashes();
+    if (this.disposed || epoch !== this.epoch) return;
+    this.scheduleHashAutoRefresh(epoch);
+  }
+
+  private static completionKey(id: string, addedAt: number): string {
+    return `${id}\u0000${addedAt}`;
+  }
+
+  /**
+   * Remember newly authoritative completions even when the hash row is not
+   * visible yet (a read may be in flight, or the pending row may arrive later).
+   * The candidate survives deferral so the worker pass is never silently lost.
+   */
+  private noteHashCompletions(previous: QueueItem[], next: QueueItem[]): void {
+    if (this.state.managed !== true) {
+      this.hashCompletionCandidates.clear();
+      return;
+    }
+    const before = new Map(previous.map((item) => [item.id, item]));
+    const completedKeys = new Set<string>();
+    for (const item of next) {
+      if (item.status !== "completed") continue;
+      const key = NativeQueueController.completionKey(item.id, item.addedAt);
+      completedKeys.add(key);
+      if (this.hashCompletionRequested.has(key)) continue;
+      const prior = before.get(item.id);
+      if (
+        prior !== undefined &&
+        prior.status === "completed" &&
+        prior.addedAt === item.addedAt
+      ) {
+        continue;
+      }
+      this.hashCompletionCandidates.add(key);
+    }
+    // Drop candidates whose completed row is gone from the authoritative queue.
+    for (const key of this.hashCompletionCandidates) {
+      if (!completedKeys.has(key)) this.hashCompletionCandidates.delete(key);
+    }
+  }
+
+  private pendingCompletionKeys(): string[] {
+    const pendingIds = new Set(
+      (this.state.hashes ?? []).filter((row) => row.state === "pending").map((row) => row.id),
+    );
+    if (pendingIds.size === 0) return [];
+    const keys: string[] = [];
+    for (const key of this.hashCompletionCandidates) {
+      if (this.hashCompletionRequested.has(key)) continue;
+      const id = key.slice(0, key.indexOf("\u0000"));
+      if (pendingIds.has(id)) keys.push(key);
+    }
+    return keys;
+  }
+
+  /**
+   * A completed row with a pending hash intent is the one moment a worker
+   * pass is useful. The trigger is only marked once it is actually issued;
+   * while another hash IPC is in flight the candidate is kept for the next
+   * application instead of being dropped.
+   */
+  private async maybeTriggerHashWorker(epoch: number): Promise<boolean> {
+    if (this.disposed || epoch !== this.epoch) return false;
+    if (this.state.phase !== "connected" || this.state.managed !== true) return false;
+    // A transport error stays a manual-recovery state. An exhausted automatic
+    // budget is not a transport failure: an authoritative completion is new
+    // activity and may restart propagation exactly once.
+    if (this.state.hashError !== null && this.state.hashError !== HASH_AUTO_STOPPED_MESSAGE) {
+      return false;
+    }
+    const keys = this.pendingCompletionKeys();
+    if (keys.length === 0) return false;
+    if (this.hashCommandInFlight(epoch)) return false;
+    for (const key of keys) this.hashCompletionRequested.add(key);
+    this.resetHashAutoBudget();
+    await this.refreshHashes();
+    return true;
+  }
+
+  /**
+   * Every hash read/write/default path shares this mapping so a quarantined
+   * hash state always reads as an explicit unconfirmed state instead of a
+   * generic transport note, while ordinary transport codes keep their meaning.
+   * The returned text is always one of the constants below or a fallback:
+   * backend payload text is never forwarded.
+   */
   private hashErrorMessage(err: unknown, fallback: string): string {
+    if (isHashUnconfirmed(err)) return HASH_UNCONFIRMED_MESSAGE;
     const text = extractCodeText(err).toLowerCase();
     if (text.includes("managedconnectionrequired")) return "Hashing needs the bundled daemon connection.";
     if (text.includes("notconnected")) return "Not connected to a daemon.";
@@ -1042,6 +1645,22 @@ export class NativeQueueController {
     if (text.includes("network")) return "Cannot reach the daemon for hash state.";
     if (/\bstate\b/.test(text)) return "Hash state unavailable. Try again.";
     return fallback;
+  }
+
+  /**
+   * Keep a failed post-write read from hiding the mutation uncertainty that
+   * triggered it. Both messages are already sanitized; combining them keeps
+   * the original warning visible while still reporting that the reconciliation
+   * read failed.
+   */
+  private applyHashReadFailure(message: string, preserveError: boolean): void {
+    const current = this.state.hashError ?? null;
+    if (!preserveError || current === null) {
+      this.state.hashError = message;
+      return;
+    }
+    if (current.includes(message)) return;
+    this.state.hashError = `${current} ${message}`;
   }
 
   private sanitizeHashDefault(raw: unknown): boolean {
@@ -1059,17 +1678,39 @@ export class NativeQueueController {
     return true;
   }
 
+  /**
+   * One-shot gate for the UI hash-row auto-load. An empty or failed result
+   * must never re-trigger from an effect rerun; explicit refresh/retry paths
+   * call loadHashes()/refreshHashes() directly. Reconnect (epoch bump) allows
+   * exactly one new auto attempt, and the controller's bounded pending-row
+   * polling/completion triggers take over from there.
+   */
+  tryClaimHashesAutoLoad(): boolean {
+    if (this.disposed) return false;
+    if (this.state.phase !== "connected") return false;
+    if (!this.state.managed) return false;
+    if (this.hashAutoLoadEpoch === this.epoch) return false;
+    this.hashAutoLoadEpoch = this.epoch;
+    return true;
+  }
+
   async loadHashDefault(): Promise<void> {
     if (this.disposed) return;
     if (this.state.phase !== "connected") return;
-    if (this.hashDefaultLoadPromise !== null && this.hashDefaultLoadEpoch === this.epoch) {
+    const epoch = this.epoch;
+    const generation = this.hashDefaultGenerationFor();
+    if (
+      this.hashDefaultLoadPromise !== null &&
+      this.hashDefaultLoadEpoch === epoch &&
+      this.hashDefaultLoadGeneration === generation
+    ) {
       return this.hashDefaultLoadPromise;
     }
-    const epoch = this.epoch;
     const seq = (this.hashDefaultSeq += 1);
-    const task = this.executeLoadHashDefault(epoch, seq);
+    const task = this.executeLoadHashDefault(epoch, seq, generation);
     this.hashDefaultLoadPromise = task;
     this.hashDefaultLoadEpoch = epoch;
+    this.hashDefaultLoadGeneration = generation;
     return task.then(
       () => {
         if (this.hashDefaultLoadPromise === task) {
@@ -1086,10 +1727,17 @@ export class NativeQueueController {
     );
   }
 
-  private async executeLoadHashDefault(epoch: number, seq: number): Promise<void> {
+  private async executeLoadHashDefault(
+    epoch: number,
+    seq: number,
+    generation: number,
+  ): Promise<void> {
     if (this.disposed) return;
     this.state.hashDefaultLoading = true;
-    this.state.hashDefaultError = null;
+    // A poisoned value stays unavailable while a reload is in flight. The read
+    // cannot prove a timed-out write did not commit later, so it never clears
+    // that uncertainty below.
+    if (!this.hashDefaultPoisoned()) this.state.hashDefaultError = null;
     this.emit();
     let raw: unknown;
     try {
@@ -1097,7 +1745,27 @@ export class NativeQueueController {
     } catch (err) {
       if (epoch !== this.epoch || this.disposed) return;
       if (seq !== this.hashDefaultSeq) return;
-      if (isSuperseded(err)) return;
+      if (
+        generation !== this.hashDefaultGenerationFor() ||
+        this.hasPendingHashDefaultWrite()
+      ) {
+        this.clearHashDefaultLoadingForLatest(seq);
+        return;
+      }
+      if (isSuperseded(err)) {
+        this.clearHashDefaultLoadingForLatest(seq);
+        return;
+      }
+      // Never replace a lifetime uncertainty with a transport note that could
+      // imply a retry will make the saved value safe again.
+      if (this.hashDefaultPoisoned()) {
+        this.state.hashDefaultEnabled = null;
+        this.state.hashDefaultUnconfirmed = true;
+        this.state.hashDefaultError = this.activeHashDefaultPoisonMessage();
+        this.state.hashDefaultLoading = false;
+        this.emit();
+        return;
+      }
       this.state.hashDefaultError = this.hashErrorMessage(err, "Could not load the hashing default.");
       this.state.hashDefaultLoading = false;
       this.emit();
@@ -1109,6 +1777,23 @@ export class NativeQueueController {
     try {
       value = this.sanitizeHashDefault(raw);
     } catch (err) {
+      if (epoch !== this.epoch || this.disposed) return;
+      if (seq !== this.hashDefaultSeq) return;
+      if (
+        generation !== this.hashDefaultGenerationFor() ||
+        this.hasPendingHashDefaultWrite()
+      ) {
+        this.clearHashDefaultLoadingForLatest(seq);
+        return;
+      }
+      if (this.hashDefaultPoisoned()) {
+        this.state.hashDefaultEnabled = null;
+        this.state.hashDefaultUnconfirmed = true;
+        this.state.hashDefaultError = this.activeHashDefaultPoisonMessage();
+        this.state.hashDefaultLoading = false;
+        this.emit();
+        return;
+      }
       this.state.hashDefaultError = this.hashErrorMessage(err, "Could not load the hashing default.");
       this.state.hashDefaultLoading = false;
       this.emit();
@@ -1116,6 +1801,27 @@ export class NativeQueueController {
     }
     if (epoch !== this.epoch || this.disposed) return;
     if (seq !== this.hashDefaultSeq) return;
+    // A write settled after this read began, or another write is still
+    // outstanding. This snapshot cannot prove the persisted default.
+    if (
+      generation !== this.hashDefaultGenerationFor() ||
+      this.hasPendingHashDefaultWrite()
+    ) {
+      this.clearHashDefaultLoadingForLatest(seq);
+      return;
+    }
+    // Any ambiguous default write remains uncertain for this controller and
+    // every controller sharing this module store. A read that happens to match
+    // the attempted target is not a completion fence: the timed-out write may
+    // still commit later and change the stored value.
+    if (this.hashDefaultPoisoned()) {
+      this.state.hashDefaultEnabled = null;
+      this.state.hashDefaultUnconfirmed = true;
+      this.state.hashDefaultError = this.activeHashDefaultPoisonMessage();
+      this.state.hashDefaultLoading = false;
+      this.emit();
+      return;
+    }
     this.state.hashDefaultEnabled = value;
     this.state.hashDefaultError = null;
     this.state.hashDefaultLoading = false;
@@ -1126,25 +1832,75 @@ export class NativeQueueController {
     if (this.disposed) return false;
     if (this.state.phase !== "connected") return false;
     if (typeof enabled !== "boolean") return false;
+    // Once any write outcome is ambiguous, the persisted value is unknowable
+    // for this controller and every controller sharing this module store.
+    // Reject before IPC; a reload cannot make it safe.
+    if (this.hashDefaultPoisoned()) return false;
+    // The default is app-wide, so only one mutation may be in flight globally,
+    // across managed and manual connections and across epochs.
+    if (this.hasPendingHashDefaultWrite()) return false;
     const epoch = this.epoch;
+    const order = (this.hashDefaultStore.writeSeq += 1);
+    const record: HashDefaultWriteRecord = {
+      order,
+      epoch,
+      target: enabled,
+      settled: false,
+      owner: this.hashDefaultOwner,
+    };
+    this.hashDefaultStore.pendingWrites.set(order, record);
+    // Invalidate every read that started before this mutation, then again at
+    // settlement for reads that started while it was in flight.
+    this.bumpHashDefaultGeneration();
     this.state.hashDefaultSaving = true;
     this.state.hashDefaultError = null;
     this.emit();
+    // Let every other live controller observe the shared in-flight mutation.
+    // This happens before the IPC await so an implicit batch cannot use their
+    // stale baseline while this write is unresolved.
+    this.publishHashDefaultStoreEvent({ kind: "started", record });
     try {
       const raw = await this.invoke("set_automatic_hash_default", { enabled });
-      if (epoch !== this.epoch || this.disposed) return false;
       const value = this.sanitizeHashDefault(raw);
-      if (epoch !== this.epoch || this.disposed) return false;
+      this.settleHashDefaultWrite(record);
+      if (this.disposed) return false;
+      if (record.epoch !== this.epoch) {
+        // The acknowledgement is a definite completion of this write, but the
+        // current epoch's baseline may predate that commit. Invalidate it and
+        // require a fresh read; this is not an ambiguous outcome.
+        this.invalidateHashDefaultBaseline(
+          this.hashDefaultPoisoned()
+            ? this.activeHashDefaultPoisonMessage()
+            : this.activeHashDefaultUncertainMessage(),
+        );
+        this.state.hashDefaultUnconfirmed = this.hashDefaultPoisoned();
+        this.refreshHashDefaultSaving();
+        this.emit();
+        return false;
+      }
+      // A successful acknowledgement of this exact write is the current value.
+      // It never clears uncertainty from an earlier ambiguous write; such a
+      // write was rejected before IPC above.
       this.state.hashDefaultEnabled = value;
       this.state.hashDefaultError = null;
-      this.state.hashDefaultSaving = false;
+      this.state.hashDefaultUnconfirmed = this.hashDefaultPoisoned();
+      this.refreshHashDefaultSaving();
       this.emit();
       return true;
     } catch (err) {
-      if (epoch !== this.epoch || this.disposed) return false;
-      if (isSuperseded(err)) return false;
-      this.state.hashDefaultError = this.hashErrorMessage(err, "Could not save the hashing default.");
-      this.state.hashDefaultSaving = false;
+      // The save may have applied before this error crossed IPC (transport,
+      // malformed reply, timeout or supersession), so the prior value is no
+      // longer trustworthy. Any such outcome poisons all modes and epochs for
+      // this controller and every controller sharing this module store: a later
+      // read matching the target is not proof the write completed, and the
+      // write may still commit later. Marking happens inside settlement, before
+      // the disposed guard, so a response arriving after disposal still blocks
+      // every other controller.
+      this.settleHashDefaultWrite(record, true);
+      if (this.disposed) return false;
+      this.invalidateHashDefaultBaseline(this.activeHashDefaultPoisonMessage());
+      this.state.hashDefaultUnconfirmed = true;
+      this.refreshHashDefaultSaving();
       this.emit();
       return false;
     }
@@ -1155,6 +1911,7 @@ export class NativeQueueController {
     if (this.state.phase !== "connected") return;
     // Manual connections never surface another daemon's digests.
     if (!this.state.managed) {
+      this.stopHashAutoRefresh();
       this.state.hashes = [];
       this.state.hashError = null;
       this.state.hashesLoading = false;
@@ -1166,7 +1923,10 @@ export class NativeQueueController {
     }
     const epoch = this.epoch;
     const seq = (this.hashLoadSeq += 1);
-    const task = this.executeLoadHashes(epoch, seq, "get_download_hashes");
+    const order = (this.hashOrderSeq += 1);
+    const overlap = this.captureHashWriteOverlap();
+    this.noteHashReadOverlap(overlap, "get_download_hashes");
+    const task = this.executeLoadHashes(epoch, seq, order, "get_download_hashes", overlap);
     this.hashLoadPromise = task;
     this.hashLoadEpoch = epoch;
     return task.then(
@@ -1189,6 +1949,7 @@ export class NativeQueueController {
     if (this.disposed) return;
     if (this.state.phase !== "connected") return;
     if (!this.state.managed) {
+      this.stopHashAutoRefresh();
       this.state.hashes = [];
       this.state.hashError = null;
       this.state.hashesLoading = false;
@@ -1197,43 +1958,148 @@ export class NativeQueueController {
     }
     const epoch = this.epoch;
     const seq = (this.hashLoadSeq += 1);
-    await this.executeLoadHashes(epoch, seq, "refresh_download_hashes");
+    const order = (this.hashOrderSeq += 1);
+    const overlap = this.captureHashWriteOverlap();
+    this.noteHashReadOverlap(overlap, "refresh_download_hashes");
+    this.resetHashAutoBudget();
+    await this.executeLoadHashes(
+      epoch,
+      seq,
+      order,
+      "refresh_download_hashes",
+      overlap,
+    );
   }
 
-  private async executeLoadHashes(epoch: number, seq: number, command: string): Promise<void> {
+  private async executeLoadHashes(
+    epoch: number,
+    seq: number,
+    order: number,
+    command: string,
+    overlaps: HashWriteRecord[],
+    preserveError = false,
+  ): Promise<void> {
     if (this.disposed) return;
     this.state.hashesLoading = true;
     this.emit();
     let raw: unknown;
+    this.beginHashCommand(epoch);
     try {
       raw = await this.invoke(command);
     } catch (err) {
       if (epoch !== this.epoch || this.disposed) return;
       if (seq !== this.hashLoadSeq) return;
+      if (order < this.hashAppliedSeq) {
+        this.state.hashesLoading = false;
+        this.emit();
+        return;
+      }
+      if (this.hashReadOverlappedSettledWrite(overlaps)) {
+        this.state.hashesLoading = false;
+        this.emit();
+        return;
+      }
       if (isSuperseded(err)) return;
-      this.state.hashError = this.hashErrorMessage(err, "Could not load hashes.");
+      this.applyHashReadFailure(
+        this.hashErrorMessage(err, "Could not load hashes."),
+        preserveError,
+      );
+      this.state.hashesLoading = false;
+      // A failed automatic read must not form a retry loop; the warning stays
+      // visible until the user retries or a later explicit action succeeds.
+      this.stopHashAutoRefresh();
+      this.emit();
+      return;
+    } finally {
+      this.endHashCommand(epoch);
+    }
+    if (epoch !== this.epoch || this.disposed) return;
+    if (seq !== this.hashLoadSeq) return;
+    if (order < this.hashAppliedSeq) {
+      // A newer intent write/read already painted; never regress to this row set.
       this.state.hashesLoading = false;
       this.emit();
       return;
     }
-    if (epoch !== this.epoch || this.disposed) return;
-    if (seq !== this.hashLoadSeq) return;
+    if (this.hashReadOverlappedSettledWrite(overlaps)) {
+      // This read was issued while a write was pending and settled first. Its
+      // snapshot may predate the commit; the write's response and follow-up
+      // read are authoritative.
+      this.state.hashesLoading = false;
+      this.emit();
+      return;
+    }
+    let rows: DownloadHash[];
+    try {
+      rows = sanitizeDownloadHashes(raw);
+    } catch (err) {
+      // Reject a malformed top-level payload before advancing either sequence
+      // or replacing the already validated rows. A legitimate empty array is
+      // still a valid response and is handled normally below.
+      if (epoch !== this.epoch || this.disposed) return;
+      if (seq !== this.hashLoadSeq) return;
+      if (isSuperseded(err)) return;
+      this.applyHashReadFailure(
+        this.hashErrorMessage(err, "Could not load hashes."),
+        preserveError,
+      );
+      this.state.hashesLoading = false;
+      this.stopHashAutoRefresh();
+      this.emit();
+      return;
+    }
+    this.hashAppliedSeq = order;
+    if (overlaps.length === 0) this.hashAuthoritativeSeq = order;
     // Manual connections never retain digests, even if a late managed
     // response arrives after a connection switch.
     if (!this.state.managed) {
+      this.stopHashAutoRefresh();
       this.state.hashes = [];
       this.state.hashError = null;
       this.state.hashesLoading = false;
       this.emit();
       return;
     }
-    const rows = sanitizeDownloadHashes(raw);
-    if (epoch !== this.epoch || this.disposed) return;
-    if (seq !== this.hashLoadSeq) return;
     this.state.hashes = rows;
-    this.state.hashError = null;
+    if (!preserveError) this.state.hashError = null;
     this.state.hashesLoading = false;
     this.emit();
+    // A failed write keeps its error visible as a manual-recovery state; the
+    // reconciliation read only refreshes the authoritative rows.
+    if (preserveError) return;
+    // A pending row that arrives after the completed queue row still gets its
+    // one worker pass; otherwise keep the active propagation timer.
+    const triggered = await this.maybeTriggerHashWorker(epoch);
+    if (this.disposed || epoch !== this.epoch) return;
+    if (!triggered) this.scheduleHashAutoRefresh(epoch);
+  }
+
+  private async followUpAfterHashWrite(
+    epoch: number,
+    command: string,
+    preserveError = false,
+  ): Promise<void> {
+    if (this.disposed || epoch !== this.epoch) return;
+    if (this.state.phase !== "connected" || this.state.managed !== true) return;
+    const seq = (this.hashLoadSeq += 1);
+    const order = (this.hashOrderSeq += 1);
+    const task = this.executeLoadHashes(epoch, seq, order, command, [], preserveError);
+    this.hashLoadPromise = task;
+    this.hashLoadEpoch = epoch;
+    await task.then(
+      () => {
+        if (this.hashLoadPromise === task) {
+          this.hashLoadPromise = null;
+          this.hashLoadEpoch = null;
+        }
+      },
+      () => {
+        if (this.hashLoadPromise === task) {
+          this.hashLoadPromise = null;
+          this.hashLoadEpoch = null;
+        }
+      },
+    );
   }
 
   async setHashIntents(intents: Array<{ id: string; enabled: boolean }>): Promise<boolean> {
@@ -1247,27 +2113,119 @@ export class NativeQueueController {
       if (typeof row.enabled !== "boolean") return false;
     }
     const epoch = this.epoch;
+    const order = (this.hashOrderSeq += 1);
+    if (this.hashActiveWave === null) {
+      this.hashActiveWave = {
+        id: (this.hashWaveSeq += 1),
+        writes: 0,
+        settled: 0,
+        overlapped: false,
+        followUpCommand: null,
+        failed: false,
+      };
+    }
+    const wave = this.hashActiveWave;
+    wave.writes += 1;
+    const writeRecord: HashWriteRecord = {
+      order,
+      settled: false,
+      followUpCommand: null,
+      waveId: wave.id,
+    };
+    this.hashPendingWrites.set(order, writeRecord);
+    let raw: unknown;
+    this.beginHashCommand(epoch);
     try {
-      const raw = await this.invoke("set_download_hash_intents", {
+      raw = await this.invoke("set_download_hash_intents", {
         intents: intents.map((intent) => ({ id: intent.id, enabled: intent.enabled })),
       });
+    } catch (err) {
+      // A failed write is an uncertain outcome, not a no-op: the daemon may
+      // have committed it before the transport failed. Settle the wave before
+      // returning so a final failure still issues exactly one authoritative
+      // reconciliation read (never a retried mutation). The read is required
+      // even when this older request settles after a newer success: request
+      // order does not make an unconfirmed mutation disappear.
+      const settlement = this.settleHashWrite(writeRecord, true);
       if (epoch !== this.epoch || this.disposed) return false;
+      if (isSuperseded(err)) return false;
+      this.state.hashError = this.hashErrorMessage(err, "Could not update hash choices.");
+      this.stopHashAutoRefresh();
+      this.emit();
+      if (settlement.final) {
+        await this.followUpAfterHashWrite(
+          epoch,
+          settlement.followUpCommand ?? "get_download_hashes",
+          true,
+        );
+      }
+      return false;
+    } finally {
+      this.endHashCommand(epoch);
+    }
+    let rows: DownloadHash[] | null = null;
+    let malformed = false;
+    let malformedError: unknown = null;
+    try {
+      rows = sanitizeDownloadHashes(raw);
+    } catch (err) {
+      malformed = true;
+      malformedError = err;
+    }
+    // A malformed response is an unconfirmed mutation, so it must fail the
+    // wave before settlement; otherwise a later success would clear it.
+    const settlement = this.settleHashWrite(writeRecord, malformed);
+    if (epoch !== this.epoch || this.disposed) return false;
+    let applied = false;
+    if (malformed) {
+      // The write may have committed, but this top-level response cannot be
+      // trusted as row state. Keep the existing rows and sequences, surface
+      // the safe protocol error, and let the bounded follow-up read decide.
+      this.applyHashReadFailure(
+        this.hashErrorMessage(malformedError, "Could not update hash choices."),
+        settlement.hadFailure,
+      );
+      this.stopHashAutoRefresh();
+      this.emit();
+    } else if (rows !== null && order >= this.hashAuthoritativeSeq) {
+      applied = true;
+      this.hashAppliedSeq = Math.max(this.hashAppliedSeq, order);
+      this.hashAuthoritativeSeq = order;
       if (!this.state.managed) {
+        this.stopHashAutoRefresh();
         this.state.hashes = [];
         this.emit();
         return true;
       }
-      this.state.hashes = sanitizeDownloadHashes(raw);
-      this.state.hashError = null;
+      this.state.hashes = rows;
+      // A later success in the same wave does not erase an earlier write
+      // failure: the wave's authoritative follow-up read reconciles the rows
+      // while the sanitized error stays visible for manual recovery.
+      if (!settlement.hadFailure) this.state.hashError = null;
       this.emit();
-      return true;
-    } catch (err) {
-      if (epoch !== this.epoch || this.disposed) return false;
-      if (isSuperseded(err)) return false;
-      this.state.hashError = this.hashErrorMessage(err, "Could not update hash choices.");
-      this.emit();
-      return false;
+      this.resetHashAutoBudget();
     }
+    // An earlier write in a concurrent wave must not close the wave or regress
+    // the newer response. The last write to settle performs exactly one read,
+    // so the committed rows from every write are visible.
+    // A malformed/unknown mutation response never counts as applied, even
+    // when a later write in an overlapping wave reconciles successfully.
+    if (!settlement.final) return !malformed;
+    if (settlement.needsRead || malformed) {
+      await this.followUpAfterHashWrite(
+        epoch,
+        settlement.followUpCommand ?? "get_download_hashes",
+        settlement.hadFailure || malformed,
+      );
+      return !malformed;
+    }
+    // A single write still seeds provider triggers from its own response, but
+    // a response fenced behind a newer read must not trigger anything.
+    if (!applied) return true;
+    const triggered = await this.maybeTriggerHashWorker(epoch);
+    if (this.disposed || epoch !== this.epoch) return true;
+    if (!triggered) this.scheduleHashAutoRefresh(epoch);
+    return true;
   }
 
   private stopTimer(): void {
@@ -1594,6 +2552,7 @@ export class NativeQueueController {
     this.stopTimer();
     this.addEpoch = null;
     this.managedEpoch = null;
+    this.managedStoreEpoch = null;
     this.rateWriteEpoch = null;
     this.rateLoadPromise = null;
     this.rateLoadEpoch = null;
@@ -1738,6 +2697,7 @@ export class NativeQueueController {
     this.captureAbandonedBatch();
     const epoch = this.epoch;
     this.managedEpoch = epoch;
+    this.managedStoreEpoch = epoch;
     this.clearStreamState();
     this.resetBulkState();
     this.stopTimer();
@@ -1855,6 +2815,9 @@ export class NativeQueueController {
       this.resetMaxConcurrentState();
       this.resetHashState();
       this.state.managed = true;
+      // The initial snapshot can already contain completed rows; remember them
+      // so a hash row that arrives later still triggers one worker pass.
+      this.noteHashCompletions([], items);
       this.state.rateLimitBps = null;
       this.state.rateLoading = false;
       this.state.rateSaving = false;
@@ -1955,8 +2918,9 @@ export class NativeQueueController {
     // fresh follow-up read that is still ambiguous does not trigger an
     // unbounded chain of reads. Only a newly suspected id starts one.
     const previouslyPending = new Set(this.pendingSnapshotConfirmation);
+    const previousItems = this.state.items;
     const merged = mergeSnapshotWithProgress(
-      this.state.items,
+      previousItems,
       items,
       cursor,
       this.progressSeqById,
@@ -2003,6 +2967,14 @@ export class NativeQueueController {
     this.state.error = null;
     this.state.refreshing = false;
     this.emit();
+    // A completion observed in this authoritative read is the only point where
+    // the hash worker is nudged. The candidate is recorded even when the hash
+    // row is not visible yet (an in-flight read or a later pending row), so the
+    // deferred trigger survives until it is actually issued.
+    this.noteHashCompletions(previousItems, merged.items);
+    const triggered = await this.maybeTriggerHashWorker(epoch);
+    if (this.disposed || epoch !== this.epoch) return { ok: true, code: null };
+    if (!triggered) this.scheduleHashAutoRefresh(epoch);
     if (newlyPending) {
       // Confirm the suspected rollback with a fresh authoritative read that
       // starts after this list completes; the reconcile drain is single-flight
@@ -3017,6 +3989,7 @@ export class NativeQueueController {
     this.stopTimer();
     this.addEpoch = null;
     this.managedEpoch = null;
+    this.managedStoreEpoch = null;
     this.rateWriteEpoch = null;
     this.rateLoadPromise = null;
     this.rateLoadEpoch = null;
@@ -3061,6 +4034,7 @@ export class NativeQueueController {
     if (this.disposed) return;
     this.epoch += 1;
     this.disposed = true;
+    this.hashDefaultStore.listeners.delete(this.hashDefaultStoreListener);
     this.clearStreamState();
     for (const unlisten of this.unlisteners.splice(0)) {
       try {
@@ -3078,6 +4052,7 @@ export class NativeQueueController {
     this.state.addOutcome = null;
     this.addEpoch = null;
     this.managedEpoch = null;
+    this.managedStoreEpoch = null;
     this.rateWriteEpoch = null;
     this.rateLoadPromise = null;
     this.rateLoadEpoch = null;

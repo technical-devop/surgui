@@ -14,6 +14,13 @@ const MD5 = "900150983cd24fb0d6963f7d28e17f72";
 const SHA256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 describe("hash sanitize", () => {
+  it("rejects malformed top-level payloads instead of treating them as empty", () => {
+    assert.throws(() => sanitizeDownloadHashes({ items: [] }), /invalidResponse/);
+    assert.throws(() => sanitizeDownloadHashes("not an array"), /invalidResponse/);
+    assert.throws(() => sanitizeDownloadHashes(null), /invalidResponse/);
+    assert.deepEqual(sanitizeDownloadHashes([]), []);
+  });
+
   it("keeps full digests verbatim with no truncation", () => {
     const rows = sanitizeDownloadHashes([
       { id: "d-1", state: "complete", md5: MD5, sha256: SHA256, bytes: 3, resultVersion: 1 },

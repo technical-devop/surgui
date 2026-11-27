@@ -224,7 +224,7 @@
         <img class="brand-logo" src={logoUrl} alt="" width="1376" height="768" decoding="async" />
         <span class="brand-divider" aria-hidden="true"></span>
         <span class="brand-text">
-          <span class="wordmark">Surge Desktop</span>
+          <span class="wordmark">Surgui</span>
           <span class="section-name">Queue</span>
         </span>
       </div>
@@ -558,7 +558,7 @@
         {#if mode === "native"}
           <section class="hash-section" aria-label="Automatic hashes for {sel.name}">
             {#if !isManaged}
-              <p class="control-pending" role="note">Hashing needs the bundled daemon connection. Digests identify file content, not trust or safety.</p>
+              <p class="control-pending" role="note">Hashing needs the bundled daemon connection.</p>
             {:else if hashError}
               <p class="control-pending" role="alert">{hashError}</p>
               {#if onRefreshHashes}
@@ -569,7 +569,7 @@
                 </div>
               {/if}
             {:else if hashRow === null}
-              <p class="control-pending" role="note">No hash requested for this download. Digests identify file content, not trust or safety.</p>
+              <p class="control-pending" role="note">No hash requested for this download.</p>
               {#if onRefreshHashes}
                 <div class="detail-actions">
                   <button type="button" class="btn" onclick={() => onRefreshHashes?.()} disabled={hashesLoading}>
@@ -578,7 +578,7 @@
                 </div>
               {/if}
             {:else if hashRow.state === "complete" && isHashComplete(hashRow)}
-              <p class="control-pending" role="status">Hashes complete. Digests identify file content, not trust or safety.</p>
+              <p class="control-pending" role="status">Hashes complete.</p>
               <dl class="facts hash-facts">
                 <div class="hash-row">
                   <dt>MD5</dt>
@@ -613,7 +613,7 @@
                 <p class="control-pending" role="alert">{copyError}</p>
               {/if}
             {:else}
-              <p class="control-pending" role="status">{hashDisplayForRow(hashRow, sel.status, true) ?? "Hash state unknown."} Digests identify file content, not trust or safety.</p>
+              <p class="control-pending" role="status">{hashDisplayForRow(hashRow, sel.status, true) ?? "Hash state unknown."}</p>
               {#if onRefreshHashes}
                 <div class="detail-actions">
                   <button type="button" class="btn" onclick={() => onRefreshHashes?.()} disabled={hashesLoading}>

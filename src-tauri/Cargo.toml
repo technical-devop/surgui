@@ -3,6 +3,7 @@ name = "surge-desktop"
 version = "0.1.2"
 description = "Unofficial desktop GUI controller for the Surge download daemon"
 edition = "2021"
+default-run = "surge-desktop"
 
 [lib]
 name = "surge_desktop_lib"

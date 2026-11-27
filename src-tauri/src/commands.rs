@@ -176,6 +176,7 @@ pub enum BridgeError {
     NotConnected,
     Superseded,
     State,
+    HashUnconfirmed,
     InvalidDownloadId,
     DownloadNotFound,
     DownloadAmbiguous,
@@ -205,6 +206,7 @@ impl fmt::Debug for BridgeError {
             Self::NotConnected => "NotConnected",
             Self::Superseded => "Superseded",
             Self::State => "State",
+            Self::HashUnconfirmed => "HashUnconfirmed",
             Self::InvalidDownloadId => "InvalidDownloadId",
             Self::DownloadNotFound => "DownloadNotFound",
             Self::DownloadAmbiguous => "DownloadAmbiguous",
@@ -237,6 +239,7 @@ impl fmt::Display for BridgeError {
             Self::NotConnected => "not connected to a Surge instance",
             Self::Superseded => "connection attempt was superseded",
             Self::State => "connection state unavailable",
+            Self::HashUnconfirmed => "automatic hash state could not be confirmed",
             Self::InvalidDownloadId => "invalid download id",
             Self::DownloadNotFound => "download not found",
             Self::DownloadAmbiguous => "download id is ambiguous",
@@ -720,7 +723,7 @@ impl Drop for LocationLaunchPermit {
     }
 }
 
-const AUTOMATIC_HASH_FILE: &str = "automatic-hash.json";
+const AUTOMATIC_HASH_FILE: &str = crate::hash_persistence::HASH_STATE_FILE;
 
 fn new_hash_connection_id() -> String {
     let mut raw = [0u8; 16];
@@ -759,6 +762,61 @@ impl Default for HashSlot {
 struct HashCoordinator {
     slot: Mutex<HashSlot>,
     worker: Mutex<HashWorkerState>,
+    /// Serializes lifecycle transitions against hash-write validation and
+    /// publication.
+    ///
+    /// Lock order is lifecycle gate -> connection state -> hash slot. A
+    /// transition holds the gate while it advances the epoch and fence. A
+    /// write holds it only while validating and while publishing an
+    /// already-synced temporary file, never across durable storage sync. That
+    /// makes the (epoch, fence) pair change atomically without letting a hung
+    /// filesystem block shutdown.
+    lifecycle_gate: Mutex<()>,
+    /// Serializes hash-state mutations across their off-lock persistence
+    /// phase. Lifecycle transitions never take this lock, so a hung filesystem
+    /// cannot prevent shutdown from fencing the connection.
+    write_gate: Mutex<()>,
+    /// Set as soon as app shutdown begins, before the lifecycle gate is
+    /// acquired. A ticketed write must not publish even while shutdown is
+    /// still waiting for an in-flight transition.
+    shutting_down: AtomicBool,
+    /// Serializes opening/replacing the isolated persistence owner. It never
+    /// spans a lifecycle, state, or slot lock.
+    open_gate: Mutex<()>,
+    /// Serializes the final domain installation against the shutdown fence.
+    /// It is never held across opening the owner.
+    install_gate: Mutex<()>,
+    /// Set under `install_gate` before shutdown releases it. An initialization
+    /// that already passed its final check can never install afterwards.
+    installation_closed: AtomicBool,
+    /// The single owner for the current managed state directory. Once it is
+    /// quarantined, no replacement is started in this process: an unresolved
+    /// rename must never be hidden behind a new writer.
+    domain: Mutex<Option<Arc<crate::hash_persistence::PersistenceDomain>>>,
+    /// Last terminal initialization failure, recorded so managed readers can
+    /// surface it without reopening the same unresolved directory.
+    initialization_failure: Mutex<Option<BridgeError>>,
+    #[cfg(test)]
+    persistence_fault: Mutex<Option<crate::hash_persistence::FaultConfig>>,
+    #[cfg(test)]
+    hash_write_pause: VerifiedPause,
+    #[cfg(test)]
+    hash_commit_pause: VerifiedPause,
+}
+
+/// Atomic connection/hash lifecycle fence for one hash-state mutation.
+///
+/// Captured under both the connection-state lock and the hash slot lock, then
+/// revalidated under the same ordering immediately before the mutation. Every
+/// connection transition increments both the epoch and the hash fence before
+/// releasing the state lock, so a captured ticket can never authorize a write
+/// after a newer lifecycle has taken over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HashWriteTicket {
+    epoch: u64,
+    binding: crate::hash_state::DaemonBinding,
+    fence: u64,
+    namespace: Option<String>,
 }
 
 #[derive(Default)]
@@ -783,27 +841,292 @@ impl HashCoordinator {
         }
     }
 
-    fn ensure_loaded(&self, directory: &Path) -> Result<(), BridgeError> {
-        let path = directory.join(AUTOMATIC_HASH_FILE);
-        let namespace = crate::hash_state::prepare_namespace(directory);
-        let mut slot = self.lock_slot();
-        if slot.loaded
-            && slot.path.as_ref() == Some(&path)
-            && namespace.namespace.is_some()
-            && slot.namespace == namespace.namespace
-        {
-            return Ok(());
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.lifecycle_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         }
-        let mut store = HashStore::load(Some(path.clone()));
-        store.set_fence(slot.store.fence().wrapping_add(1));
+    }
+
+    fn lock_write(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.write_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn lock_open(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.open_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn lock_install(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.install_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn domain(&self) -> Option<Arc<crate::hash_persistence::PersistenceDomain>> {
+        match self.domain.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn persistence_confirmed(&self) -> bool {
+        self.domain().is_some_and(|domain| domain.is_confirmed())
+    }
+
+    fn initialization_failure(&self) -> Option<BridgeError> {
+        match self.initialization_failure.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set_initialization_failure(&self, failure: Option<BridgeError>) {
+        let mut guard = match self.initialization_failure.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = failure;
+    }
+
+    fn abandon_domain(&self) {
+        if let Some(domain) = self.domain() {
+            domain.abandon_unconfirmed();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_persistence_fault(&self, fault: Option<crate::hash_persistence::FaultConfig>) {
+        let mut guard = match self.persistence_fault.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = fault;
+    }
+
+    fn begin_shutdown(&self) {
+        {
+            // Publish the shutdown fence under the same lock used to install a
+            // newly opened owner. Initialization cannot cross this point and
+            // then install afterwards.
+            let _install = self.lock_install();
+            self.shutting_down.store(true, Ordering::SeqCst);
+            self.installation_closed.store(true, Ordering::SeqCst);
+        }
+        // Bounded owner shutdown: never waits on a filesystem syscall, and an
+        // unresolved owner stays locked/quarantined instead of being replaced.
+        if let Some(domain) = self.domain() {
+            domain.shutdown();
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    fn ensure_loaded(&self, directory: &Path) -> Result<(), BridgeError> {
+        // An unresolved pending marker/quarantined owner can never be
+        // confirmed in this process. Keep the recorded failure observable and
+        // avoid opening the same directory again on every reader.
+        if self.initialization_failure() == Some(BridgeError::HashUnconfirmed) {
+            return Err(BridgeError::HashUnconfirmed);
+        }
+        let result = self.ensure_loaded_inner(directory);
+        match result {
+            Ok(()) => {
+                self.set_initialization_failure(None);
+                Ok(())
+            }
+            Err(error) => {
+                if error != BridgeError::Superseded {
+                    self.set_initialization_failure(Some(error));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_loaded_inner(&self, directory: &Path) -> Result<(), BridgeError> {
+        let path = directory.join(AUTOMATIC_HASH_FILE);
+        let _open = self.lock_open();
+        if self.is_shutting_down() {
+            return Err(BridgeError::Superseded);
+        }
+        {
+            let slot = self.lock_slot();
+            if let Some(loaded_path) = slot.path.as_ref() {
+                if loaded_path == &path {
+                    return if self.persistence_confirmed() {
+                        Ok(())
+                    } else {
+                        Err(BridgeError::HashUnconfirmed)
+                    };
+                }
+                // A coordinator owns one state directory. Refuse to silently
+                // forget the old owner (which may still be unresolved).
+                return Err(BridgeError::State);
+            }
+        }
+        if self.domain().is_some() {
+            return Err(BridgeError::State);
+        }
+        #[cfg(test)]
+        let fault = match self.persistence_fault.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        #[cfg(not(test))]
+        let fault = None;
+        let (domain, open) = crate::hash_persistence::PersistenceDomain::open(directory, fault)
+            .map_err(|error| match error {
+                crate::hash_persistence::PersistenceError::Unresolved => {
+                    BridgeError::HashUnconfirmed
+                }
+                crate::hash_persistence::PersistenceError::Busy
+                | crate::hash_persistence::PersistenceError::Malformed
+                | crate::hash_persistence::PersistenceError::Unavailable => BridgeError::State,
+            })?;
+        if self.is_shutting_down() {
+            domain.shutdown();
+            return Err(BridgeError::Superseded);
+        }
+        let namespace = open.namespace.clone();
+        let mut store = match open.bytes.as_deref() {
+            Some(bytes) => match HashStore::from_bytes(None, bytes) {
+                Ok(store) => store,
+                Err(_) => {
+                    domain.shutdown();
+                    return Err(BridgeError::State);
+                }
+            },
+            None => HashStore::load(None),
+        };
+        store.align_revision(open.revision);
         // Records from a different (or missing/malformed) namespace can never
         // be proven to belong to this owned queue, so fail closed before any
-        // result can be served or resumed.
-        let _ = store.invalidate_unprovable(namespace.namespace.as_deref());
-        slot.namespace = namespace.namespace;
+        // result can be served or resumed. This mutation is in memory only;
+        // the staged bytes are published without any lock held.
+        let base = store.revision();
+        let _ = store.invalidate_unprovable(namespace.as_deref());
+        if store.revision() != base {
+            if self.is_shutting_down() {
+                domain.shutdown();
+                return Err(BridgeError::Superseded);
+            }
+            let staged = match store.stage_write() {
+                Ok(staged) => staged,
+                Err(_) => {
+                    domain.shutdown();
+                    return Err(BridgeError::State);
+                }
+            };
+            let prepared = match domain.prepare(base, staged.bytes().to_vec()) {
+                Ok(crate::hash_persistence::PrepareOutcome::Prepared(prepared)) => prepared,
+                Ok(crate::hash_persistence::PrepareOutcome::BeforeRename) => {
+                    domain.shutdown();
+                    return Err(if self.is_shutting_down() {
+                        BridgeError::Superseded
+                    } else {
+                        BridgeError::State
+                    });
+                }
+                Ok(crate::hash_persistence::PrepareOutcome::Conflict) => {
+                    domain.shutdown();
+                    return Err(BridgeError::Superseded);
+                }
+                Ok(crate::hash_persistence::PrepareOutcome::ExternalChange)
+                | Ok(crate::hash_persistence::PrepareOutcome::Unconfirmed)
+                | Err(crate::hash_persistence::PersistenceError::Unavailable)
+                | Err(crate::hash_persistence::PersistenceError::Unresolved) => {
+                    domain.shutdown();
+                    return Err(if self.is_shutting_down() {
+                        BridgeError::Superseded
+                    } else {
+                        BridgeError::HashUnconfirmed
+                    });
+                }
+                Err(crate::hash_persistence::PersistenceError::Busy)
+                | Err(crate::hash_persistence::PersistenceError::Malformed) => {
+                    domain.shutdown();
+                    return Err(if self.is_shutting_down() {
+                        BridgeError::Superseded
+                    } else {
+                        BridgeError::State
+                    });
+                }
+            };
+            if self.is_shutting_down() {
+                prepared.abort();
+                return Err(BridgeError::Superseded);
+            }
+            match prepared.confirm() {
+                Ok(crate::hash_persistence::CommitOutcome::Committed(revision))
+                    if !self.is_shutting_down() =>
+                {
+                    staged.install(&mut store, revision);
+                }
+                Ok(crate::hash_persistence::CommitOutcome::BeforeRename) => {
+                    domain.shutdown();
+                    return Err(if self.is_shutting_down() {
+                        BridgeError::Superseded
+                    } else {
+                        BridgeError::State
+                    });
+                }
+                Ok(crate::hash_persistence::CommitOutcome::Conflict) => {
+                    domain.shutdown();
+                    return Err(BridgeError::Superseded);
+                }
+                Ok(crate::hash_persistence::CommitOutcome::Committed(_))
+                | Ok(crate::hash_persistence::CommitOutcome::ExternalChange)
+                | Ok(crate::hash_persistence::CommitOutcome::Unconfirmed)
+                | Err(crate::hash_persistence::PersistenceError::Unavailable)
+                | Err(crate::hash_persistence::PersistenceError::Unresolved) => {
+                    domain.shutdown();
+                    return Err(if self.is_shutting_down() {
+                        BridgeError::Superseded
+                    } else {
+                        BridgeError::HashUnconfirmed
+                    });
+                }
+                Err(crate::hash_persistence::PersistenceError::Busy)
+                | Err(crate::hash_persistence::PersistenceError::Malformed) => {
+                    domain.shutdown();
+                    return Err(if self.is_shutting_down() {
+                        BridgeError::Superseded
+                    } else {
+                        BridgeError::State
+                    });
+                }
+            }
+        }
+        // Final installation is serialized with `begin_shutdown`, which sets
+        // both flags under the same lock. An owner that started opening before
+        // shutdown can never cross this point and install afterwards.
+        let _install = self.lock_install();
+        if self.is_shutting_down() || self.installation_closed.load(Ordering::SeqCst) {
+            drop(_install);
+            domain.shutdown();
+            return Err(BridgeError::Superseded);
+        }
+        let mut slot = self.lock_slot();
+        let fence = slot.store.fence().wrapping_add(1);
+        store.set_fence(fence);
+        slot.namespace = namespace;
         slot.store = store;
         slot.path = Some(path);
         slot.loaded = true;
+        let mut domain_guard = match self.domain.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *domain_guard = Some(domain);
         Ok(())
     }
 
@@ -818,6 +1141,9 @@ impl HashCoordinator {
     }
 
     fn default_enabled(&self) -> Result<bool, BridgeError> {
+        if !self.persistence_confirmed() {
+            return Err(BridgeError::HashUnconfirmed);
+        }
         let slot = self.lock_slot();
         if !slot.loaded {
             return Err(BridgeError::State);
@@ -826,33 +1152,126 @@ impl HashCoordinator {
     }
 
     fn set_default_enabled(&self, enabled: bool) -> Result<bool, BridgeError> {
-        let mut slot = self.lock_slot();
-        if !slot.loaded {
-            return Err(BridgeError::State);
-        }
-        slot.store
-            .set_default_enabled(enabled)
+        let _write = self.lock_write();
+        let (mut fork, base) = {
+            let slot = self.lock_slot();
+            if !slot.loaded {
+                return Err(BridgeError::State);
+            }
+            (slot.store.fork_for_staging(), slot.store.revision())
+        };
+        fork.set_default_enabled(enabled)
             .map_err(|_| BridgeError::State)?;
+        let staged = fork.stage_write().map_err(|_| BridgeError::State)?;
+        let revision = self.commit_staged(base, staged)?;
+        let slot = self.lock_slot();
+        if slot.store.revision() != revision {
+            self.abandon_domain();
+            return Err(BridgeError::HashUnconfirmed);
+        }
         Ok(slot.store.default_enabled())
     }
 
-    #[cfg(test)]
+    /// Publish an already-serialized in-memory mutation through the isolated
+    /// owner and install it only if the owner confirms and no other writer
+    /// changed the slot while the commit was in flight.
+    fn commit_staged(
+        &self,
+        base: u64,
+        staged: crate::hash_state::StagedHashWrite,
+    ) -> Result<u64, BridgeError> {
+        let Some(domain) = self.domain() else {
+            return Err(BridgeError::State);
+        };
+        let prepared = match domain.prepare(base, staged.bytes().to_vec()) {
+            Ok(crate::hash_persistence::PrepareOutcome::Prepared(prepared)) => prepared,
+            Ok(crate::hash_persistence::PrepareOutcome::BeforeRename) => {
+                return Err(BridgeError::State);
+            }
+            Ok(crate::hash_persistence::PrepareOutcome::Conflict) => {
+                self.abandon_domain();
+                return Err(BridgeError::Superseded);
+            }
+            Ok(crate::hash_persistence::PrepareOutcome::ExternalChange)
+            | Ok(crate::hash_persistence::PrepareOutcome::Unconfirmed)
+            | Err(_) => {
+                return Err(BridgeError::HashUnconfirmed);
+            }
+        };
+        if self.is_shutting_down() || !domain.is_confirmed() {
+            prepared.abort();
+            return Err(if self.is_shutting_down() {
+                BridgeError::Superseded
+            } else {
+                BridgeError::HashUnconfirmed
+            });
+        }
+        let revision = match prepared.confirm() {
+            Ok(crate::hash_persistence::CommitOutcome::Committed(revision))
+                if !self.is_shutting_down() && domain.is_confirmed() =>
+            {
+                revision
+            }
+            Ok(crate::hash_persistence::CommitOutcome::Committed(_)) => {
+                return Err(if self.is_shutting_down() {
+                    BridgeError::Superseded
+                } else {
+                    BridgeError::HashUnconfirmed
+                });
+            }
+            Ok(_) | Err(_) => {
+                return Err(BridgeError::HashUnconfirmed);
+            }
+        };
+        let mut slot = self.lock_slot();
+        if slot.store.revision() != base {
+            drop(slot);
+            self.abandon_domain();
+            return Err(BridgeError::Superseded);
+        }
+        staged.install(&mut slot.store, revision);
+        Ok(revision)
+    }
+
+    /// Run a non-ticketed in-memory mutation through the isolated owner. Used
+    /// for state that is not tied to a managed connection (the app-wide
+    /// default) and by test-only completion seeding.
+    fn mutate_persisted<R>(
+        &self,
+        mutate: impl FnOnce(&mut HashStore) -> Result<R, BridgeError>,
+    ) -> Result<R, BridgeError> {
+        let _write = self.lock_write();
+        let (mut fork, base) = {
+            let slot = self.lock_slot();
+            if !slot.loaded {
+                return Err(BridgeError::State);
+            }
+            (slot.store.fork_for_staging(), slot.store.revision())
+        };
+        let result = mutate(&mut fork)?;
+        if fork.revision() != base {
+            let staged = fork.stage_write().map_err(|_| BridgeError::State)?;
+            self.commit_staged(base, staged)?;
+        }
+        Ok(result)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     fn record_intents(&self, intents: &[HashIntent]) -> Result<(), BridgeError> {
         self.record_intents_with(intents, &[]).map(|_| ())
     }
 
+    #[cfg(test)]
     fn record_intents_with(
         &self,
         intents: &[HashIntent],
         provenance: &[(String, crate::hash_state::HashProvenance)],
     ) -> Result<crate::hash_state::ReconcileCohort, BridgeError> {
-        let mut slot = self.lock_slot();
-        if !slot.loaded {
-            return Err(BridgeError::State);
-        }
-        slot.store
-            .record_intents_with(intents, provenance)
-            .map_err(|_| BridgeError::State)
+        self.mutate_persisted(|store| {
+            store
+                .record_intents_with(intents, provenance)
+                .map_err(|_| BridgeError::State)
+        })
     }
 
     fn visible(&self, namespace: Option<&str>) -> Vec<DownloadHashDto> {
@@ -860,6 +1279,11 @@ impl HashCoordinator {
         namespace
             .map(|value| slot.store.visible(value))
             .unwrap_or_default()
+    }
+
+    fn visible_unconfirmed(&self, namespace: Option<&str>) -> Vec<DownloadHashDto> {
+        let slot = self.lock_slot();
+        slot.store.visible_unconfirmed(namespace)
     }
 
     fn candidates(&self, namespace: &str) -> Vec<crate::hash_state::HashCandidate> {
@@ -870,18 +1294,6 @@ impl HashCoordinator {
     fn reconcile_cohort(&self) -> crate::hash_state::ReconcileCohort {
         let slot = self.lock_slot();
         slot.store.reconcile_cohort()
-    }
-
-    fn reconcile_cohort_and_candidates(
-        &self,
-        namespace: &str,
-        items: &[crate::hash_state::QueueItemIdentity],
-        cohort: &crate::hash_state::ReconcileCohort,
-    ) -> Result<Vec<crate::hash_state::HashCandidate>, BridgeError> {
-        let mut slot = self.lock_slot();
-        slot.store
-            .reconcile_cohort_and_candidates(namespace, items, cohort)
-            .map_err(|_| BridgeError::State)
     }
 
     fn completed_for(&self, namespace: &str) -> Vec<crate::hash_state::CompletedHash> {
@@ -899,6 +1311,7 @@ impl HashCoordinator {
         slot.store.visible_verified(namespace, verified, fence)
     }
 
+    #[allow(dead_code)]
     fn mark_complete(
         &self,
         id: &str,
@@ -906,43 +1319,38 @@ impl HashCoordinator {
         fence: u64,
         completed: crate::hash_state::HashCompleted,
     ) -> Result<bool, BridgeError> {
-        let mut slot = self.lock_slot();
-        if !slot.loaded {
-            return Err(BridgeError::State);
-        }
-        slot.store
-            .mark_complete(id, generation, fence, completed)
-            .map_err(|_| BridgeError::State)
+        self.mutate_persisted(|store| {
+            store
+                .mark_complete(id, generation, fence, completed)
+                .map_err(|_| BridgeError::State)
+        })
     }
 
+    #[allow(dead_code)]
     fn mark_failed(&self, id: &str, generation: u64, fence: u64) -> Result<bool, BridgeError> {
-        let mut slot = self.lock_slot();
-        if !slot.loaded {
-            return Err(BridgeError::State);
-        }
-        slot.store
-            .mark_failed(id, generation, fence)
-            .map_err(|_| BridgeError::State)
+        self.mutate_persisted(|store| {
+            store
+                .mark_failed(id, generation, fence)
+                .map_err(|_| BridgeError::State)
+        })
     }
 
+    #[allow(dead_code)]
     fn mark_unavailable(&self, id: &str, generation: u64, fence: u64) -> Result<bool, BridgeError> {
-        let mut slot = self.lock_slot();
-        if !slot.loaded {
-            return Err(BridgeError::State);
-        }
-        slot.store
-            .mark_unavailable(id, generation, fence)
-            .map_err(|_| BridgeError::State)
+        self.mutate_persisted(|store| {
+            store
+                .mark_unavailable(id, generation, fence)
+                .map_err(|_| BridgeError::State)
+        })
     }
 
+    #[allow(dead_code)]
     fn mark_stale(&self, id: &str, generation: u64, fence: u64) -> Result<bool, BridgeError> {
-        let mut slot = self.lock_slot();
-        if !slot.loaded {
-            return Err(BridgeError::State);
-        }
-        slot.store
-            .mark_stale(id, generation, fence)
-            .map_err(|_| BridgeError::State)
+        self.mutate_persisted(|store| {
+            store
+                .mark_stale(id, generation, fence)
+                .map_err(|_| BridgeError::State)
+        })
     }
 
     fn invalidate_completed(
@@ -950,22 +1358,29 @@ impl HashCoordinator {
         expected: &crate::hash_state::CompletedHash,
         fence: u64,
     ) -> Result<bool, BridgeError> {
-        let mut slot = self.lock_slot();
-        if !slot.loaded {
-            return Err(BridgeError::State);
-        }
-        slot.store
-            .invalidate_completed(expected, fence)
-            .map_err(|_| BridgeError::State)
+        self.mutate_persisted(|store| {
+            store
+                .invalidate_completed(expected, fence)
+                .map_err(|_| BridgeError::State)
+        })
     }
 
-    fn cancel_current(&self) {
-        {
-            let worker = self.lock_worker();
-            if let Some(token) = worker.token.as_ref() {
-                token.store(true, Ordering::SeqCst);
-            }
+    /// Signal the current worker without changing the lifecycle fence. The
+    /// epoch and fence are advanced together by the owning transition under
+    /// the lifecycle gate and connection-state lock.
+    fn cancel_worker(&self) {
+        let worker = self.lock_worker();
+        if let Some(token) = worker.token.as_ref() {
+            token.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Test-only helper that simulates a lifecycle change without an epoch
+    /// transition. Production transitions must use the atomic path instead.
+    #[cfg(test)]
+    fn cancel_current(&self) {
+        let _lifecycle = self.lock_lifecycle();
+        self.cancel_worker();
         // A lifecycle change must immediately fence results from the previous
         // managed connection, even if the old worker has not observed its
         // cancellation token yet. This fence is intentionally not persisted.
@@ -974,7 +1389,15 @@ impl HashCoordinator {
 
     /// Start the single worker or coalesce with the running one. A new token is
     /// created only when no worker owns the slot.
+    ///
+    /// The lifecycle gate is held while the token is created so a transition
+    /// that is cancelling and fencing the old lifecycle cannot race a new
+    /// uncancelled worker into the gap between cancellation and the fence.
     fn start_worker(&self) -> Option<Arc<AtomicBool>> {
+        let _lifecycle = self.lock_lifecycle();
+        if self.is_shutting_down() {
+            return None;
+        }
         let mut worker = self.lock_worker();
         if worker.running {
             worker.dirty = true;
@@ -995,6 +1418,10 @@ impl HashCoordinator {
         token: &Arc<AtomicBool>,
         allow_respawn: bool,
     ) -> Option<Arc<AtomicBool>> {
+        // Respawn also takes the lifecycle gate. A worker that exits while a
+        // transition is cancelling/fencing therefore waits and can only start
+        // against the new epoch, never between the cancel and the fence.
+        let _lifecycle = self.lock_lifecycle();
         let mut worker = self.lock_worker();
         worker.running = false;
         if worker
@@ -1004,7 +1431,7 @@ impl HashCoordinator {
         {
             worker.token = None;
         }
-        if !allow_respawn || !worker.dirty {
+        if !allow_respawn || !worker.dirty || self.is_shutting_down() {
             worker.dirty = false;
             return None;
         }
@@ -1022,6 +1449,141 @@ impl HashCoordinator {
     }
 }
 
+/// Revalidate a captured lifecycle ticket and run one hash-state mutation.
+///
+/// The lifecycle/state/slot locks are held only to snapshot the fork and to
+/// install confirmed memory. The durable write is submitted to the isolated
+/// persistence owner with no lock held, so a hung `fsync`/`rename` can never
+/// block shutdown. If the lifecycle wins the race after the owner published,
+/// the result is not installed as current and the domain is quarantined; we do
+/// not claim the already-authorized rename could not physically occur.
+fn mutate_hash_at_ticket<T>(
+    state: &Mutex<ConnectionState>,
+    hashes: &HashCoordinator,
+    ticket: &HashWriteTicket,
+    mutate: impl FnOnce(&mut HashSlot) -> Result<T, BridgeError>,
+) -> Result<T, BridgeError> {
+    let _write = hashes.lock_write();
+    #[cfg(test)]
+    hashes.hash_write_pause.wait();
+
+    // Snapshot and validate under the lifecycle gate, but do not mutate or
+    // persist while holding it.
+    let (mut staged_slot, base_revision) = {
+        let _lifecycle = hashes.lock_lifecycle();
+        let state = state.lock().map_err(|_| BridgeError::State)?;
+        if hashes.is_shutting_down() || state.shutting_down {
+            return Err(BridgeError::Superseded);
+        }
+        if state.epoch != ticket.epoch
+            || state.hash_daemon_binding().as_ref() != Some(&ticket.binding)
+        {
+            return Err(BridgeError::Superseded);
+        }
+        let slot = hashes.lock_slot();
+        if slot.store.fence() != ticket.fence
+            || slot.namespace.as_deref() != ticket.namespace.as_deref()
+        {
+            return Err(BridgeError::Superseded);
+        }
+        let staged = HashSlot {
+            path: slot.path.clone(),
+            loaded: slot.loaded,
+            namespace: slot.namespace.clone(),
+            store: slot.store.fork_for_staging(),
+        };
+        (staged, slot.store.revision())
+    };
+
+    let result = mutate(&mut staged_slot)?;
+    if staged_slot.store.revision() == base_revision {
+        return Ok(result);
+    }
+    let staged = staged_slot
+        .store
+        .stage_write()
+        .map_err(|_| BridgeError::State)?;
+    #[cfg(test)]
+    hashes.hash_commit_pause.wait();
+    if hashes.is_shutting_down() {
+        return Err(BridgeError::Superseded);
+    }
+
+    let Some(domain) = hashes.domain() else {
+        return Err(BridgeError::State);
+    };
+    let prepared = match domain.prepare(base_revision, staged.bytes().to_vec()) {
+        Ok(crate::hash_persistence::PrepareOutcome::Prepared(prepared)) => prepared,
+        Ok(crate::hash_persistence::PrepareOutcome::BeforeRename) => {
+            return Err(BridgeError::State);
+        }
+        Ok(crate::hash_persistence::PrepareOutcome::Conflict) => {
+            hashes.abandon_domain();
+            return Err(BridgeError::Superseded);
+        }
+        Ok(crate::hash_persistence::PrepareOutcome::ExternalChange)
+        | Ok(crate::hash_persistence::PrepareOutcome::Unconfirmed)
+        | Err(_) => {
+            return Err(if hashes.is_shutting_down() {
+                BridgeError::Superseded
+            } else {
+                BridgeError::HashUnconfirmed
+            });
+        }
+    };
+
+    // The state is already durable, but authorization is decided only while
+    // the lifecycle gate is held. A stale ticket aborts before the marker can
+    // become `acked`, so a successor fails closed instead of accepting an
+    // obsolete publication. A transition cannot slip between this validation
+    // and the durable acknowledgement.
+    let _lifecycle = hashes.lock_lifecycle();
+    let state = state.lock().map_err(|_| BridgeError::State)?;
+    let mut slot = hashes.lock_slot();
+    if hashes.is_shutting_down()
+        || state.shutting_down
+        || state.epoch != ticket.epoch
+        || state.hash_daemon_binding().as_ref() != Some(&ticket.binding)
+    {
+        drop(slot);
+        drop(state);
+        drop(_lifecycle);
+        prepared.abort();
+        hashes.abandon_domain();
+        return Err(BridgeError::Superseded);
+    }
+    if slot.store.fence() != ticket.fence
+        || slot.namespace.as_deref() != ticket.namespace.as_deref()
+        || slot.store.revision() != base_revision
+    {
+        drop(slot);
+        drop(state);
+        drop(_lifecycle);
+        prepared.abort();
+        hashes.abandon_domain();
+        return Err(BridgeError::HashUnconfirmed);
+    }
+    let committed_revision = match prepared.confirm() {
+        Ok(crate::hash_persistence::CommitOutcome::Committed(revision)) => revision,
+        Ok(_) | Err(_) => {
+            drop(slot);
+            drop(state);
+            drop(_lifecycle);
+            return Err(BridgeError::HashUnconfirmed);
+        }
+    };
+    if hashes.is_shutting_down() || state.shutting_down {
+        drop(slot);
+        drop(state);
+        drop(_lifecycle);
+        hashes.abandon_domain();
+        return Err(BridgeError::Superseded);
+    }
+    drop(state);
+    staged.install(&mut slot.store, committed_revision);
+    Ok(result)
+}
+
 fn spawn_hash_worker(
     state: Arc<Mutex<ConnectionState>>,
     lifecycle: Arc<ManagedLifecycle>,
@@ -1037,19 +1599,42 @@ fn spawn_hash_worker(
                 break 'worker;
             }
             let _ = hashes.take_dirty();
-            let snapshot = {
+            // Capture the daemon target and the hash lifecycle ticket under
+            // one state lock, then the namespace/fence under the slot lock.
+            // This binds the eventual reconcile mutation to the exact
+            // connection epoch that produced the `/list` request.
+            let (snapshot, ticket) = {
                 let state = match state.lock() {
                     Ok(state) => state,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                state.managed_rate_snapshot()
+                match (state.managed_rate_snapshot(), state.hash_daemon_binding()) {
+                    (Ok(snapshot), Some(binding)) => {
+                        let slot = hashes.lock_slot();
+                        let Some(namespace) = slot.namespace.clone() else {
+                            break 'worker;
+                        };
+                        (
+                            snapshot,
+                            HashWriteTicket {
+                                epoch: state.epoch,
+                                binding,
+                                fence: slot.store.fence(),
+                                namespace: Some(namespace),
+                            },
+                        )
+                    }
+                    _ => break 'worker,
+                }
             };
-            let Ok(snapshot) = snapshot else {
+            let Some(namespace) = ticket.namespace.clone() else {
                 break 'worker;
             };
-            let Some(namespace) = hashes.namespace() else {
+            // A transition may have cancelled the token after the capture
+            // above; do not start a superseded `/list` request.
+            if token.load(Ordering::SeqCst) || lifecycle.is_shutting_down() {
                 break 'worker;
-            };
+            }
             // Capture the exact cohort before the snapshot request starts.
             // A record accepted or modified while `/list` is in flight must
             // never be invalidated by that older response.
@@ -1060,21 +1645,21 @@ fn spawn_hash_worker(
                 let Ok(downloads) = snapshot.client.refresh().await else {
                     break 'worker;
                 };
-                let current = {
-                    let state = match state.lock() {
-                        Ok(state) => state,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    !state.shutting_down && state.rate_write_is_current(&snapshot)
-                };
-                if !current {
+                if token.load(Ordering::SeqCst) || lifecycle.is_shutting_down() {
                     break 'worker;
                 }
                 let items: Vec<_> = downloads
                     .iter()
                     .map(crate::hash_state::QueueItemIdentity::from_download)
                     .collect();
-                match hashes.reconcile_cohort_and_candidates(&namespace, &items, &cohort) {
+                match mutate_hash_at_ticket(&state, &hashes, &ticket, |slot| {
+                    if !slot.loaded {
+                        return Err(BridgeError::State);
+                    }
+                    slot.store
+                        .reconcile_cohort_and_candidates(&namespace, &items, &cohort)
+                        .map_err(|_| BridgeError::State)
+                }) {
                     Ok(candidates) => candidates,
                     Err(_) => break 'worker,
                 }
@@ -1094,8 +1679,9 @@ fn spawn_hash_worker(
                 let check_state = Arc::clone(&state);
                 let check_token = Arc::clone(&token);
                 let check_snapshot = snapshot.clone();
+                let check_lifecycle = Arc::clone(&lifecycle);
                 let current = move || {
-                    if check_token.load(Ordering::SeqCst) {
+                    if check_token.load(Ordering::SeqCst) || check_lifecycle.is_shutting_down() {
                         return false;
                     }
                     match check_state.lock() {
@@ -1116,39 +1702,71 @@ fn spawn_hash_worker(
                 .await
                 {
                     Ok(automatic_hash::HashOneOutcome::Completed(completed)) => {
-                        if hashes
-                            .mark_complete(
-                                &candidate.id,
-                                candidate.generation,
-                                candidate.fence,
-                                completed,
-                            )
-                            .is_err()
+                        if mutate_hash_at_ticket(&state, &hashes, &ticket, |slot| {
+                            if !slot.loaded {
+                                return Err(BridgeError::State);
+                            }
+                            slot.store
+                                .mark_complete(
+                                    &candidate.id,
+                                    candidate.generation,
+                                    candidate.fence,
+                                    completed,
+                                )
+                                .map(|_| ())
+                                .map_err(|_| BridgeError::State)
+                        })
+                        .is_err()
                         {
                             break 'worker;
                         }
                     }
                     Ok(automatic_hash::HashOneOutcome::Pending) => {}
                     Ok(automatic_hash::HashOneOutcome::Failed) => {
-                        if hashes
-                            .mark_failed(&candidate.id, candidate.generation, candidate.fence)
-                            .is_err()
+                        if mutate_hash_at_ticket(&state, &hashes, &ticket, |slot| {
+                            if !slot.loaded {
+                                return Err(BridgeError::State);
+                            }
+                            slot.store
+                                .mark_failed(&candidate.id, candidate.generation, candidate.fence)
+                                .map(|_| ())
+                                .map_err(|_| BridgeError::State)
+                        })
+                        .is_err()
                         {
                             break 'worker;
                         }
                     }
                     Ok(automatic_hash::HashOneOutcome::Unavailable) => {
-                        if hashes
-                            .mark_unavailable(&candidate.id, candidate.generation, candidate.fence)
-                            .is_err()
+                        if mutate_hash_at_ticket(&state, &hashes, &ticket, |slot| {
+                            if !slot.loaded {
+                                return Err(BridgeError::State);
+                            }
+                            slot.store
+                                .mark_unavailable(
+                                    &candidate.id,
+                                    candidate.generation,
+                                    candidate.fence,
+                                )
+                                .map(|_| ())
+                                .map_err(|_| BridgeError::State)
+                        })
+                        .is_err()
                         {
                             break 'worker;
                         }
                     }
                     Ok(automatic_hash::HashOneOutcome::Stale) => {
-                        if hashes
-                            .mark_stale(&candidate.id, candidate.generation, candidate.fence)
-                            .is_err()
+                        if mutate_hash_at_ticket(&state, &hashes, &ticket, |slot| {
+                            if !slot.loaded {
+                                return Err(BridgeError::State);
+                            }
+                            slot.store
+                                .mark_stale(&candidate.id, candidate.generation, candidate.fence)
+                                .map(|_| ())
+                                .map_err(|_| BridgeError::State)
+                        })
+                        .is_err()
                         {
                             break 'worker;
                         }
@@ -1175,6 +1793,7 @@ fn spawn_hash_worker(
 struct TestManagedConnection {
     client: Arc<SurgeClient>,
     pid: u32,
+    exited: bool,
 }
 
 #[derive(Default)]
@@ -1203,6 +1822,9 @@ impl ConnectionState {
             ActiveConnection::Managed => {
                 #[cfg(test)]
                 if let Some(test) = self.test_managed.as_ref() {
+                    if test.exited {
+                        return Err(BridgeError::NotConnected);
+                    }
                     return Ok((Arc::clone(&test.client), self.epoch));
                 }
                 let server = self.managed.as_ref().ok_or(BridgeError::NotConnected)?;
@@ -1220,6 +1842,9 @@ impl ConnectionState {
         }
         #[cfg(test)]
         if let Some(test) = self.test_managed.as_ref() {
+            if test.exited {
+                return Err(BridgeError::NotConnected);
+            }
             return Ok(ManagedRateSnapshot {
                 client: Arc::clone(&test.client),
                 epoch: self.epoch,
@@ -1244,6 +1869,9 @@ impl ConnectionState {
         let connection_id = self.hash_connection_id.clone()?;
         #[cfg(test)]
         if let Some(test) = self.test_managed.as_ref() {
+            if test.exited {
+                return None;
+            }
             return Some(crate::hash_state::DaemonBinding {
                 connection_id,
                 daemon_pid: test.pid,
@@ -1280,7 +1908,7 @@ impl ConnectionState {
         }
         #[cfg(test)]
         if let Some(test) = self.test_managed.as_ref() {
-            return test.pid == snapshot.pid;
+            return !test.exited && test.pid == snapshot.pid;
         }
         self.managed
             .as_ref()
@@ -1305,9 +1933,7 @@ impl ConnectionState {
         self.retiring = self.retiring.saturating_sub(1);
     }
 
-    fn begin_managed_start(
-        &mut self,
-    ) -> Result<(ManagedStartTicket, Option<ManagedServer>), ManagedError> {
+    fn can_begin_managed_start(&self) -> Result<(), ManagedError> {
         if self.shutting_down {
             return Err(ManagedError::ShuttingDown);
         }
@@ -1324,6 +1950,13 @@ impl ConnectionState {
                 return Err(ManagedError::AlreadyStarted);
             }
         }
+        Ok(())
+    }
+
+    fn begin_managed_start(
+        &mut self,
+    ) -> Result<(ManagedStartTicket, Option<ManagedServer>), ManagedError> {
+        self.can_begin_managed_start()?;
         // Remove the old daemon under the lock, but never shut it down while
         // holding the lock: the caller performs the bounded network/process
         // retirement after the guard is released.
@@ -1441,6 +2074,7 @@ struct VerifiedPauseArmed {
 
 #[cfg(test)]
 impl VerifiedPause {
+    #[cfg(target_os = "linux")]
     fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (entered, entered_rx) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
@@ -1455,6 +2089,7 @@ impl VerifiedPause {
         (entered_rx, release)
     }
 
+    #[cfg(target_os = "linux")]
     fn clear(&self) {
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
@@ -1500,7 +2135,11 @@ pub struct ConnectionManager {
     #[cfg(test)]
     verified_pause: VerifiedPause,
     #[cfg(test)]
+    verified_list_pause: VerifiedPause,
+    #[cfg(test)]
     record_intents_pause: VerifiedPause,
+    #[cfg(test)]
+    lifecycle_fence_pause: VerifiedPause,
 }
 
 impl fmt::Debug for ConnectionManager {
@@ -1533,16 +2172,23 @@ impl ConnectionManager {
         // A replacement connection must never leave the previous stream or
         // hash worker reading from the superseded daemon.
         self.progress.stop();
-        self.hashes.cancel_current();
         // Hold the lifecycle operation only across taking and retiring the old
         // daemon. If app shutdown has already started, the shutdown path owns
-        // any remaining server.
+        // any remaining server and this attempt must not cancel/fence it.
         let lifecycle = match self.lifecycle.begin_operation() {
             Some(guard) => guard,
             None => return Err(BridgeError::Superseded),
         };
         let (epoch, retired, retirement_registered) = {
+            // Cancel and fence under one gate so a trigger cannot start a new
+            // uncancelled worker between the two operations.
+            let _lifecycle = self.hashes.lock_lifecycle();
+            self.hashes.cancel_worker();
+            #[cfg(test)]
+            self.lifecycle_fence_pause.wait();
             let mut state = self.state.lock().map_err(|_| BridgeError::State)?;
+            let mut slot = self.hashes.lock_slot();
+            slot.store.fence_in_flight();
             state.epoch = state.epoch.wrapping_add(1);
             state.clear_active();
             let retired = state.managed.take();
@@ -1599,9 +2245,21 @@ impl ConnectionManager {
     fn begin_managed_start(
         &self,
     ) -> Result<(ManagedStartTicket, Option<ManagedServer>), ManagedError> {
+        let _lifecycle = self.hashes.lock_lifecycle();
+        // Reject an invalid start before touching the progress stream, worker,
+        // or fence. A concurrent valid claim or shutdown must not disturb the
+        // work that already belongs to the current lifecycle.
+        {
+            let state = self.state.lock().map_err(|_| ManagedError::State)?;
+            state.can_begin_managed_start()?;
+        }
         self.progress.stop();
-        self.hashes.cancel_current();
+        self.hashes.cancel_worker();
+        #[cfg(test)]
+        self.lifecycle_fence_pause.wait();
         let mut state = self.state.lock().map_err(|_| ManagedError::State)?;
+        let mut slot = self.hashes.lock_slot();
+        slot.store.fence_in_flight();
         state.begin_managed_start()
     }
 
@@ -1742,19 +2400,26 @@ impl ConnectionManager {
         // This ordering means an operation that already claimed a slot either
         // sees `shutting_down` before finishing or gets cancelled below.
         self.lifecycle.begin_shutdown();
+        self.hashes.begin_shutdown();
         self.progress.stop();
-        self.hashes.cancel_current();
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
+        let server = {
+            let _lifecycle = self.hashes.lock_lifecycle();
+            self.hashes.cancel_worker();
+            #[cfg(test)]
+            self.lifecycle_fence_pause.wait();
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut slot = self.hashes.lock_slot();
+            slot.store.fence_in_flight();
+            state.shutting_down = true;
+            state.starting = false;
+            state.start_generation = state.start_generation.wrapping_add(1);
+            state.epoch = state.epoch.wrapping_add(1);
+            state.clear_active();
+            state.managed.take()
         };
-        state.shutting_down = true;
-        state.starting = false;
-        state.start_generation = state.start_generation.wrapping_add(1);
-        state.epoch = state.epoch.wrapping_add(1);
-        state.clear_active();
-        let server = state.managed.take();
-        drop(state);
         if let Some(server) = server {
             let owner = server.owner_lifetime();
             // Count the active server shutdown itself so app drain cannot
@@ -2143,6 +2808,209 @@ impl ConnectionManager {
         self.hashes.namespace()
     }
 
+    fn is_active_managed(&self) -> bool {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.active == ActiveConnection::Managed
+    }
+
+    /// Capture the connection mode and epoch together so a hash command can
+    /// attribute an initialization failure to the connection it actually
+    /// observed, then fence its result against a later transition.
+    fn connection_mode_epoch(&self) -> Result<(ActiveConnection, u64), BridgeError> {
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        Ok((state.active, state.epoch))
+    }
+
+    fn connection_mode_epoch_is_current(&self, mode: ActiveConnection, epoch: u64) -> bool {
+        match self.state.lock() {
+            Ok(state) => state.active == mode && state.epoch == epoch,
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                state.active == mode && state.epoch == epoch
+            }
+        }
+    }
+
+    /// Owned managed readers must fail closed when the persistence owner is
+    /// unresolved or quarantined. Manual and disconnected states keep their
+    /// existing empty-row behavior because they never own automatic hashes.
+    fn require_managed_hash_confirmed(&self) -> Result<(), BridgeError> {
+        if !self.is_active_managed() || self.hashes.persistence_confirmed() {
+            return Ok(());
+        }
+        Err(self
+            .hashes
+            .initialization_failure()
+            .filter(|error| *error != BridgeError::Superseded)
+            .unwrap_or(BridgeError::HashUnconfirmed))
+    }
+
+    /// Command body for `get_download_hashes` after managed initialization.
+    ///
+    /// The mode/epoch observed before the asynchronous verification is fenced
+    /// again afterwards. A transition during the snapshot must surface as
+    /// `Superseded`, never as a stale empty success (manual/offline) or a stale
+    /// error from the previous connection. Manual and offline connections keep
+    /// their existing empty-row behavior as long as no transition intervened.
+    pub async fn get_download_hashes_checked(&self) -> Result<Vec<DownloadHashDto>, BridgeError> {
+        let (mode, epoch) = self.connection_mode_epoch()?;
+        self.require_managed_hash_confirmed()?;
+        let result = self.verified_download_hashes().await;
+        let fence_current = self.connection_mode_epoch_is_current(mode, epoch);
+        let confirmed = self.require_managed_hash_confirmed();
+        if !fence_current {
+            return Err(BridgeError::Superseded);
+        }
+        confirmed?;
+        result
+    }
+
+    /// Get with an initialization step whose failure is attributed to the
+    /// connection mode/epoch observed before it ran.
+    ///
+    /// The mode/epoch is captured before `ensure`, then fenced again after the
+    /// synchronous initialization and after the asynchronous verified snapshot.
+    /// A transition during either phase surfaces as `Superseded`; a managed
+    /// failure from the captured connection is never leaked as a replacement
+    /// connection's error. Manual connections keep their existing empty-row
+    /// behavior and skip the managed initialization.
+    pub(crate) async fn get_download_hashes_fenced<F>(
+        &self,
+        ensure: F,
+    ) -> Result<Vec<DownloadHashDto>, BridgeError>
+    where
+        F: FnOnce() -> Result<(), BridgeError>,
+    {
+        let (mode, epoch) = self.connection_mode_epoch()?;
+        let managed = mode == ActiveConnection::Managed;
+        let init = if managed { ensure() } else { Ok(()) };
+        let fence_current = self.connection_mode_epoch_is_current(mode, epoch);
+        match init {
+            Ok(()) => {
+                if !fence_current {
+                    return Err(BridgeError::Superseded);
+                }
+                let result = self.get_download_hashes_checked().await;
+                if !self.connection_mode_epoch_is_current(mode, epoch) {
+                    return Err(BridgeError::Superseded);
+                }
+                result
+            }
+            Err(error) => {
+                if managed && !fence_current {
+                    Err(BridgeError::Superseded)
+                } else if managed || self.is_active_managed() {
+                    Err(error)
+                } else if !fence_current {
+                    Err(BridgeError::Superseded)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+    }
+
+    /// Command body for `refresh_download_hashes` after managed initialization.
+    pub async fn refresh_download_hashes_checked(
+        &self,
+    ) -> Result<Vec<DownloadHashDto>, BridgeError> {
+        let (mode, epoch) = self.connection_mode_epoch()?;
+        self.require_managed_hash_confirmed()?;
+        self.trigger_hashing();
+        let result = self.verified_download_hashes().await;
+        let fence_current = self.connection_mode_epoch_is_current(mode, epoch);
+        let confirmed = self.require_managed_hash_confirmed();
+        if !fence_current {
+            return Err(BridgeError::Superseded);
+        }
+        confirmed?;
+        result
+    }
+
+    /// Refresh with an initialization step whose failure is attributed to the
+    /// connection mode/epoch observed before it ran. A stale manual snapshot
+    /// can never swallow a managed initialization failure into an empty
+    /// success, and the result of the asynchronous verification is only
+    /// returned while its fence is still current. A transition that happens
+    /// while the snapshot is in flight must surface as `Superseded`, never as
+    /// a stale empty success or a stale error from the previous connection.
+    pub(crate) async fn refresh_download_hashes_fenced<F>(
+        &self,
+        ensure: F,
+    ) -> Result<Vec<DownloadHashDto>, BridgeError>
+    where
+        F: FnOnce() -> Result<(), BridgeError>,
+    {
+        let (mode, epoch) = self.connection_mode_epoch()?;
+        let managed = mode == ActiveConnection::Managed;
+        let init = ensure();
+        let fence_current = self.connection_mode_epoch_is_current(mode, epoch);
+        match init {
+            Ok(()) => {
+                if !fence_current {
+                    return Err(BridgeError::Superseded);
+                }
+                let result = self.refresh_download_hashes_checked().await;
+                if !self.connection_mode_epoch_is_current(mode, epoch) {
+                    return Err(BridgeError::Superseded);
+                }
+                result
+            }
+            Err(error) => {
+                // Manual connections keep their best-effort empty rows, but
+                // only while neither the captured nor the current connection
+                // is managed. A managed failure is always surfaced.
+                if self.is_active_managed() || (managed && fence_current) {
+                    Err(error)
+                } else if !fence_current {
+                    Err(BridgeError::Superseded)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+    }
+
+    /// Capture the lifecycle fence for the connection currently held by
+    /// `state`. The caller must already hold the connection-state lock; the
+    /// hash slot is nested inside it to preserve the state -> slot lock order.
+    fn hash_write_ticket_locked(
+        &self,
+        state: &ConnectionState,
+    ) -> Result<HashWriteTicket, BridgeError> {
+        let binding = state
+            .hash_daemon_binding()
+            .ok_or(BridgeError::NotConnected)?;
+        let slot = self.hashes.lock_slot();
+        Ok(HashWriteTicket {
+            epoch: state.epoch,
+            binding,
+            fence: slot.store.fence(),
+            namespace: slot.namespace.clone(),
+        })
+    }
+
+    /// Capture a ticket for an operation already pinned to `epoch`. A manual
+    /// or missing daemon binding yields `None`, so the caller leaves automatic
+    /// hashing disabled rather than writing an unbound record.
+    fn capture_hash_write_ticket(
+        &self,
+        epoch: u64,
+    ) -> Result<Option<HashWriteTicket>, BridgeError> {
+        let state = self.state.lock().map_err(|_| BridgeError::State)?;
+        if state.epoch != epoch {
+            return Err(BridgeError::Superseded);
+        }
+        match self.hash_write_ticket_locked(&state) {
+            Ok(ticket) => Ok(Some(ticket)),
+            Err(BridgeError::NotConnected) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Enqueue a download and, only for a confirmed accepted id, persist the
     /// per-download hash intent before triggering the worker.
     ///
@@ -2160,13 +3028,11 @@ impl ConnectionManager {
         let (client, epoch) = self.acquire_active()?;
         let receipt = client.add_download_receipt(url).await?;
 
-        let binding = {
-            let state = self.state.lock().map_err(|_| BridgeError::State)?;
-            if state.epoch != epoch {
-                return Err(BridgeError::Superseded);
-            }
-            state.hash_daemon_binding()
-        };
+        // Bind the eventual intent write to the exact daemon lifecycle that
+        // acknowledged the add. The ticket is captured before the status read
+        // and revalidated atomically with the mutation, so a reconnect during
+        // that read can never install an old intent into the new lifecycle.
+        let ticket = self.capture_hash_write_ticket(epoch)?;
 
         let mut hash_recorded = None;
         if hash {
@@ -2178,42 +3044,38 @@ impl ConnectionManager {
                     hash_recorded,
                 });
             };
-            let recorded = match binding {
-                Some(binding) => match client.get_download(id).await {
-                    Ok(download) => {
-                        let current = {
-                            let state = self.state.lock().map_err(|_| BridgeError::State)?;
-                            state.epoch == epoch
-                                && state.hash_daemon_binding().as_ref() == Some(&binding)
-                        };
-                        if current {
-                            match self.hashes.namespace() {
-                                Some(namespace) => {
-                                    let provenance = crate::hash_state::HashProvenance {
-                                        namespace,
-                                        added_at: download.added_at,
-                                        fingerprint: crate::hash_state::queue_fingerprint(
-                                            &download.id,
-                                            download.added_at,
-                                            &download.url,
-                                        ),
-                                    };
-                                    self.hashes
-                                        .record_intents_with(
-                                            &[HashIntent {
-                                                id: id.to_owned(),
-                                                enabled: true,
-                                            }],
-                                            &[(id.to_owned(), provenance)],
-                                        )
-                                        .is_ok()
+            let recorded = match ticket {
+                Some(ticket) => match client.get_download(id).await {
+                    Ok(download) => match ticket.namespace.clone() {
+                        Some(namespace) => {
+                            let provenance = crate::hash_state::HashProvenance {
+                                namespace,
+                                added_at: download.added_at,
+                                fingerprint: crate::hash_state::queue_fingerprint(
+                                    &download.id,
+                                    download.added_at,
+                                    &download.url,
+                                ),
+                            };
+                            mutate_hash_at_ticket(&self.state, &self.hashes, &ticket, |slot| {
+                                if !slot.loaded {
+                                    return Err(BridgeError::State);
                                 }
-                                None => false,
-                            }
-                        } else {
-                            false
+                                slot.store
+                                    .record_intents_with(
+                                        &[HashIntent {
+                                            id: id.to_owned(),
+                                            enabled: true,
+                                        }],
+                                        &[(id.to_owned(), provenance)],
+                                    )
+                                    .map(|_| ())
+                                    .map_err(|_| BridgeError::State)
+                            })
+                            .is_ok()
                         }
-                    }
+                        None => false,
+                    },
                     Err(_) => false,
                 },
                 None => false,
@@ -2243,54 +3105,64 @@ impl ConnectionManager {
         &self,
         intents: &[HashIntent],
     ) -> Result<Vec<DownloadHashDto>, BridgeError> {
-        // Only records that existed before this snapshot request may be
-        // reconciled by its response. Intents recorded by this call are added
-        // to the cohort explicitly below so they can still fail closed.
-        let preexisting = self.hashes.reconcile_cohort();
-        let snapshot = {
+        // Capture the lifecycle ticket before any cohort or network read so
+        // the whole transaction is bound to one connection. Only records that
+        // existed before this snapshot request may be reconciled by its
+        // response. Intents recorded by this call are added to the cohort
+        // explicitly below so they can still fail closed.
+        let (snapshot, ticket) = {
             let state = self.state.lock().map_err(|_| BridgeError::State)?;
-            state.managed_rate_snapshot()?
-        };
-        let downloads = snapshot.client.refresh().await?;
-        let current = {
-            let state = self.state.lock().map_err(|_| BridgeError::State)?;
-            state.rate_write_is_current(&snapshot)
-        };
-        if !current {
-            return Err(BridgeError::Superseded);
-        }
-        let namespace = self.hashes.namespace();
-        let mut provenance = Vec::new();
-        if let Some(namespace) = namespace.as_deref() {
-            for intent in intents.iter().filter(|intent| intent.enabled) {
-                let mut matches = downloads.iter().filter(|download| download.id == intent.id);
-                let Some(download) = matches.next() else {
-                    continue;
-                };
-                if matches.next().is_some() {
-                    continue;
-                }
-                provenance.push((
-                    intent.id.clone(),
-                    crate::hash_state::HashProvenance {
-                        namespace: namespace.to_owned(),
-                        added_at: download.added_at,
-                        fingerprint: crate::hash_state::queue_fingerprint(
-                            &download.id,
-                            download.added_at,
-                            &download.url,
-                        ),
-                    },
-                ));
+            if state.shutting_down {
+                return Err(BridgeError::Superseded);
             }
-        }
-        let written = self.hashes.record_intents_with(intents, &provenance)?;
+            let snapshot = state.managed_rate_snapshot()?;
+            let ticket = self.hash_write_ticket_locked(&state)?;
+            (snapshot, ticket)
+        };
+        let preexisting = self.hashes.reconcile_cohort();
+        let downloads = snapshot.client.refresh().await?;
+        let namespace = ticket.namespace.clone();
+        let written = mutate_hash_at_ticket(&self.state, &self.hashes, &ticket, |slot| {
+            if !slot.loaded {
+                return Err(BridgeError::State);
+            }
+            let mut provenance = Vec::new();
+            if let Some(namespace) = namespace.as_deref() {
+                for intent in intents.iter().filter(|intent| intent.enabled) {
+                    let mut matches = downloads.iter().filter(|download| download.id == intent.id);
+                    let Some(download) = matches.next() else {
+                        continue;
+                    };
+                    if matches.next().is_some() {
+                        continue;
+                    }
+                    provenance.push((
+                        intent.id.clone(),
+                        crate::hash_state::HashProvenance {
+                            namespace: namespace.to_owned(),
+                            added_at: download.added_at,
+                            fingerprint: crate::hash_state::queue_fingerprint(
+                                &download.id,
+                                download.added_at,
+                                &download.url,
+                            ),
+                        },
+                    ));
+                }
+            }
+            slot.store
+                .record_intents_with(intents, &provenance)
+                .map_err(|_| BridgeError::State)
+        })?;
         #[cfg(test)]
         self.record_intents_pause.wait();
         // Unprovable enabled intents must not remain pending forever, while a
         // concurrent record must not be staled by this older snapshot. The
         // write returned its exact identities+generations, so a replacement
-        // recorded after the write is never included in this cohort.
+        // recorded after the write is never included in this cohort. The
+        // reconcile is fenced by the same lifecycle ticket: if a reconnect
+        // happened while the snapshot was in flight, it is discarded instead
+        // of mutating the replacement connection's records.
         if let Some(namespace) = namespace {
             let mut cohort = preexisting;
             cohort.extend(written);
@@ -2298,26 +3170,44 @@ impl ConnectionManager {
                 .iter()
                 .map(crate::hash_state::QueueItemIdentity::from_download)
                 .collect();
-            let _ = self
-                .hashes
-                .reconcile_cohort_and_candidates(&namespace, &items, &cohort);
+            let _ = mutate_hash_at_ticket(&self.state, &self.hashes, &ticket, |slot| {
+                if !slot.loaded {
+                    return Err(BridgeError::State);
+                }
+                slot.store
+                    .reconcile_cohort_and_candidates(&namespace, &items, &cohort)
+                    .map(|_| ())
+                    .map_err(|_| BridgeError::State)
+            });
         }
         self.trigger_hashing();
         // Never return persisted complete digests without the verified serve
         // path; this also covers existing rows the caller did not mention.
-        Ok(self.verified_download_hashes().await)
+        self.verified_download_hashes().await
     }
 
     pub fn download_hashes(&self) -> Vec<DownloadHashDto> {
         let namespace = self.current_hash_namespace();
+        if !self.hashes.persistence_confirmed() {
+            return self.hashes.visible_unconfirmed(namespace.as_deref());
+        }
         self.hashes.visible(namespace.as_deref())
     }
 
     /// Serve only digests whose authoritative queue record and exact file
     /// identity still match. Any missing, replaced, modified or ambiguous
-    /// record is invalidated before the rows are returned; if the daemon
-    /// cannot be queried, no completed digest is served.
-    pub async fn verified_download_hashes(&self) -> Vec<DownloadHashDto> {
+    /// record is invalidated before the rows are returned. If the daemon
+    /// cannot be queried, the previous digests are withheld and a sanitized
+    /// error is returned instead of a misleading empty success. A transition
+    /// that races the verification surfaces as `Superseded` for both success
+    /// and failure paths. Manual/offline connections keep their positive
+    /// empty-row behavior because they never own automatic hashes.
+    pub async fn verified_download_hashes(&self) -> Result<Vec<DownloadHashDto>, BridgeError> {
+        let early_namespace = self.current_hash_namespace();
+        if !self.hashes.persistence_confirmed() {
+            return Ok(self.hashes.visible_unconfirmed(early_namespace.as_deref()));
+        }
+        let (mode, epoch) = self.connection_mode_epoch()?;
         let snapshot = {
             let state = match self.state.lock() {
                 Ok(state) => state,
@@ -2325,21 +3215,41 @@ impl ConnectionManager {
             };
             state.managed_rate_snapshot()
         };
-        let Ok(snapshot) = snapshot else {
-            return Vec::new();
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if !self.connection_mode_epoch_is_current(mode, epoch) {
+                    return Err(BridgeError::Superseded);
+                }
+                // Manual and disconnected readers retain the existing
+                // best-effort empty rows; only an owned managed reader must
+                // surface the failed verification.
+                if mode == ActiveConnection::Managed {
+                    return Err(error);
+                }
+                return Ok(Vec::new());
+            }
         };
         // Capture the exact completed cohort and fence before the network
         // request. A completion persisted while the older `/list` is still in
         // flight must not be reconciled against (or invalidated by) it.
         let Some(namespace) = self.hashes.namespace() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let fence = self.hashes.fence();
         let completed = self.hashes.completed_for(&namespace);
 
-        let Ok(downloads) = snapshot.client.refresh().await else {
-            return Vec::new();
+        let downloads = match snapshot.client.refresh().await {
+            Ok(downloads) => downloads,
+            Err(error) => {
+                if !self.connection_mode_epoch_is_current(mode, epoch) {
+                    return Err(BridgeError::Superseded);
+                }
+                return Err(BridgeError::from(error));
+            }
         };
+        #[cfg(test)]
+        self.verified_list_pause.wait();
         let current = {
             let state = match self.state.lock() {
                 Ok(state) => state,
@@ -2348,7 +3258,14 @@ impl ConnectionManager {
             state.rate_write_is_current(&snapshot)
         };
         if !current {
-            return Vec::new();
+            if !self.connection_mode_epoch_is_current(mode, epoch) {
+                return Err(BridgeError::Superseded);
+            }
+            // The mode/epoch is still the one this read observed, so the
+            // owned managed process exited (or its snapshot is no longer
+            // valid) after the successful `/list`. An empty success here
+            // would falsely assert that no hash intent exists.
+            return Err(BridgeError::NotConnected);
         }
         let mut invalid = Vec::new();
         let mut verified = Vec::new();
@@ -2376,7 +3293,12 @@ impl ConnectionManager {
             let decision = match automatic_hash::completion_state(&snapshot.client, download).await
             {
                 Ok(decision) => decision,
-                Err(_) => return Vec::new(),
+                Err(_) => {
+                    if !self.connection_mode_epoch_is_current(mode, epoch) {
+                        return Err(BridgeError::Superseded);
+                    }
+                    return Err(BridgeError::InvalidResponse);
+                }
             };
             match decision {
                 automatic_hash::CompletionDecision::Ready => {}
@@ -2413,7 +3335,27 @@ impl ConnectionManager {
         for record in invalid {
             match self.hashes.invalidate_completed(&record, fence) {
                 Ok(true) => {}
-                Ok(false) | Err(_) => return Vec::new(),
+                Ok(false) => {
+                    // `false` is not proof that there was no hash intent.
+                    // Either the lifecycle fence moved while this response
+                    // was in flight, or the exact record changed/was already
+                    // invalidated. A moved lifecycle is superseded; anything
+                    // else is revalidated by the final exact-set projection,
+                    // so a stale digest still cannot be served.
+                    if self.hashes.fence() != fence
+                        || !self.connection_mode_epoch_is_current(mode, epoch)
+                    {
+                        return Err(BridgeError::Superseded);
+                    }
+                }
+                Err(error) => {
+                    if self.hashes.fence() != fence
+                        || !self.connection_mode_epoch_is_current(mode, epoch)
+                    {
+                        return Err(BridgeError::Superseded);
+                    }
+                    return Err(error);
+                }
             }
         }
         #[cfg(test)]
@@ -2424,12 +3366,21 @@ impl ConnectionManager {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if state.shutting_down || !state.rate_write_is_current(&snapshot) {
-            return Vec::new();
+        if state.shutting_down {
+            return Err(BridgeError::Superseded);
+        }
+        if !state.rate_write_is_current(&snapshot) {
+            if state.epoch != epoch || state.active != mode {
+                return Err(BridgeError::Superseded);
+            }
+            // The connection is still this read's lifecycle, but its owned
+            // process exited before publication. Never publish an empty
+            // success for an unverifiable managed snapshot.
+            return Err(BridgeError::NotConnected);
         }
         let rows = self.hashes.visible_verified(&namespace, &verified, fence);
         drop(state);
-        rows.unwrap_or_default()
+        rows.ok_or(BridgeError::Superseded)
     }
 
     pub fn refresh_download_hashes(&self) -> Vec<DownloadHashDto> {
@@ -2732,14 +3683,32 @@ impl ConnectionManager {
 
     #[cfg(test)]
     fn install_test_managed(&self, client: Arc<SurgeClient>, pid: u32) -> u64 {
-        self.hashes.cancel_current();
+        let _lifecycle = self.hashes.lock_lifecycle();
+        self.hashes.cancel_worker();
         let mut state = self.state.lock().expect("test state lock");
+        let mut slot = self.hashes.lock_slot();
+        slot.store.fence_in_flight();
         state.epoch = state.epoch.wrapping_add(1);
         state.manual = None;
-        state.test_managed = Some(TestManagedConnection { client, pid });
+        state.test_managed = Some(TestManagedConnection {
+            client,
+            pid,
+            exited: false,
+        });
         state.hash_connection_id = Some(new_hash_connection_id());
         state.active = ActiveConnection::Managed;
         state.epoch
+    }
+
+    /// Simulate the owned managed child exiting without a connection
+    /// transition. The epoch and hash fence deliberately stay unchanged, so
+    /// readers must not mistake the loss for a lifecycle supersession.
+    #[cfg(test)]
+    fn mark_test_managed_exited(&self) {
+        let mut state = self.state.lock().expect("test state lock");
+        if let Some(test) = state.test_managed.as_mut() {
+            test.exited = true;
+        }
     }
 
     /// Drop the active connection and fence off any in-flight `connect`.
@@ -2750,10 +3719,10 @@ impl ConnectionManager {
     /// only hold an `Arc<SurgeClient>` clone, so they observe the new epoch (or
     /// a network error) without stranding state.
     pub fn disconnect(&self) {
-        // Abort the stream and hash worker before any state change so no read
-        // survives the disconnect.
+        // Abort the stream before any state change so no read survives the
+        // disconnect. Hash worker cancellation happens atomically with the
+        // fence below.
         self.progress.stop();
-        self.hashes.cancel_current();
         // The shutdown path owns lifecycle fencing once it starts; it also
         // takes any remaining managed server itself. Registering here keeps a
         // concurrent new start from binding the fixed port mid-retirement.
@@ -2763,20 +3732,28 @@ impl ConnectionManager {
         };
         // Recover from a poisoned lock: the only mutation is a full reset, so a
         // half-written prior state is safely overwritten.
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
+        let (server, registered) = {
+            let _lifecycle = self.hashes.lock_lifecycle();
+            self.hashes.cancel_worker();
+            #[cfg(test)]
+            self.lifecycle_fence_pause.wait();
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut slot = self.hashes.lock_slot();
+            slot.store.fence_in_flight();
+            state.epoch = state.epoch.wrapping_add(1);
+            state.clear_active();
+            let server = state.managed.take();
+            let registered = if server.is_some() {
+                state.mark_retirement();
+                true
+            } else {
+                false
+            };
+            (server, registered)
         };
-        state.epoch = state.epoch.wrapping_add(1);
-        state.clear_active();
-        let server = state.managed.take();
-        let registered = if server.is_some() {
-            state.mark_retirement();
-            true
-        } else {
-            false
-        };
-        drop(state);
         let retirement = if registered {
             let owner = server
                 .as_ref()
@@ -3357,28 +4334,32 @@ pub async fn set_download_hash_intents(
 /// Current sanitized automatic-hash rows for the owned managed connection.
 /// Results associated with another daemon process are never returned, and a
 /// completed digest is only served after its authoritative queue record and
-/// exact file identity are re-verified.
+/// exact file identity are re-verified. An owned managed connection with
+/// unresolved/quarantined hash persistence reports `HashUnconfirmed` instead
+/// of an empty success. Manual connections never initialize or own this state.
 #[tauri::command]
 pub async fn get_download_hashes(
+    app: tauri::AppHandle,
     state: tauri::State<'_, ConnectionManager>,
 ) -> Result<Vec<DownloadHashDto>, BridgeError> {
-    Ok(state.verified_download_hashes().await)
+    state
+        .get_download_hashes_fenced(|| state.ensure_hash_state(&app))
+        .await
 }
 
 /// Ask the single bounded worker to make another pass, then return the
 /// re-verified sanitized rows. Hashing itself continues in the background and
-/// never blocks this command.
+/// never blocks this command. An owned managed connection with unresolved or
+/// quarantined persistence reports `HashUnconfirmed`; a manual connection keeps
+/// the existing best-effort empty-row behavior.
 #[tauri::command]
 pub async fn refresh_download_hashes(
     app: tauri::AppHandle,
     state: tauri::State<'_, ConnectionManager>,
 ) -> Result<Vec<DownloadHashDto>, BridgeError> {
-    if state.ensure_hash_state(&app).is_ok() {
-        state.trigger_hashing();
-        Ok(state.verified_download_hashes().await)
-    } else {
-        Ok(Vec::new())
-    }
+    state
+        .refresh_download_hashes_fenced(|| state.ensure_hash_state(&app))
+        .await
 }
 
 /// Enqueue a download with the batch checkbox value.
@@ -5025,6 +6006,11 @@ mod tests {
             for (status_line, body) in responses {
                 let mut stream = rate_test_accept(&listener);
                 captured.push(rate_test_capture(&mut stream));
+                if status_line == "DROP" {
+                    // Close without a response to model a network failure after
+                    // the authenticated request was accepted.
+                    continue;
+                }
                 rate_test_write_response(&mut stream, status_line, &body);
             }
             captured
@@ -5743,10 +6729,1721 @@ mod tests {
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].state, "disabled");
 
+        drop(coordinator);
         let reloaded = HashCoordinator::default();
         reloaded.ensure_loaded(&root).expect("reload state");
         assert!(reloaded.default_enabled().expect("persisted default"));
         assert_eq!(reloaded.visible(Some("conn-a"))[0].state, "disabled");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persistence_fault(
+        dir: &Path,
+        pause: Option<&str>,
+        fail: Option<&str>,
+    ) -> crate::hash_persistence::FaultConfig {
+        crate::hash_persistence::FaultConfig {
+            pause: pause.map(str::to_owned),
+            fail: fail.map(str::to_owned),
+            cleanup: None,
+            dir: Some(dir.to_path_buf()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        path.exists()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn before_rename_failures_are_definitive_and_leave_the_domain_usable() {
+        let root = fresh_dir("hash-before-rename");
+        let state_path = root.join(AUTOMATIC_HASH_FILE);
+        let coordinator = HashCoordinator::default();
+        coordinator.set_persistence_fault(Some(persistence_fault(&root, None, Some("write"))));
+        coordinator.ensure_loaded(&root).expect("load state");
+
+        for point in ["write", "file_sync", "rename"] {
+            coordinator
+                .domain()
+                .expect("owner")
+                .set_fault(Some(persistence_fault(&root, None, Some(point))))
+                .expect("arm fault");
+            assert_eq!(
+                coordinator.set_default_enabled(true),
+                Err(BridgeError::State),
+                "failure before rename is definitive ({point})"
+            );
+            assert!(!state_path.exists(), "nothing may be published ({point})");
+            assert!(
+                coordinator.persistence_confirmed(),
+                "a before-rename failure must not quarantine ({point})"
+            );
+            assert!(!coordinator.default_enabled().expect("default still known"));
+        }
+        coordinator
+            .domain()
+            .expect("owner")
+            .set_fault(None)
+            .expect("clear fault");
+        assert!(coordinator
+            .set_default_enabled(true)
+            .expect("retry succeeds"));
+        drop(coordinator);
+        let reloaded = HashCoordinator::default();
+        reloaded.ensure_loaded(&root).expect("reload");
+        assert!(reloaded.default_enabled().expect("persisted"));
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_sync_failure_is_published_but_reported_unconfirmed() {
+        let root = fresh_dir("hash-dir-sync");
+        let state_path = root.join(AUTOMATIC_HASH_FILE);
+        let coordinator = HashCoordinator::default();
+        coordinator.set_persistence_fault(Some(persistence_fault(&root, None, Some("dir_sync"))));
+        coordinator.ensure_loaded(&root).expect("load state");
+
+        assert_eq!(
+            coordinator.set_default_enabled(true),
+            Err(BridgeError::HashUnconfirmed)
+        );
+        assert!(!coordinator.persistence_confirmed());
+        assert_eq!(
+            coordinator.set_default_enabled(false),
+            Err(BridgeError::HashUnconfirmed),
+            "a quarantined owner is never replaced by a new writer"
+        );
+        let bytes = std::fs::read(&state_path).expect("published file");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(json["defaultEnabled"], true, "the rename really published");
+        drop(coordinator);
+
+        let reloaded = HashCoordinator::default();
+        assert_eq!(
+            reloaded.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "a new owner must not confirm a publication whose directory sync failed"
+        );
+        assert!(root.join("automatic-hash.pending").exists());
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_after_rename_leaves_publication_unconfirmed_for_the_next_owner() {
+        let root = fresh_dir("hash-crash-rename");
+        let coordinator = HashCoordinator::default();
+        coordinator.set_persistence_fault(Some(persistence_fault(
+            &root,
+            None,
+            Some("crash_after_rename"),
+        )));
+        coordinator.ensure_loaded(&root).expect("load state");
+        assert_eq!(
+            coordinator.set_default_enabled(true),
+            Err(BridgeError::HashUnconfirmed)
+        );
+        assert!(!coordinator.persistence_confirmed());
+        drop(coordinator);
+
+        let reloaded = HashCoordinator::default();
+        assert_eq!(
+            reloaded.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "a crash after rename must not be silently confirmed by a successor"
+        );
+        assert!(root.join("automatic-hash.pending").exists());
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_hash_reads_fail_unconfirmed_on_a_pending_marker_while_the_queue_continues() {
+        let root = fresh_dir("hash-command-pending");
+        let marker = root.join(crate::hash_persistence::HASH_PENDING_FILE);
+        std::fs::write(
+            &marker,
+            b"SURGUI-HASH-MARKER-2 pending 1 0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .expect("write real pending marker");
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", RATE_TEST_LIST.to_string()),
+        ]);
+
+        let manager = ConnectionManager::default();
+        assert_eq!(
+            manager.hashes.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "a real pending marker must not be silently confirmed"
+        );
+        assert_eq!(
+            manager.hashes.initialization_failure(),
+            Some(BridgeError::HashUnconfirmed),
+            "the initialization failure must be recorded for later readers"
+        );
+        install_rate_test_managed(&manager, &base, 4242).await;
+
+        // The download queue is independent of automatic-hash persistence.
+        let queue = manager
+            .refresh()
+            .await
+            .expect("managed queue must continue with unresolved hash state");
+        assert_eq!(queue.len(), 1);
+
+        assert_eq!(
+            manager
+                .get_download_hashes_checked()
+                .await
+                .expect_err("get must not return an empty success"),
+            BridgeError::HashUnconfirmed,
+            "get must not turn unresolved persistence into an empty success"
+        );
+        assert_eq!(
+            manager
+                .refresh_download_hashes_checked()
+                .await
+                .expect_err("refresh must not return an empty success"),
+            BridgeError::HashUnconfirmed,
+            "refresh must not turn unresolved persistence into an empty success"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "only connect and the queue refresh may reach the daemon"
+        );
+
+        // A recorded terminal failure is observable without reopening the same
+        // unresolved directory on every read.
+        std::fs::remove_file(&marker).expect("remove marker");
+        assert_eq!(
+            manager.hashes.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "the recorded failure must remain observable without a new attempt"
+        );
+
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_hash_reads_return_normal_empty_success_when_confirmed() {
+        let root = fresh_dir("hash-command-empty");
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", "[]".to_string()),
+            ("200 OK", "[]".to_string()),
+            ("200 OK", "[]".to_string()),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load confirmed hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+
+        assert!(
+            manager
+                .get_download_hashes_fenced(|| Ok(()))
+                .await
+                .expect("confirmed empty get")
+                .is_empty(),
+            "confirmed persistence with no records is a real empty success"
+        );
+        assert!(
+            manager
+                .refresh_download_hashes_fenced(|| Ok(()))
+                .await
+                .expect("confirmed empty refresh")
+                .is_empty(),
+            "confirmed persistence with no records is a real empty success"
+        );
+
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            3,
+            "connect, get, and refresh must each contact the daemon exactly once"
+        );
+        for request in &captured {
+            assert_eq!(
+                rate_test_path(request),
+                "/list",
+                "every hash read must use the authenticated queue probe"
+            );
+        }
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_hash_reads_fail_closed_when_the_daemon_list_fails() {
+        for (status, expected) in [
+            ("500 Internal Server Error", BridgeError::InvalidResponse),
+            ("DROP", BridgeError::Network),
+        ] {
+            let root = fresh_dir("hash-command-daemon-failure");
+            let file = root.join("failed.bin");
+            std::fs::write(&file, b"abc").expect("write fixture");
+            let (base, server) = rate_test_spawn_scripted(vec![
+                ("200 OK", RATE_TEST_LIST.to_string()),
+                (status, "{}".to_string()),
+                (status, "{}".to_string()),
+            ]);
+            let manager = ConnectionManager::default();
+            manager
+                .hashes
+                .ensure_loaded(&root)
+                .expect("load confirmed hash state");
+            install_rate_test_managed(&manager, &base, 4242).await;
+            seed_completed_hash(&manager, &root, "h-failed-read", 42, &file);
+            // The refresh fixture triggers the worker, but this test is about
+            // the synchronous command body. Stop the worker before it can race
+            // the scripted responses.
+            manager.lifecycle.begin_shutdown();
+
+            assert_eq!(
+                manager.get_download_hashes_fenced(|| Ok(())).await.err(),
+                Some(expected),
+                "get must surface the daemon verification failure"
+            );
+            assert_eq!(
+                manager.refresh_download_hashes_checked().await.err(),
+                Some(expected),
+                "refresh must surface the daemon verification failure"
+            );
+            let stored = manager.download_hashes();
+            let row = hash_row(&stored, "h-failed-read");
+            assert_eq!(
+                row.state, "complete",
+                "a failed verification must not mutate the persisted digest"
+            );
+            assert!(
+                row.md5.is_some(),
+                "the withheld digest must remain persisted for a later retry"
+            );
+
+            let captured = server.join().expect("server thread panicked");
+            assert_eq!(
+                captured.len(),
+                3,
+                "connect, get, and refresh must each contact the daemon exactly once"
+            );
+            for request in &captured {
+                assert_eq!(
+                    rate_test_path(request),
+                    "/list",
+                    "a failed read must still be an authenticated queue probe"
+                );
+            }
+            manager.hashes.cancel_current();
+            remove_all_best_effort(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_hash_reads_recover_after_a_daemon_list_failure() {
+        let root = fresh_dir("hash-command-daemon-recovery");
+        let file = root.join("recovered.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let recovery_list = serde_json::json!([hash_test_item(
+            "h-recovery",
+            &destination,
+            "completed",
+            None,
+            false,
+            true,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("500 Internal Server Error", "{}".to_string()),
+        ]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load confirmed hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-recovery", 42, &file);
+        manager.lifecycle.begin_shutdown();
+        assert_eq!(
+            manager.get_download_hashes_fenced(|| Ok(())).await.err(),
+            Some(BridgeError::InvalidResponse)
+        );
+        server.join().expect("server thread panicked");
+
+        // A later, successful authoritative read on the same owned persistence
+        // serves the same digest without requiring a new hash computation.
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", recovery_list),
+        ]);
+        install_rate_test_managed(&manager, &base, 4343).await;
+        let rows = manager
+            .get_download_hashes_fenced(|| Ok(()))
+            .await
+            .expect("normal recovery succeeds");
+        let row = hash_row(&rows, "h-recovery");
+        assert_eq!(row.state, "complete");
+        assert_eq!(row.md5.as_deref(), Some("900150983cd24fb0d6963f7d28e17f72"));
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            2,
+            "recovery is one connect probe and one authoritative /list"
+        );
+        for request in &captured {
+            assert_eq!(rate_test_path(request), "/list");
+        }
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn manual_and_offline_hash_reads_keep_a_positive_empty_result() {
+        let root = fresh_dir("hash-command-manual-offline");
+        let file = root.join("manual.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let manager = ConnectionManager::default();
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load confirmed hash state");
+        seed_completed_hash(&manager, &root, "h-manual", 42, &file);
+        manager
+            .connect(&base, "manual-token")
+            .await
+            .expect("manual connection");
+        assert!(
+            manager
+                .get_download_hashes_checked()
+                .await
+                .expect("manual reads stay positive")
+                .is_empty(),
+            "manual connections never surface managed digests"
+        );
+        assert!(
+            manager
+                .refresh_download_hashes_checked()
+                .await
+                .expect("manual refresh stays positive")
+                .is_empty(),
+            "manual refresh never surfaces managed digests"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            captured.len(),
+            1,
+            "only the manual connect may use the daemon"
+        );
+        manager.disconnect();
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+
+        // Offline/disconnected readers keep the same positive empty result and
+        // never probe a daemon they do not own.
+        let root = fresh_dir("hash-command-offline");
+        let offline = ConnectionManager::default();
+        offline
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load confirmed hash state");
+        assert!(offline
+            .get_download_hashes_checked()
+            .await
+            .expect("offline reads stay positive")
+            .is_empty());
+        assert!(offline
+            .refresh_download_hashes_checked()
+            .await
+            .expect("offline refresh stays positive")
+            .is_empty());
+        offline.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_list_failure_after_a_lifecycle_transition_is_superseded() {
+        let root = fresh_dir("hash-command-daemon-superseded");
+        let file = root.join("superseded.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut connect = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut connect));
+            rate_test_write_response(&mut connect, "200 OK", RATE_TEST_LIST);
+
+            let mut list = rate_test_accept(&listener);
+            captured.push(rate_test_capture(&mut list));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            rate_test_write_response(&mut list, "500 Internal Server Error", "{}");
+            captured
+        });
+        let base = format!("http://{addr}");
+
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load confirmed hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-1", 42, &file);
+        manager.lifecycle.begin_shutdown();
+
+        let read = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get_download_hashes_fenced(|| Ok(())).await }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("verification started its /list request");
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        release_tx
+            .send(())
+            .expect("release the stale failure response");
+
+        assert_eq!(
+            read.await.expect("read task").err(),
+            Some(BridgeError::Superseded),
+            "a failure from a replaced lifecycle must not surface as its error"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 2, "connect and the superseded /list only");
+        for request in &captured {
+            assert_eq!(rate_test_path(request), "/list");
+        }
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn manual_connections_keep_empty_hash_rows_with_unresolved_persistence() {
+        let root = fresh_dir("hash-command-manual");
+        std::fs::write(
+            root.join(crate::hash_persistence::HASH_PENDING_FILE),
+            b"SURGUI-HASH-MARKER-2 pending 1 0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .expect("write real pending marker");
+        let (endpoint, captured, server) = manual_plain_listener(b"[]", b"200 OK");
+
+        let manager = ConnectionManager::default();
+        assert_eq!(
+            manager.hashes.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed)
+        );
+        manager
+            .connect(&endpoint, "manual-token")
+            .await
+            .expect("manual connect must succeed independently");
+
+        assert!(manager
+            .get_download_hashes_checked()
+            .await
+            .expect("manual get keeps existing behavior")
+            .is_empty());
+        assert!(manager
+            .refresh_download_hashes_checked()
+            .await
+            .expect("manual refresh keeps existing behavior")
+            .is_empty());
+        assert_eq!(
+            manager.hashes.initialization_failure(),
+            Some(BridgeError::HashUnconfirmed),
+            "manual behavior must not erase the recorded managed failure"
+        );
+
+        let request = captured
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured manual request");
+        server.join().expect("manual server thread");
+        let text = String::from_utf8_lossy(&request);
+        assert!(text.starts_with("GET /list HTTP/1.1"));
+
+        manager.disconnect();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_state_change_is_detected_without_overwriting_it() {
+        let root = fresh_dir("hash-external-change");
+        let state_path = root.join(AUTOMATIC_HASH_FILE);
+        let coordinator = HashCoordinator::default();
+        coordinator.ensure_loaded(&root).expect("load state");
+        let foreign = br#"{"version":2,"defaultEnabled":true,"records":[]}"#;
+        std::fs::write(&state_path, foreign).expect("foreign write");
+
+        assert_eq!(
+            coordinator.set_default_enabled(false),
+            Err(BridgeError::HashUnconfirmed)
+        );
+        assert_eq!(
+            std::fs::read(&state_path).expect("foreign state preserved"),
+            foreign
+        );
+        assert!(!coordinator.persistence_confirmed());
+        drop(coordinator);
+        let reloaded = HashCoordinator::default();
+        reloaded.ensure_loaded(&root).expect("load foreign state");
+        assert!(reloaded.default_enabled().expect("foreign value retained"));
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_state_and_namespace_are_never_regenerated() {
+        let root = fresh_dir("hash-malformed-state");
+        let state_path = root.join(AUTOMATIC_HASH_FILE);
+        std::fs::write(&state_path, b"{not json").expect("malformed state");
+        let coordinator = HashCoordinator::default();
+        assert_eq!(coordinator.ensure_loaded(&root), Err(BridgeError::State));
+        assert_eq!(
+            std::fs::read(&state_path).expect("state preserved"),
+            b"{not json"
+        );
+        drop(coordinator);
+        remove_all_best_effort(&root);
+
+        let root = fresh_dir("hash-malformed-namespace");
+        let namespace_path = root.join(crate::hash_state::HASH_NAMESPACE_FILE);
+        std::fs::write(&namespace_path, b"bad-namespace").expect("malformed namespace");
+        let coordinator = HashCoordinator::default();
+        assert_eq!(coordinator.ensure_loaded(&root), Err(BridgeError::State));
+        assert_eq!(
+            std::fs::read(&namespace_path).expect("namespace preserved"),
+            b"bad-namespace"
+        );
+        assert!(!root.join(AUTOMATIC_HASH_FILE).exists());
+        drop(coordinator);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn second_owner_instance_fails_closed_until_the_first_really_dies() {
+        let root = fresh_dir("hash-second-instance");
+        let first = ConnectionManager::default();
+        first.hashes.ensure_loaded(&root).expect("first owner");
+        assert!(first.hashes.set_default_enabled(true).expect("write"));
+
+        let second = ConnectionManager::default();
+        assert_eq!(
+            second.hashes.ensure_loaded(&root),
+            Err(BridgeError::State),
+            "a live owner makes the directory busy"
+        );
+        assert_eq!(
+            second.hashes.set_default_enabled(false),
+            Err(BridgeError::State),
+            "the busy instance must not write or reset state"
+        );
+
+        first.shutdown_managed();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match second.hashes.ensure_loaded(&root) {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(error) => panic!("successor never acquired the released lock: {error:?}"),
+            }
+        }
+        assert!(
+            second.hashes.default_enabled().expect("successor default"),
+            "the successor validates the winner's published state"
+        );
+        drop(second);
+        drop(first);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_first_run_has_a_single_exclusive_namespace_winner() {
+        let root = fresh_dir("hash-namespace-race");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let manager = ConnectionManager::default();
+                barrier.wait();
+                let result = manager.hashes.ensure_loaded(&root);
+                let namespace = manager.hashes.namespace();
+                (manager, result, namespace)
+            }));
+        }
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("instance"))
+            .collect();
+        let ready: Vec<_> = outcomes
+            .iter()
+            .filter(|(_, result, _)| result.is_ok())
+            .collect();
+        assert_eq!(ready.len(), 1, "exactly one first-run owner wins");
+        let winner_namespace = ready[0].2.clone().expect("winner namespace");
+        assert!(outcomes
+            .iter()
+            .filter(|(_, result, _)| result.is_err())
+            .all(|(_, _, namespace)| namespace.is_none()));
+        // Drop both managers; the loser never created or replaced metadata.
+        drop(outcomes);
+        let reader = ConnectionManager::default();
+        reader.hashes.ensure_loaded(&root).expect("successor loads");
+        assert_eq!(
+            reader.hashes.namespace().as_deref(),
+            Some(winner_namespace.as_str())
+        );
+        drop(reader);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_and_namespace_barriers_are_deterministic() {
+        for point in ["load", "namespace"] {
+            let root = fresh_dir("hash-barrier");
+            let manager = Arc::new(ConnectionManager::default());
+            manager
+                .hashes
+                .set_persistence_fault(Some(persistence_fault(&root, Some(point), None)));
+            let load = {
+                let manager = Arc::clone(&manager);
+                let root = root.clone();
+                std::thread::spawn(move || manager.hashes.ensure_loaded(&root))
+            };
+            assert!(
+                wait_for_path(
+                    &root.join(format!("entered-{point}")),
+                    Duration::from_secs(5)
+                ),
+                "helper must reach the {point} barrier"
+            );
+            std::fs::write(root.join(format!("release-{point}")), b"go").expect("release");
+            assert_eq!(load.join().expect("load thread"), Ok(()));
+            manager.hashes.begin_shutdown();
+            drop(manager);
+            remove_all_best_effort(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_flight_publish_cannot_block_shutdown_or_surface_as_current() {
+        let root = fresh_dir("hash-in-flight-publish");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(
+                &root,
+                Some("rename_in_progress"),
+                None,
+            )))
+            .expect("arm rename barrier");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let result = manager.hashes.set_default_enabled(true);
+                let _ = done_tx.send(result);
+            })
+        };
+        assert!(
+            wait_for_path(
+                &root.join("entered-rename_in_progress"),
+                Duration::from_secs(5)
+            ),
+            "the rename must be genuinely in progress"
+        );
+        let started = Instant::now();
+        let drained = manager.shutdown_managed();
+        let elapsed = started.elapsed();
+        assert!(drained, "shutdown must complete within its bound");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "shutdown waited on the in-flight filesystem operation: {elapsed:?}"
+        );
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the commit thread must observe cancellation");
+        assert!(
+            matches!(
+                result,
+                Err(BridgeError::Superseded) | Err(BridgeError::HashUnconfirmed)
+            ),
+            "the old lifecycle must not report success: {result:?}"
+        );
+        assert!(!manager.hashes.persistence_confirmed());
+        assert_eq!(
+            manager.hashes.default_enabled(),
+            Err(BridgeError::HashUnconfirmed),
+            "the published-but-unconfirmed value must not surface from stale memory"
+        );
+        write.join().expect("write thread");
+        let _ = std::fs::write(root.join("release-rename_in_progress"), b"go");
+        drop(manager);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambiguous_rename_timeout_quarantines_and_discards_late_completion() {
+        let root = fresh_dir("hash-rename-timeout");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(
+                &root,
+                Some("rename_in_progress"),
+                None,
+            )))
+            .expect("arm rename barrier");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let result = manager.hashes.set_default_enabled(true);
+                let _ = done_tx.send(result);
+            })
+        };
+        assert!(wait_for_path(
+            &root.join("entered-rename_in_progress"),
+            Duration::from_secs(5)
+        ));
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("commit must time out and quarantine");
+        assert!(
+            matches!(
+                result,
+                Err(BridgeError::HashUnconfirmed) | Err(BridgeError::Superseded)
+            ),
+            "an unresolved rename is not a success: {result:?}"
+        );
+        assert!(!manager.hashes.persistence_confirmed());
+        assert_eq!(
+            manager.hashes.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "no replacement writer starts while the old operation is unresolved"
+        );
+        assert_eq!(
+            manager.hashes.default_enabled(),
+            Err(BridgeError::HashUnconfirmed)
+        );
+        // A late helper completion cannot be observed after the domain was
+        // quarantined; the release file only exists to stop test threads.
+        let _ = std::fs::write(root.join("release-rename_in_progress"), b"go");
+        write.join().expect("write thread");
+        drop(manager);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_errors_are_ambiguous_and_pending_marker_survives_restart() {
+        for fault in ["rename_error", "rename_after_effect"] {
+            let root = fresh_dir("hash-rename-ambiguous");
+            let state_path = root.join(AUTOMATIC_HASH_FILE);
+            let coordinator = HashCoordinator::default();
+            coordinator.set_persistence_fault(Some(persistence_fault(&root, None, Some(fault))));
+            coordinator.ensure_loaded(&root).expect("load state");
+            assert_eq!(
+                coordinator.set_default_enabled(true),
+                Err(BridgeError::HashUnconfirmed),
+                "a rename syscall error is ambiguous ({fault})"
+            );
+            assert!(
+                !coordinator.persistence_confirmed(),
+                "an ambiguous rename must quarantine, not report rollback ({fault})"
+            );
+            if fault == "rename_after_effect" {
+                let bytes = std::fs::read(&state_path).expect("published file");
+                let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!(json["defaultEnabled"], true, "the rename really published");
+            }
+            drop(coordinator);
+
+            // The pending marker is durable before the rename. A new owner must
+            // not silently confirm either outcome after the process exits.
+            let reloaded = HashCoordinator::default();
+            assert_eq!(
+                reloaded.ensure_loaded(&root),
+                Err(BridgeError::HashUnconfirmed),
+                "restart must not lose the unresolved publication ({fault})"
+            );
+            assert!(root.join("automatic-hash.pending").exists());
+            remove_all_best_effort(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_migration_or_invalid_marker_fails_closed_on_the_next_owner() {
+        let root = fresh_dir("hash-migration-pending");
+        let state_path = root.join(AUTOMATIC_HASH_FILE);
+        std::fs::write(
+            &state_path,
+            br#"{ "version": 2, "defaultEnabled": true, "records": [] }"#,
+        )
+        .expect("legacy spacing needs normalization");
+        let coordinator = HashCoordinator::default();
+        coordinator.set_persistence_fault(Some(persistence_fault(&root, None, Some("dir_sync"))));
+        assert_eq!(
+            coordinator.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "an ambiguous initialization publication must not become generic State"
+        );
+        drop(coordinator);
+        assert!(root.join("automatic-hash.pending").exists());
+
+        let reloaded = HashCoordinator::default();
+        assert_eq!(
+            reloaded.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "a failed migration publication is still unresolved"
+        );
+
+        let invalid = fresh_dir("hash-invalid-pending");
+        std::fs::write(
+            invalid.join("automatic-hash.pending"),
+            b"not a pending marker",
+        )
+        .expect("invalid marker");
+        let invalid_owner = HashCoordinator::default();
+        assert_eq!(
+            invalid_owner.ensure_loaded(&invalid),
+            Err(BridgeError::HashUnconfirmed),
+            "an invalid marker is never treated as confirmation"
+        );
+        assert_eq!(
+            std::fs::read(invalid.join("automatic-hash.pending")).expect("marker preserved"),
+            b"not a pending marker"
+        );
+        remove_all_best_effort(&root);
+        remove_all_best_effort(&invalid);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initialization_definite_pre_rename_failure_stays_distinct_from_ambiguity() {
+        let root = fresh_dir("hash-init-definite");
+        let state_path = root.join(AUTOMATIC_HASH_FILE);
+        std::fs::write(
+            &state_path,
+            br#"{ "version": 2, "defaultEnabled": true, "records": [] }"#,
+        )
+        .expect("legacy spacing needs normalization");
+        let coordinator = HashCoordinator::default();
+        coordinator.set_persistence_fault(Some(persistence_fault(&root, None, Some("write"))));
+        assert_eq!(
+            coordinator.ensure_loaded(&root),
+            Err(BridgeError::State),
+            "a definite failure before rename is not an ambiguous publication"
+        );
+        assert!(!root.join("automatic-hash.pending").exists());
+        assert!(
+            std::fs::read(&state_path)
+                .expect("previous state remains")
+                .windows(b"\"version\": 2".len())
+                .any(|window| window == b"\"version\": 2"),
+            "the pre-existing state must not be rewritten"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initialization_helper_exit_after_publication_maps_to_unconfirmed() {
+        let root = fresh_dir("hash-init-crash");
+        std::fs::write(
+            root.join(AUTOMATIC_HASH_FILE),
+            br#"{ "version": 2, "defaultEnabled": true, "records": [] }"#,
+        )
+        .expect("legacy spacing needs normalization");
+        let coordinator = HashCoordinator::default();
+        coordinator.set_persistence_fault(Some(persistence_fault(
+            &root,
+            None,
+            Some("crash_after_rename"),
+        )));
+        assert_eq!(
+            coordinator.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "a helper that exits after the rename is ambiguous, not generic State"
+        );
+        assert!(root
+            .join(crate::hash_persistence::HASH_PENDING_FILE)
+            .exists());
+        drop(coordinator);
+
+        let reloaded = HashCoordinator::default();
+        assert_eq!(
+            reloaded.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "the successor must still fail closed on the pending marker"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_fences_a_stale_manual_snapshot_before_managed_failure() {
+        use std::sync::Barrier;
+
+        let manager = Arc::new(ConnectionManager::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.active = ActiveConnection::Manual;
+            state.epoch = 11;
+        }
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let switcher = {
+            let manager = Arc::clone(&manager);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                entered.wait();
+                {
+                    let mut state = manager.state.lock().unwrap();
+                    state.active = ActiveConnection::Managed;
+                    state.epoch = state.epoch.wrapping_add(1);
+                }
+                release.wait();
+            })
+        };
+        let ensure = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+                Err(BridgeError::HashUnconfirmed)
+            }
+        };
+
+        let result = manager.refresh_download_hashes_fenced(ensure).await;
+        switcher.join().expect("switcher thread");
+        assert!(
+            matches!(result, Err(BridgeError::HashUnconfirmed)),
+            "a stale manual snapshot must not turn a managed failure into empty success: {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_success_is_fenced_against_a_concurrent_mode_change() {
+        use std::sync::Barrier;
+
+        let manager = Arc::new(ConnectionManager::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.active = ActiveConnection::Manual;
+            state.epoch = 12;
+        }
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let switcher = {
+            let manager = Arc::clone(&manager);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                entered.wait();
+                {
+                    let mut state = manager.state.lock().unwrap();
+                    state.active = ActiveConnection::Managed;
+                    state.epoch = state.epoch.wrapping_add(1);
+                }
+                release.wait();
+            })
+        };
+        let ensure = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+                Ok(())
+            }
+        };
+
+        let result = manager.refresh_download_hashes_fenced(ensure).await;
+        switcher.join().expect("switcher thread");
+        assert!(
+            matches!(result, Err(BridgeError::Superseded)),
+            "rows initialized for the old mode must not be returned after a transition: {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_fences_a_managed_initialization_failure_across_a_transition() {
+        use std::sync::Barrier;
+
+        for (next_mode, label) in [
+            (ActiveConnection::Manual, "managed/manual"),
+            (ActiveConnection::Managed, "managed/reconnect"),
+        ] {
+            let manager = Arc::new(ConnectionManager::default());
+            {
+                let mut state = manager.state.lock().unwrap();
+                state.active = ActiveConnection::Managed;
+                state.epoch = 21;
+            }
+            let entered = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let switcher = {
+                let manager = Arc::clone(&manager);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    entered.wait();
+                    {
+                        let mut state = manager.state.lock().unwrap();
+                        state.active = next_mode;
+                        state.epoch = state.epoch.wrapping_add(1);
+                    }
+                    release.wait();
+                })
+            };
+            let ensure = {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move || {
+                    entered.wait();
+                    release.wait();
+                    Err(BridgeError::HashUnconfirmed)
+                }
+            };
+
+            let result = manager.get_download_hashes_fenced(ensure).await;
+            switcher.join().expect("switcher thread");
+            assert!(
+                matches!(result, Err(BridgeError::Superseded)),
+                "a {label} transition during managed initialization must supersede its stale error: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_success_is_fenced_when_the_mode_changes_during_ensure() {
+        use std::sync::Barrier;
+
+        let manager = Arc::new(ConnectionManager::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.active = ActiveConnection::Managed;
+            state.epoch = 22;
+        }
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let switcher = {
+            let manager = Arc::clone(&manager);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                entered.wait();
+                {
+                    let mut state = manager.state.lock().unwrap();
+                    state.active = ActiveConnection::Manual;
+                    state.epoch = state.epoch.wrapping_add(1);
+                }
+                release.wait();
+            })
+        };
+        let ensure = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+                Ok(())
+            }
+        };
+
+        let result = manager.get_download_hashes_fenced(ensure).await;
+        switcher.join().expect("switcher thread");
+        assert!(
+            matches!(result, Err(BridgeError::Superseded)),
+            "a transition during ensure must not return the old lifecycle's rows: {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn get_manual_connections_skip_managed_initialization() {
+        let manager = ConnectionManager::default();
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.active = ActiveConnection::Manual;
+            state.epoch = 23;
+        }
+
+        let rows = manager
+            .get_download_hashes_fenced(|| panic!("manual get must not initialize managed state"))
+            .await
+            .expect("manual get keeps its empty-row behavior");
+        assert!(rows.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_is_fenced_after_the_verified_snapshot_awaits() {
+        let root = fresh_dir("hash-refresh-post-await");
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", "[]".to_string()),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load confirmed hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+
+        let (entered_rx, release_tx) = manager.verified_pause.arm();
+        let refresh = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.refresh_download_hashes_fenced(|| Ok(())).await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("verification reached the publication barrier");
+
+        // Change the connection while the verified snapshot is paused after
+        // its filesystem/network awaits. The production refresh path must not
+        // return the old connection's now-stale empty snapshot.
+        {
+            let mut state = manager.state.lock().expect("state lock");
+            state.active = ActiveConnection::Manual;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        release_tx.send(()).expect("release publication");
+        let result = refresh.await.expect("refresh task");
+        manager.verified_pause.clear();
+        server.join().expect("server thread panicked");
+
+        assert!(
+            matches!(result, Err(BridgeError::Superseded)),
+            "a transition after the snapshot await must not surface a stale empty success: {result:?}"
+        );
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_is_fenced_after_the_verified_snapshot_awaits() {
+        let root = fresh_dir("hash-get-post-await");
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", "[]".to_string()),
+            ("200 OK", "[]".to_string()),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load confirmed hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+
+        // A get that is not overtaken by a transition still returns the
+        // verified snapshot as a normal success.
+        let (entered_rx, release_tx) = manager.verified_pause.arm();
+        let get = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get_download_hashes_fenced(|| Ok(())).await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("valid get reached the publication barrier");
+        release_tx.send(()).expect("release valid publication");
+        let result = get.await.expect("valid get task");
+        manager.verified_pause.clear();
+        assert!(
+            matches!(result, Ok(ref rows) if rows.is_empty()),
+            "a current verified snapshot must remain a normal empty success: {result:?}"
+        );
+
+        // Change the connection while a second get is paused after its
+        // filesystem/network awaits. The production get path must not return
+        // the old connection's now-stale empty snapshot.
+        let (entered_rx, release_tx) = manager.verified_pause.arm();
+        let get = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get_download_hashes_fenced(|| Ok(())).await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stale get reached the publication barrier");
+        {
+            let mut state = manager.state.lock().expect("state lock");
+            state.active = ActiveConnection::Manual;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        release_tx.send(()).expect("release stale publication");
+        let result = get.await.expect("stale get task");
+        manager.verified_pause.clear();
+        server.join().expect("server thread panicked");
+
+        assert!(
+            matches!(result, Err(BridgeError::Superseded)),
+            "a transition after the snapshot await must not surface a stale empty get: {result:?}"
+        );
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_during_load_or_namespace_never_installs_an_owner() {
+        for point in ["load", "namespace"] {
+            let root = fresh_dir("hash-shutdown-init");
+            let manager = Arc::new(ConnectionManager::default());
+            manager
+                .hashes
+                .set_persistence_fault(Some(persistence_fault(&root, Some(point), None)));
+            let load = {
+                let manager = Arc::clone(&manager);
+                let root = root.clone();
+                std::thread::spawn(move || manager.hashes.ensure_loaded(&root))
+            };
+            assert!(
+                wait_for_path(
+                    &root.join(format!("entered-{point}")),
+                    Duration::from_secs(5)
+                ),
+                "helper must reach the {point} barrier"
+            );
+            manager.hashes.begin_shutdown();
+            std::fs::write(root.join(format!("release-{point}")), b"go").expect("release");
+            let result = load.join().expect("load thread");
+            assert!(
+                result.is_err(),
+                "shutdown during {point} must reject initialization: {result:?}"
+            );
+            assert!(
+                manager.hashes.domain().is_none(),
+                "no owner may be installed after shutdown ({point})"
+            );
+            assert!(!manager.hashes.persistence_confirmed());
+            assert!(
+                manager.hashes.ensure_loaded(&root).is_err(),
+                "shutdown must prevent launching a replacement owner ({point})"
+            );
+            assert!(manager.hashes.domain().is_none());
+            drop(manager);
+            remove_all_best_effort(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timed_out_prelock_open_is_one_attempt_per_directory_and_process() {
+        use std::time::Instant;
+
+        let root = fresh_dir("hash-open-timeout");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .set_persistence_fault(Some(persistence_fault(&root, Some("load"), None)));
+        let first = {
+            let manager = Arc::clone(&manager);
+            let root = root.clone();
+            std::thread::spawn(move || manager.hashes.ensure_loaded(&root))
+        };
+        assert!(
+            wait_for_path(&root.join("entered-load"), Duration::from_secs(5)),
+            "helper must hang before acquiring the lock"
+        );
+        assert!(
+            first.join().expect("first open thread").is_err(),
+            "the timed-out open must fail closed"
+        );
+        let attempts = |root: &Path| {
+            std::fs::read_dir(root)
+                .expect("attempt dir")
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("entered-load-")
+                })
+                .count()
+        };
+        assert_eq!(attempts(&root), 1, "exactly one helper attempt was made");
+
+        let started = Instant::now();
+        let second = {
+            let manager = Arc::clone(&manager);
+            let root = root.clone();
+            std::thread::spawn(move || manager.hashes.ensure_loaded(&root))
+        };
+        std::thread::sleep(Duration::from_millis(750));
+        let finished = second.is_finished();
+        if !finished {
+            // Red path: release the unintended replacement helper so the test
+            // can report the failure without leaving a paused process behind.
+            let _ = std::fs::write(root.join("release-load"), b"go");
+        }
+        let result = second.join().expect("second open thread");
+        assert!(
+            finished,
+            "a retry after an unresolved pre-lock attempt must not spawn another helper: {:?}",
+            started.elapsed()
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            attempts(&root),
+            1,
+            "no replacement helper may be spawned for the unresolved directory"
+        );
+        drop(manager);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn marker_prepublication_failure_rolls_back_and_keeps_the_domain_usable() {
+        let root = fresh_dir("hash-marker-rollback");
+        let coordinator = HashCoordinator::default();
+        coordinator.ensure_loaded(&root).expect("load state");
+        assert!(coordinator
+            .set_default_enabled(true)
+            .expect("initial write"));
+        coordinator
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(
+                &root,
+                None,
+                Some("marker_pending_dir_sync"),
+            )))
+            .expect("arm marker fault");
+
+        assert_eq!(
+            coordinator.set_default_enabled(false),
+            Err(BridgeError::State),
+            "a marker failure before rename is a definitive pre-publication failure"
+        );
+        assert!(
+            !root.join("automatic-hash.pending").exists(),
+            "the failed pending marker must be rolled back when cleanup succeeds"
+        );
+        assert!(coordinator.persistence_confirmed());
+        assert!(
+            coordinator
+                .default_enabled()
+                .expect("old state remains known"),
+            "the healthy previous state is not stranded"
+        );
+
+        coordinator
+            .domain()
+            .expect("owner")
+            .set_fault(None)
+            .expect("clear fault");
+        assert!(!coordinator.set_default_enabled(false).expect("retry"));
+        drop(coordinator);
+        let reloaded = HashCoordinator::default();
+        reloaded.ensure_loaded(&root).expect("reload healthy state");
+        assert!(!reloaded.default_enabled().expect("persisted retry"));
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_marker_cleanup_reports_unresolved_instead_of_claiming_rollback() {
+        let root = fresh_dir("hash-marker-cleanup-failed");
+        let coordinator = HashCoordinator::default();
+        coordinator.ensure_loaded(&root).expect("load state");
+        assert!(coordinator
+            .set_default_enabled(true)
+            .expect("initial write"));
+        let mut fault = persistence_fault(&root, None, Some("marker_pending_dir_sync"));
+        fault.cleanup = Some("marker_cleanup".into());
+        coordinator
+            .domain()
+            .expect("owner")
+            .set_fault(Some(fault))
+            .expect("arm marker and cleanup fault");
+
+        assert_eq!(
+            coordinator.set_default_enabled(false),
+            Err(BridgeError::HashUnconfirmed),
+            "a marker whose cleanup also failed is unresolved, not rolled back"
+        );
+        assert!(root.join("automatic-hash.pending").exists());
+        assert!(!coordinator.persistence_confirmed());
+        drop(coordinator);
+
+        let reloaded = HashCoordinator::default();
+        assert_eq!(
+            reloaded.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "the next owner must fail closed on the unresolved marker"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn acked_marker_cleanup_failures_remain_durable_known_across_restart() {
+        for point in ["marker_unlink", "marker_unlink_sync"] {
+            let root = fresh_dir("hash-marker-cleanup");
+            let coordinator = HashCoordinator::default();
+            coordinator.ensure_loaded(&root).expect("load state");
+            coordinator
+                .domain()
+                .expect("owner")
+                .set_fault(Some(persistence_fault(&root, None, Some(point))))
+                .expect("arm cleanup fault");
+
+            assert!(
+                coordinator
+                    .set_default_enabled(true)
+                    .expect("authorized write"),
+                "an already-acked durable write is confirmed even if cleanup fails ({point})"
+            );
+            if point == "marker_unlink" {
+                let marker = std::fs::read_to_string(root.join("automatic-hash.pending"))
+                    .expect("acked marker retained");
+                assert!(
+                    marker.contains("acked"),
+                    "the retained marker records durable authorization ({point})"
+                );
+            }
+            coordinator
+                .domain()
+                .expect("owner")
+                .set_fault(None)
+                .expect("clear fault");
+            drop(coordinator);
+
+            let reloaded = HashCoordinator::default();
+            reloaded
+                .ensure_loaded(&root)
+                .expect("a durably acked state is accepted, not unconfirmed");
+            assert!(reloaded.default_enabled().expect("persisted default"));
+            assert!(
+                !root.join("automatic-hash.pending").exists(),
+                "recovery cleans up the acked marker ({point})"
+            );
+            remove_all_best_effort(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_ack_reply_is_reported_unconfirmed_but_the_authorized_state_is_durable() {
+        let root = fresh_dir("hash-lost-ack");
+        let coordinator = Arc::new(HashCoordinator::default());
+        coordinator.ensure_loaded(&root).expect("load state");
+        coordinator
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(
+                &root,
+                Some("marker_acked_ready"),
+                None,
+            )))
+            .expect("arm ack barrier");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write = {
+            let coordinator = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                let result = coordinator.set_default_enabled(true);
+                let _ = done_tx.send(result);
+            })
+        };
+        assert!(
+            wait_for_path(
+                &root.join("entered-marker_acked_ready"),
+                Duration::from_secs(5)
+            ),
+            "the helper must pause after the durable ack and before its reply"
+        );
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(6))
+            .expect("the lost reply must time out");
+        assert_eq!(
+            result,
+            Err(BridgeError::HashUnconfirmed),
+            "a lost reply is not reported as success"
+        );
+        assert!(!coordinator.persistence_confirmed());
+        let _ = std::fs::write(root.join("release-marker_acked_ready"), b"go");
+        write.join().expect("write thread");
+        drop(coordinator);
+
+        let reloaded = HashCoordinator::default();
+        reloaded
+            .ensure_loaded(&root)
+            .expect("the durably authorized state may be visible after a lost reply");
+        assert!(
+            reloaded.default_enabled().expect("authorized default"),
+            "this is not an exactly-once or reply-derived outcome promise"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_lifecycle_commit_never_becomes_acked_and_fails_closed_after_restart() {
+        let root = fresh_dir("hash-stale-epoch-restart");
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let ticket = {
+            let state = manager.state.lock().unwrap();
+            manager
+                .hash_write_ticket_locked(&state)
+                .expect("managed hash ticket")
+        };
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(
+                &root,
+                Some("marker_durable_ready"),
+                None,
+            )))
+            .expect("arm durable barrier");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let result =
+                    mutate_hash_at_ticket(&manager.state, &manager.hashes, &ticket, |slot| {
+                        if !slot.loaded {
+                            return Err(BridgeError::State);
+                        }
+                        slot.store
+                            .record_intents(&[HashIntent {
+                                id: "stale-epoch".to_owned(),
+                                enabled: true,
+                            }])
+                            .map_err(|_| BridgeError::State)
+                    });
+                let _ = done_tx.send(result);
+            })
+        };
+        assert!(
+            wait_for_path(
+                &root.join("entered-marker_durable_ready"),
+                Duration::from_secs(5)
+            ),
+            "the state must be durable but not yet acknowledged"
+        );
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        let _ = std::fs::write(root.join("release-marker_durable_ready"), b"go");
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(6))
+            .expect("stale write must finish");
+        assert!(
+            matches!(
+                result,
+                Err(BridgeError::Superseded) | Err(BridgeError::HashUnconfirmed)
+            ),
+            "the stale lifecycle must not publish authority: {result:?}"
+        );
+        write.join().expect("write thread");
+        let captured = server.join().expect("server thread");
+        assert_eq!(captured.len(), 1);
+        assert!(root.join("automatic-hash.pending").exists());
+        drop(manager);
+
+        let reloaded = HashCoordinator::default();
+        assert_eq!(
+            reloaded.ensure_loaded(&root),
+            Err(BridgeError::HashUnconfirmed),
+            "an unacknowledged stale publication must fail closed after restart"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migration_is_normalized_by_the_isolated_owner() {
+        let root = fresh_dir("hash-owner-migration");
+        let state_path = root.join(AUTOMATIC_HASH_FILE);
+        let md5 = "900150983cd24fb0d6963f7d28e17f72";
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let fingerprint = crate::hash_state::queue_fingerprint("old-1", 1, "https://example.test");
+        let legacy = format!(
+            r#"{{"version":2,"defaultEnabled":true,"records":[{{"id":"old-1","enabled":true,"status":"complete","generation":4,"namespace":"00112233445566778899aabbccddeeff","addedAt":1,"fingerprint":"{fingerprint}","fileSize":3,"mtimeSec":1,"mtimeNsec":2,"fileDev":10,"fileIno":20,"md5":"{md5}","sha256":"{sha256}","resultVersion":2}}]}}"#
+        );
+        std::fs::write(&state_path, legacy.as_bytes()).expect("legacy state");
+        let manager = ConnectionManager::default();
+        manager.hashes.ensure_loaded(&root).expect("migrate load");
+        assert!(
+            manager.hashes.default_enabled().expect("default preserved"),
+            "the v2 app default survives migration"
+        );
+        assert!(
+            manager
+                .hashes
+                .candidates("00112233445566778899aabbccddeeff")
+                .is_empty(),
+            "legacy completed results are not served as current"
+        );
+        drop(manager);
+        let bytes = std::fs::read(&state_path).expect("normalized state");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["records"][0]["status"], "stale");
+        assert_eq!(json["records"][0]["generation"], 5);
         remove_all_best_effort(&root);
     }
 
@@ -5876,10 +8573,13 @@ mod tests {
             ("200 OK", HASH_TEST_NO_HOOK.to_string()),
         ]);
         let manager = ConnectionManager::default();
-        manager
-            .hashes
-            .ensure_loaded(&root)
-            .expect("load hash state");
+        crate::hash_persistence::clear_persist_diagnostic();
+        manager.hashes.ensure_loaded(&root).unwrap_or_else(|error| {
+            panic!(
+                "load hash state failed: {error:?}; diagnostic={:?}",
+                crate::hash_persistence::last_persist_diagnostic()
+            )
+        });
         let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
         let _ = client;
         let namespace = manager.hashes.namespace().expect("queue namespace");
@@ -6091,7 +8791,10 @@ mod tests {
         let second = ConnectionManager::default();
         second.hashes.ensure_loaded(&root).expect("reload state");
         let (_client, _epoch) = install_rate_test_managed(&second, &base, 7171).await;
-        let rows = second.verified_download_hashes().await;
+        let rows = second
+            .verified_download_hashes()
+            .await
+            .expect("verified restart rows");
         let row = rows.iter().find(|row| row.id == "h-1").expect("row");
         assert_eq!(row.state, "complete", "matching queue retains the result");
         assert!(row.md5.is_some());
@@ -6107,7 +8810,10 @@ mod tests {
         let third = ConnectionManager::default();
         third.hashes.ensure_loaded(&root).expect("reload state");
         let (_client, _epoch) = install_rate_test_managed(&third, &base, 8181).await;
-        let rows = third.verified_download_hashes().await;
+        let rows = third
+            .verified_download_hashes()
+            .await
+            .expect("verified restart rows");
         let row = rows.iter().find(|row| row.id == "h-1").expect("row");
         assert_eq!(row.state, "stale");
         assert!(row.md5.is_none());
@@ -6802,6 +9508,612 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn lifecycle_marker(manager: &ConnectionManager) -> (u64, u64) {
+        let epoch = manager.state.lock().unwrap().epoch;
+        (epoch, manager.hashes.fence())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disconnect_advances_epoch_and_fence_atomically() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let root = fresh_dir("lifecycle-atomic-disconnect");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let before = lifecycle_marker(&manager);
+        let (entered_rx, release_tx) = manager.lifecycle_fence_pause.arm();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                manager.disconnect();
+                let _ = done_tx.send(());
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("disconnect reached the lifecycle fence");
+        assert_eq!(
+            lifecycle_marker(&manager),
+            before,
+            "fence and epoch must not be published separately"
+        );
+        release_tx.send(()).expect("release disconnect");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("disconnect completed");
+        worker.join().expect("disconnect thread");
+        let after = lifecycle_marker(&manager);
+        assert_eq!(after.0, before.0.wrapping_add(1));
+        assert_eq!(after.1, before.1.wrapping_add(1));
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_advances_epoch_and_fence_atomically() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let root = fresh_dir("lifecycle-atomic-shutdown");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let before = lifecycle_marker(&manager);
+        let (entered_rx, release_tx) = manager.lifecycle_fence_pause.arm();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let drained = manager.shutdown_managed();
+                let _ = done_tx.send(drained);
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown reached the lifecycle fence");
+        assert_eq!(
+            lifecycle_marker(&manager),
+            before,
+            "shutdown must not publish the fence before the epoch"
+        );
+        release_tx.send(()).expect("release shutdown");
+        let drained = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown completed");
+        assert!(drained);
+        worker.join().expect("shutdown thread");
+        let after = lifecycle_marker(&manager);
+        assert_eq!(after.0, before.0.wrapping_add(1));
+        assert_eq!(after.1, before.1.wrapping_add(1));
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_start_advances_epoch_and_fence_atomically() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let root = fresh_dir("lifecycle-atomic-managed");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let before = lifecycle_marker(&manager);
+        let (entered_rx, release_tx) = manager.lifecycle_fence_pause.arm();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let claim = manager.begin_managed_start();
+                let _ = done_tx.send(claim.is_ok());
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("managed start reached the lifecycle fence");
+        assert_eq!(
+            lifecycle_marker(&manager),
+            before,
+            "managed start must not publish the fence before the epoch"
+        );
+        release_tx.send(()).expect("release managed start");
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("managed start completed"));
+        worker.join().expect("managed start thread");
+        let after = lifecycle_marker(&manager);
+        assert_eq!(after.0, before.0.wrapping_add(1));
+        assert_eq!(after.1, before.1.wrapping_add(1));
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_start_and_respawn_wait_for_the_lifecycle_fence() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let root = fresh_dir("hash-worker-lifecycle-gap");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let first = manager.hashes.start_worker().expect("start worker");
+        assert!(
+            manager.hashes.start_worker().is_none(),
+            "second trigger marks pending work"
+        );
+
+        let (entered_rx, release_tx) = manager.lifecycle_fence_pause.arm();
+        let (disconnect_tx, disconnect_rx) = mpsc::channel();
+        let disconnect = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                manager.disconnect();
+                let _ = disconnect_tx.send(());
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("disconnect paused after cancelling but before fencing");
+
+        // In the gap between cancellation and the fence, neither a fresh
+        // trigger nor a finishing worker may install an uncancelled worker
+        // against the old lifecycle.
+        let start_hashes = Arc::clone(&manager.hashes);
+        let (start_tx, start_rx) = mpsc::channel();
+        let starter = std::thread::spawn(move || {
+            let started = start_hashes.start_worker().is_some();
+            let _ = start_tx.send(started);
+        });
+        assert!(
+            start_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "start_worker must wait for the lifecycle fence"
+        );
+
+        let finish_hashes = Arc::clone(&manager.hashes);
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            let respawned = finish_hashes.finish_worker(&first, true).is_some();
+            let _ = finish_tx.send(respawned);
+        });
+        assert!(
+            finish_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "finish_worker must wait for the lifecycle fence before respawning"
+        );
+
+        release_tx.send(()).expect("release disconnect");
+        disconnect_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("disconnect completed");
+        start_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("start_worker completed after the fence");
+        assert!(
+            finish_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("finish_worker completed after the fence"),
+            "pending dirty work must respawn with a fresh uncancelled token"
+        );
+        disconnect.join().expect("disconnect thread");
+        starter.join().expect("starter thread");
+        finisher.join().expect("finisher thread");
+        manager.hashes.cancel_worker();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_managed_start_does_not_cancel_or_fence_live_work() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let root = fresh_dir("managed-start-reject");
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let token = manager.hashes.start_worker().expect("start worker");
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.starting = true;
+            state.start_generation = 7;
+        }
+        let before = lifecycle_marker(&manager);
+        let (_entered_rx, release_tx) = manager.lifecycle_fence_pause.arm();
+        let (done_tx, done_rx) = mpsc::channel();
+        let begin = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let already_started = matches!(
+                    manager.begin_managed_start(),
+                    Err(ManagedError::AlreadyStarted)
+                );
+                let _ = done_tx.send(already_started);
+            })
+        };
+        let result = done_rx.recv_timeout(Duration::from_millis(300));
+        if result.is_err() {
+            // Old behavior: the rejected start entered the fence pause first.
+            let _ = release_tx.send(());
+        }
+        let already_started = result
+            .or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| ()))
+            .expect("rejected managed start must return without waiting on the fence");
+        begin.join().expect("begin thread");
+        assert!(already_started);
+        assert!(
+            !token.load(Ordering::SeqCst),
+            "a rejected start must not cancel the live worker"
+        );
+        assert_eq!(
+            lifecycle_marker(&manager),
+            before,
+            "a rejected start must not advance the epoch or fence"
+        );
+        assert!(
+            manager.state.lock().unwrap().starting,
+            "a rejected start must not clear the existing claim"
+        );
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_connect_advances_epoch_and_fence_atomically() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let manager = Arc::new(ConnectionManager::default());
+        let before = lifecycle_marker(&manager);
+        let (entered_rx, release_tx) = manager.lifecycle_fence_pause.arm();
+        let connect = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let base = base.clone();
+            async move { manager.connect(&base, "test-token").await }
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("manual connect reached the lifecycle fence");
+        assert_eq!(
+            lifecycle_marker(&manager),
+            before,
+            "manual connect must not publish the fence before the epoch"
+        );
+        release_tx.send(()).expect("release manual connect");
+        connect
+            .await
+            .expect("connect task")
+            .expect("manual connect succeeds");
+        server.join().expect("server thread");
+        let after = lifecycle_marker(&manager);
+        assert_eq!(after.0, before.0.wrapping_add(1));
+        assert_eq!(after.1, before.1.wrapping_add(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_hash_persistence_does_not_block_shutdown_and_supersedes_the_write() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let root = fresh_dir("hash-persist-shutdown");
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+        let ticket = {
+            let state = manager.state.lock().unwrap();
+            manager
+                .hash_write_ticket_locked(&state)
+                .expect("managed hash ticket")
+        };
+        let (write_entered_rx, write_release_tx) = manager.hashes.hash_commit_pause.arm();
+        let (write_done_tx, write_done_rx) = mpsc::channel();
+        let write = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let result =
+                    mutate_hash_at_ticket(&manager.state, &manager.hashes, &ticket, |slot| {
+                        if !slot.loaded {
+                            return Err(BridgeError::State);
+                        }
+                        slot.store
+                            .record_intents(&[HashIntent {
+                                id: "blocked-persist".to_owned(),
+                                enabled: true,
+                            }])
+                            .map_err(|_| BridgeError::State)
+                    });
+                let _ = write_done_tx.send(matches!(result, Err(BridgeError::Superseded)));
+            })
+        };
+        write_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("hash write staged and paused before publishing");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel();
+        let shutdown = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let drained = manager.shutdown_managed();
+                let _ = shutdown_done_tx.send(drained);
+            })
+        };
+        let shutdown_result = shutdown_done_rx.recv_timeout(Duration::from_secs(2));
+
+        write_release_tx
+            .send(())
+            .expect("release staged hash write");
+        let superseded = write_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("hash write completed");
+        write.join().expect("hash write thread");
+        shutdown.join().expect("shutdown thread");
+        assert!(
+            shutdown_result
+                .expect("shutdown must not wait for a hash write blocked in durable persistence"),
+            "shutdown must drain within its bound"
+        );
+        assert!(
+            superseded,
+            "a write staged before shutdown must not publish after the fence"
+        );
+        let captured = server.join().expect("server thread");
+        assert_eq!(captured.len(), 1);
+        assert!(
+            manager
+                .download_hashes()
+                .iter()
+                .all(|row| row.id != "blocked-persist"),
+            "the superseded write must not install a record"
+        );
+        manager.hashes.hash_commit_pause.clear();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_flag_supersedes_a_ticket_write_before_the_fence() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let root = fresh_dir("hash-shutdown-flag");
+        let (base, server) = rate_test_spawn_scripted(vec![("200 OK", RATE_TEST_LIST.to_string())]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+        let ticket = {
+            let state = manager.state.lock().unwrap();
+            manager
+                .hash_write_ticket_locked(&state)
+                .expect("managed hash ticket")
+        };
+        let (write_entered_rx, write_release_tx) = manager.hashes.hash_write_pause.arm();
+        let (write_done_tx, write_done_rx) = mpsc::channel();
+        let write = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let result =
+                    mutate_hash_at_ticket(&manager.state, &manager.hashes, &ticket, |slot| {
+                        if !slot.loaded {
+                            return Err(BridgeError::State);
+                        }
+                        slot.store
+                            .record_intents(&[HashIntent {
+                                id: "shutdown-flag".to_owned(),
+                                enabled: true,
+                            }])
+                            .map_err(|_| BridgeError::State)
+                    });
+                let _ = write_done_tx.send(matches!(result, Err(BridgeError::Superseded)));
+            })
+        };
+        write_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("hash write paused before validation");
+
+        // Simulate the earliest part of shutdown: the flag is set before the
+        // epoch/fence transition can acquire the lifecycle gate.
+        manager.hashes.begin_shutdown();
+        write_release_tx.send(()).expect("release paused write");
+        assert!(
+            write_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("hash write completed"),
+            "shutdown begin must reject a ticket captured before the fence moved"
+        );
+        write.join().expect("hash write thread");
+        assert!(
+            manager
+                .download_hashes()
+                .iter()
+                .all(|row| row.id != "shutdown-flag"),
+            "a shutdown-flagged write must not install a record"
+        );
+        manager.hashes.hash_write_pause.clear();
+        server.join().expect("server thread");
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_hash_intent_is_fenced_against_a_reconnect_during_the_write() {
+        let root = fresh_dir("hash-add-fence");
+        let item = hash_test_item(
+            "fast-race",
+            "/tmp/not-opened.bin",
+            "downloading",
+            None,
+            false,
+            false,
+            42,
+            3,
+            1,
+        );
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            (
+                "200 OK",
+                r#"{"status":"queued","id":"fast-race","filename":"abc.bin"}"#.to_string(),
+            ),
+            ("200 OK", item.to_string()),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+
+        let (entered_rx, release_tx) = manager.hashes.hash_write_pause.arm();
+        let add = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .add_download_with_options("https://dl.example.test/abc.bin", true)
+                    .await
+            }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("add reached the fenced intent write");
+
+        // Replace the connection after the old add pinned its epoch but before
+        // it commits the intent. The old ticket must not write into the new
+        // lifecycle's state.
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        manager.lifecycle.begin_shutdown();
+        release_tx.send(()).expect("release the fenced write");
+
+        let receipt = add
+            .await
+            .expect("add task")
+            .expect("add receipt remains a success");
+        manager.hashes.hash_write_pause.clear();
+        let captured = server.join().expect("server thread panicked");
+
+        assert_eq!(captured.len(), 3);
+        assert_eq!(receipt.id.as_deref(), Some("fast-race"));
+        assert_eq!(
+            receipt.hash_recorded,
+            Some(false),
+            "a superseded add must not claim a persisted intent"
+        );
+        assert!(
+            manager
+                .download_hashes()
+                .iter()
+                .all(|row| row.id != "fast-race"),
+            "the old add must not install a record into the replacement lifecycle"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_intent_after_reconnect_is_not_surfaced_as_current() {
+        let root = fresh_dir("hash-publish-reconnect");
+        let item = hash_test_item(
+            "late-race",
+            "/tmp/not-opened.bin",
+            "downloading",
+            None,
+            false,
+            false,
+            42,
+            3,
+            1,
+        );
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            (
+                "200 OK",
+                r#"{"status":"queued","id":"late-race","filename":"abc.bin"}"#.to_string(),
+            ),
+            ("200 OK", item.to_string()),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(
+                &root,
+                Some("rename_in_progress"),
+                None,
+            )))
+            .expect("arm rename barrier");
+
+        let add = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .add_download_with_options("https://dl.example.test/abc.bin", true)
+                    .await
+            }
+        });
+        assert!(
+            wait_for_path(
+                &root.join("entered-rename_in_progress"),
+                Duration::from_secs(15)
+            ),
+            "the intent rename must be in progress"
+        );
+        // Reconnect while the already-authorized rename is physically in
+        // flight. It may still publish, but it must not become current.
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        std::fs::write(root.join("release-rename_in_progress"), b"go").expect("release");
+        let receipt = add
+            .await
+            .expect("add task")
+            .expect("add receipt remains a success");
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 3);
+        assert_eq!(receipt.id.as_deref(), Some("late-race"));
+        assert_eq!(
+            receipt.hash_recorded,
+            Some(false),
+            "a rename published after reconnect is not a confirmed intent"
+        );
+        assert!(!manager.hashes.persistence_confirmed());
+        assert!(
+            manager
+                .download_hashes()
+                .iter()
+                .all(|row| row.id != "late-race"),
+            "the published old-lifecycle record must not surface as current"
+        );
+        drop(manager);
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy)]
     enum HashVerification {
         FileRemoved,
@@ -6901,6 +10213,7 @@ mod tests {
         added_at: i64,
         destination: &Path,
     ) -> String {
+        crate::hash_persistence::clear_persist_diagnostic();
         manager.hashes.ensure_loaded(root).expect("load hash state");
         let namespace = manager.hashes.namespace().expect("queue namespace");
         manager
@@ -6953,7 +10266,13 @@ mod tests {
                         file_ino: digests.file_ino,
                     },
                 )
-                .expect("complete fixture"),
+                .unwrap_or_else(|error| {
+                    let diagnostic = crate::hash_persistence::last_persist_diagnostic()
+                        .unwrap_or_else(|| "<none>".into());
+                    panic!(
+                        "complete fixture failed: {error:?}; last persistence diagnostic: {diagnostic}"
+                    )
+                }),
             "fixture completion must publish"
         );
         namespace
@@ -7005,7 +10324,10 @@ mod tests {
             let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
             seed_completed_hash(&manager, &root, "h-1", 42, &file);
 
-            let rows = manager.verified_download_hashes().await;
+            let rows = manager
+                .verified_download_hashes()
+                .await
+                .expect("verified phase rows");
             assert_not_served_complete(hash_row(&rows, "h-1"));
             let captured = server.join().expect("server thread panicked");
             assert_eq!(captured.len(), 2, "{phase} must not fetch hook settings");
@@ -7058,7 +10380,10 @@ mod tests {
         let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
         seed_completed_hash(&manager, &root, "h-1", 42, &file);
 
-        let rows = manager.verified_download_hashes().await;
+        let rows = manager
+            .verified_download_hashes()
+            .await
+            .expect("verified hook rows");
         assert_not_served_complete(hash_row(&rows, "h-1"));
         let captured = server.join().expect("server thread panicked");
         assert_eq!(captured.len(), 3);
@@ -7110,7 +10435,10 @@ mod tests {
             .expect("load hash state");
         let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
         seed_completed_hash(&manager, &root, "h-1", 42, &file);
-        let rows = manager.verified_download_hashes().await;
+        let rows = manager
+            .verified_download_hashes()
+            .await
+            .expect("verified hook-change rows");
         let first = hash_row(&rows, "h-1");
         assert_eq!(first.state, "complete");
         assert!(first.md5.is_some());
@@ -7122,7 +10450,10 @@ mod tests {
             ("200 OK", hook),
         ]);
         let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4343).await;
-        let rows = manager.verified_download_hashes().await;
+        let rows = manager
+            .verified_download_hashes()
+            .await
+            .expect("verified hook rows");
         assert_not_served_complete(hash_row(&rows, "h-1"));
         let captured = server.join().expect("server thread panicked");
         assert_eq!(captured.len(), 3);
@@ -7166,8 +10497,12 @@ mod tests {
             let (_client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
             seed_completed_hash(&manager, &root, "h-1", 42, &file);
 
-            let rows = manager.verified_download_hashes().await;
-            assert!(rows.is_empty(), "unvalidated settings must serve no rows");
+            let result = manager.verified_download_hashes().await;
+            assert_eq!(
+                result.err(),
+                Some(BridgeError::InvalidResponse),
+                "unvalidated settings must not become an empty success"
+            );
             let captured = server.join().expect("server thread panicked");
             assert_eq!(captured.len(), 3);
             manager.hashes.cancel_current();
@@ -7267,7 +10602,7 @@ mod tests {
             )
             .expect("complete later record"));
         release_tx.send(()).expect("release publication");
-        let rows = serve.await.expect("serve task");
+        let rows = serve.await.expect("serve task").expect("verified rows");
         manager.verified_pause.clear();
         server.join().expect("server thread panicked");
 
@@ -7348,7 +10683,7 @@ mod tests {
             .send(())
             .expect("release the older /list snapshot");
 
-        let rows = serve.await.expect("serve task");
+        let rows = serve.await.expect("serve task").expect("verified rows");
         server.join().expect("server thread panicked");
         manager.hashes.cancel_current();
 
@@ -7376,7 +10711,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn verified_hashes_strip_everything_after_an_epoch_change_during_validation() {
+    async fn verified_hashes_are_superseded_by_an_epoch_change_during_validation() {
         let root = fresh_dir("hash-verify-epoch");
         let file = root.join("abc.bin");
         std::fs::write(&file, b"abc").expect("write fixture");
@@ -7415,14 +10750,365 @@ mod tests {
 
         manager.install_test_managed(Arc::clone(&client), 4343);
         release_tx.send(()).expect("release publication");
-        let rows = serve.await.expect("serve task");
+        let result = serve.await.expect("serve task");
         manager.verified_pause.clear();
         server.join().expect("server thread panicked");
 
-        assert!(
-            rows.iter().all(|row| row.state != "complete"),
-            "an epoch change during validation must not publish old digests"
+        assert_eq!(
+            result.err(),
+            Some(BridgeError::Superseded),
+            "an epoch change during validation must never fabricate an empty success"
         );
+        let stored = manager.download_hashes();
+        let row = hash_row(&stored, "h-1");
+        assert_eq!(
+            row.state, "complete",
+            "the superseded read must not publish or clear the persisted digest"
+        );
+        assert!(row.md5.is_some());
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_fail_closed_when_the_managed_process_exits_after_the_list() {
+        let root = fresh_dir("hash-verify-exit-after-list");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            true,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-1", 42, &file);
+        let (entered_rx, release_tx) = manager.verified_list_pause.arm();
+        let read = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get_download_hashes_fenced(|| Ok(())).await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("verification reached the post-list barrier");
+
+        manager.mark_test_managed_exited();
+        release_tx.send(()).expect("release the /list snapshot");
+        let result = read.await.expect("read task");
+        manager.verified_list_pause.clear();
+        let captured = server.join().expect("server thread panicked");
+
+        assert_eq!(
+            result.err(),
+            Some(BridgeError::NotConnected),
+            "a process exit after /list must not fabricate an empty success"
+        );
+        assert_eq!(captured.len(), 2);
+        let stored = manager.download_hashes();
+        let row = hash_row(&stored, "h-1");
+        assert_eq!(row.state, "complete");
+        assert!(
+            row.md5.is_some(),
+            "the exited process must not clear the persisted digest"
+        );
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_fail_closed_when_the_managed_process_exits_at_the_final_barrier() {
+        let root = fresh_dir("hash-verify-exit-final");
+        let file = root.join("abc.bin");
+        std::fs::write(&file, b"abc").expect("write fixture");
+        let destination = file.to_string_lossy().into_owned();
+        let list = serde_json::json!([hash_test_item(
+            "h-1",
+            &destination,
+            "completed",
+            None,
+            false,
+            true,
+            42,
+            3,
+            3
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        install_rate_test_managed(&manager, &base, 4242).await;
+        seed_completed_hash(&manager, &root, "h-1", 42, &file);
+        // Stop the refresh-triggered worker so only the command body reaches
+        // the scripted daemon.
+        manager.lifecycle.begin_shutdown();
+        let (entered_rx, release_tx) = manager.verified_pause.arm();
+        let read = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.refresh_download_hashes_fenced(|| Ok(())).await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("verification reached the publication barrier");
+
+        manager.mark_test_managed_exited();
+        release_tx.send(()).expect("release publication");
+        let result = read.await.expect("read task");
+        manager.verified_pause.clear();
+        let captured = server.join().expect("server thread panicked");
+
+        assert_eq!(
+            result.err(),
+            Some(BridgeError::NotConnected),
+            "a process exit at the final barrier must not fabricate an empty success"
+        );
+        assert_eq!(captured.len(), 2);
+        let stored = manager.download_hashes();
+        let row = hash_row(&stored, "h-1");
+        assert_eq!(row.state, "complete");
+        assert!(
+            row.md5.is_some(),
+            "the final barrier must not clear the persisted digest"
+        );
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_propagate_a_definite_invalidation_failure() {
+        let (root, file, server, manager) = completed_hash_fixture(
+            "hash-verify-invalidate-before-rename",
+            HashVerification::FileRemoved,
+        )
+        .await;
+        std::fs::remove_file(&file).expect("remove completed file");
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(&root, None, Some("rename"))))
+            .expect("arm definitive failure");
+
+        let result = manager.get_download_hashes_fenced(|| Ok(())).await;
+        assert_eq!(
+            result.err(),
+            Some(BridgeError::State),
+            "a before-rename invalidation failure must surface its exact error"
+        );
+
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(None)
+            .expect("clear definitive failure");
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 8);
+        let stored = manager.download_hashes();
+        let row = hash_row(&stored, "h-1");
+        assert_eq!(
+            row.state, "complete",
+            "a definitive failure must not stale or serve the unverified digest"
+        );
+        assert!(row.md5.is_some());
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_preserve_an_ambiguous_invalidation_as_unconfirmed() {
+        let (root, file, server, manager) = completed_hash_fixture(
+            "hash-verify-invalidate-unconfirmed",
+            HashVerification::FileRemoved,
+        )
+        .await;
+        std::fs::remove_file(&file).expect("remove completed file");
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(&root, None, Some("dir_sync"))))
+            .expect("arm ambiguous failure");
+
+        let result = manager.get_download_hashes_fenced(|| Ok(())).await;
+        assert_eq!(
+            result.err(),
+            Some(BridgeError::HashUnconfirmed),
+            "an ambiguous invalidation must stay HashUnconfirmed, not become State or empty"
+        );
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(captured.len(), 8);
+        let stored = manager.download_hashes();
+        let row = hash_row(&stored, "h-1");
+        assert_eq!(
+            row.state, "unavailable",
+            "no stale digest may be served after an ambiguous invalidation"
+        );
+        assert!(row.md5.is_none());
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_supersede_an_invalidation_error_after_an_epoch_change() {
+        let (root, file, server, manager) = completed_hash_fixture(
+            "hash-verify-invalidate-epoch",
+            HashVerification::FileRemoved,
+        )
+        .await;
+        let manager = Arc::new(manager);
+        std::fs::remove_file(&file).expect("remove completed file");
+        manager
+            .hashes
+            .domain()
+            .expect("owner")
+            .set_fault(Some(persistence_fault(&root, Some("write"), None)))
+            .expect("arm write barrier");
+
+        let read = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get_download_hashes_fenced(|| Ok(())).await }
+        });
+        assert!(
+            wait_for_path(
+                &root.join("entered-write"),
+                std::time::Duration::from_secs(15)
+            ),
+            "invalidation reached the persistence write barrier"
+        );
+
+        let client = {
+            let state = manager.state.lock().expect("test state lock");
+            Arc::clone(&state.test_managed.as_ref().expect("test managed").client)
+        };
+        manager.install_test_managed(client, 4343);
+        std::fs::write(
+            root.join(AUTOMATIC_HASH_FILE),
+            br#"{"version":2,"defaultEnabled":true,"records":[]}"#,
+        )
+        .expect("inject foreign state");
+        std::fs::write(root.join("release-write"), b"go").expect("release write barrier");
+
+        let result = read.await.expect("read task");
+        let captured = server.join().expect("server thread panicked");
+        assert_eq!(
+            result.err(),
+            Some(BridgeError::Superseded),
+            "an old invalidation error must not surface after a lifecycle change"
+        );
+        assert_eq!(captured.len(), 8);
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_supersede_a_stale_invalidation_fence() {
+        let (root, file, server, manager) = completed_hash_fixture(
+            "hash-verify-invalidate-fence",
+            HashVerification::FileRemoved,
+        )
+        .await;
+        let manager = Arc::new(manager);
+        std::fs::remove_file(&file).expect("remove completed file");
+        let (entered_rx, release_tx) = manager.verified_list_pause.arm();
+        let read = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get_download_hashes_fenced(|| Ok(())).await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("verification reached the post-list barrier");
+
+        manager.hashes.cancel_current();
+        release_tx.send(()).expect("release the /list snapshot");
+        let result = read.await.expect("read task");
+        manager.verified_list_pause.clear();
+        let captured = server.join().expect("server thread panicked");
+
+        assert_eq!(
+            result.err(),
+            Some(BridgeError::Superseded),
+            "a moved hash fence is a lifecycle change, not an empty hash result"
+        );
+        assert_eq!(captured.len(), 8);
+        manager.hashes.cancel_current();
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_hashes_do_not_treat_an_already_invalidated_record_as_empty() {
+        let (root, file, server, manager) = completed_hash_fixture(
+            "hash-verify-invalidate-already",
+            HashVerification::FileRemoved,
+        )
+        .await;
+        let manager = Arc::new(manager);
+        std::fs::remove_file(&file).expect("remove completed file");
+        let (entered_rx, release_tx) = manager.verified_list_pause.arm();
+        let read = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get_download_hashes_fenced(|| Ok(())).await }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("verification reached the post-list barrier");
+
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        let fence = manager.hashes.fence();
+        let record = manager
+            .hashes
+            .completed_for(&namespace)
+            .into_iter()
+            .find(|record| record.id == "h-1")
+            .expect("completed record");
+        assert!(
+            manager
+                .hashes
+                .invalidate_completed(&record, fence)
+                .expect("concurrent invalidation"),
+            "the exact record must invalidate under the current fence"
+        );
+        release_tx.send(()).expect("release the /list snapshot");
+        let rows = read
+            .await
+            .expect("read task")
+            .expect("a concurrent invalidation is not a false empty success");
+        manager.verified_list_pause.clear();
+        let captured = server.join().expect("server thread panicked");
+
+        assert_eq!(captured.len(), 8);
+        let row = hash_row(&rows, "h-1");
+        assert_eq!(row.state, "stale");
+        assert!(row.md5.is_none());
+        assert!(row.sha256.is_none());
         manager.hashes.cancel_current();
         remove_all_best_effort(&root);
     }
@@ -7576,6 +11262,234 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_hash_intents_are_fenced_against_a_reconnect_during_the_write() {
+        let root = fresh_dir("hash-record-write-fence");
+        let list = serde_json::json!([hash_test_item(
+            "h-race",
+            "/tmp/not-opened.bin",
+            "downloading",
+            None,
+            false,
+            false,
+            42,
+            3,
+            1
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+
+        let (entered_rx, release_tx) = manager.hashes.hash_write_pause.arm();
+        let record = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .record_hash_intents(&[HashIntent {
+                        id: "h-race".into(),
+                        enabled: true,
+                    }])
+                    .await
+            }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("record reached the fenced intent write");
+
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        release_tx.send(()).expect("release the fenced write");
+
+        let result = record.await.expect("record task");
+        manager.hashes.hash_write_pause.clear();
+        let captured = server.join().expect("server thread panicked");
+
+        assert_eq!(captured.len(), 2);
+        assert!(
+            matches!(result, Err(BridgeError::Superseded)),
+            "an older record snapshot must not commit after a reconnect"
+        );
+        assert!(
+            manager
+                .download_hashes()
+                .iter()
+                .all(|row| row.id != "h-race"),
+            "the old record must not install a record into the replacement lifecycle"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_hash_intents_reconcile_is_fenced_against_a_reconnect() {
+        let root = fresh_dir("hash-record-reconcile-fence");
+        let list = serde_json::json!([hash_test_item(
+            "h-new",
+            "/tmp/not-opened.bin",
+            "downloading",
+            None,
+            false,
+            false,
+            99,
+            3,
+            1
+        )])
+        .to_string();
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", list),
+            ("200 OK", "[]".to_string()),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-old".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-old".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace,
+                        added_at: 42,
+                        fingerprint: hash_test_fingerprint("h-old", 42),
+                    },
+                )],
+            )
+            .expect("seed preexisting intent");
+
+        let (entered_rx, release_tx) = manager.record_intents_pause.arm();
+        let record = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .record_hash_intents(&[HashIntent {
+                        id: "h-new".into(),
+                        enabled: true,
+                    }])
+                    .await
+            }
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("record reached the reconcile barrier");
+
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        manager.lifecycle.begin_shutdown();
+        release_tx
+            .send(())
+            .expect("release the older list snapshot");
+
+        record
+            .await
+            .expect("record task")
+            .expect("record and serve verified rows");
+        manager.record_intents_pause.clear();
+        server.join().expect("server thread panicked");
+
+        let old = manager
+            .download_hashes()
+            .into_iter()
+            .find(|row| row.id == "h-old")
+            .expect("preexisting row remains");
+        assert_ne!(
+            old.state, "stale",
+            "an older /list must not stale a record across a reconnect"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_worker_reconcile_is_fenced_against_a_reconnect() {
+        let root = fresh_dir("hash-worker-reconcile-fence");
+        let (base, server) = rate_test_spawn_scripted(vec![
+            ("200 OK", RATE_TEST_LIST.to_string()),
+            ("200 OK", "[]".to_string()),
+        ]);
+        let manager = Arc::new(ConnectionManager::default());
+        manager
+            .hashes
+            .ensure_loaded(&root)
+            .expect("load hash state");
+        let (client, _epoch) = install_rate_test_managed(&manager, &base, 4242).await;
+        let namespace = manager.hashes.namespace().expect("queue namespace");
+        manager
+            .hashes
+            .record_intents_with(
+                &[HashIntent {
+                    id: "h-old".into(),
+                    enabled: true,
+                }],
+                &[(
+                    "h-old".into(),
+                    crate::hash_state::HashProvenance {
+                        namespace: namespace.clone(),
+                        added_at: 42,
+                        fingerprint: hash_test_fingerprint("h-old", 42),
+                    },
+                )],
+            )
+            .expect("seed preexisting intent");
+
+        let (entered_rx, release_tx) = manager.hashes.hash_write_pause.arm();
+        manager.trigger_hashing();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker reached the fenced reconcile");
+
+        manager.install_test_managed(Arc::clone(&client), 4343);
+        manager.lifecycle.begin_shutdown();
+        release_tx
+            .send(())
+            .expect("release the older list snapshot");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.hashes.lock_worker().running {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "superseded worker did not exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        manager.hashes.hash_write_pause.clear();
+        server.join().expect("server thread panicked");
+
+        let old = manager
+            .download_hashes()
+            .into_iter()
+            .find(|row| row.id == "h-old")
+            .expect("preexisting row remains");
+        assert_ne!(
+            old.state, "stale",
+            "an older worker /list must not stale a record across a reconnect"
+        );
+        assert!(
+            manager
+                .hashes
+                .candidates(&namespace)
+                .iter()
+                .any(|candidate| candidate.id == "h-old" && candidate.added_at == 42),
+            "the superseded reconcile must leave the record eligible for the new lifecycle"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_stale_after_verification(rows: Vec<DownloadHashDto>) {
         let row = rows
             .iter()
@@ -7592,7 +11506,10 @@ mod tests {
         let (root, file, server, manager) =
             completed_hash_fixture("hash-verify-removed", HashVerification::FileRemoved).await;
         std::fs::remove_file(&file).expect("remove completed file");
-        let rows = manager.verified_download_hashes().await;
+        let rows = manager
+            .verified_download_hashes()
+            .await
+            .expect("verified rows");
         assert_stale_after_verification(rows);
         let captured = server.join().expect("server thread panicked");
         assert_eq!(captured.len(), 8);
@@ -7605,14 +11522,20 @@ mod tests {
         let (root, file, server, manager) =
             completed_hash_fixture("hash-verify-replaced", HashVerification::FileReplaced).await;
         std::fs::write(&file, b"xyz").expect("replace file contents");
-        let rows = manager.verified_download_hashes().await;
+        let rows = manager
+            .verified_download_hashes()
+            .await
+            .expect("verified rows");
         assert_stale_after_verification(rows);
         server.join().expect("server thread panicked");
         remove_all_best_effort(&root);
 
         let (root, _file, server, manager) =
             completed_hash_fixture("hash-verify-queue", HashVerification::QueueRemoved).await;
-        let rows = manager.verified_download_hashes().await;
+        let rows = manager
+            .verified_download_hashes()
+            .await
+            .expect("verified rows");
         assert_stale_after_verification(rows);
         let captured = server.join().expect("server thread panicked");
         assert_eq!(captured.len(), 7);

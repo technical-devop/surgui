@@ -19,6 +19,7 @@
     rateInputErrorMessage,
     resolveBatchDraft,
   } from "./queue/queue";
+  import { draftAfterConnectionLoss, resolveAppTab, type AppTab } from "./queue/view-tabs";
   import { onDestroy, onMount } from "svelte";
   import { untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
@@ -40,12 +41,19 @@
   let endpoint = $state("");
   let token = $state("");
   let addUrl = $state("");
+  // View tabs: Downloads is the default; Settings holds speed, concurrency
+  // and advanced connection. Drafts live outside the tab conditional so
+  // switching tabs never clears edits and never restarts the daemon.
+  let activeTab = $state<AppTab>("downloads");
   let snapshot = $state<NativeState>({ phase: "offline", items: [], error: null, refreshing: false, controllingId: null, adding: false, addOutcome: null, batch: null, managed: false, rateLimitBps: null, rateLoading: false, rateSaving: false, rateError: null, rateUnconfirmed: false, maxConcurrent: null, maxConcurrentLoading: false, maxConcurrentSaving: false, maxConcurrentError: null, maxConcurrentUnconfirmed: false, maxConcurrentRestartPending: false, locationOpeningId: null, locationError: null, locationErrorId: null, bulkAction: null, bulkSummary: null, bulkUncertainties: [], bulkUncertaintyOverflow: 0, hashIntentWarnings: [], hashIntentWarningOverflow: 0, hashDefaultEnabled: null, hashDefaultLoading: false, hashDefaultSaving: false, hashDefaultError: null, hashes: [], hashesLoading: false, hashError: null });
   // Per-batch hash choice. Initialized from the persisted default; the user
   // may override per batch without changing the default. Snapshotted once at
   // submission so an in-flight toggle cannot retarget the running batch.
   let hashForBatch = $state(false);
   let hashBatchDirty = $state(false);
+  // Incremented only by an explicit user toggle. Lets a completed batch tell
+  // whether its own reset would overwrite a newer choice made after submit.
+  let hashChoiceRevision = 0;
   let rateDraft = $state("");
   let rateDirty = $state(false);
   let rateTouched = $state(false);
@@ -149,14 +157,50 @@
   const hashDefaultLoading = $derived(snapshot.hashDefaultLoading === true);
   const hashDefaultSaving = $derived(snapshot.hashDefaultSaving === true);
   const hashDefaultError = $derived(snapshot.hashDefaultError ?? null);
+  const hashDefaultUnconfirmed = $derived(snapshot.hashDefaultUnconfirmed === true);
   const hashes = $derived(snapshot.hashes ?? []);
   const hashesLoading = $derived(snapshot.hashesLoading === true);
   const hashError = $derived(snapshot.hashError ?? null);
+  // A batch hash choice is resolved only by a loaded persisted default or an
+  // explicit per-batch toggle. Until then, submitting would silently guess
+  // "disabled" even when the saved default is true. A default save in flight
+  // leaves the old value visible, so that old value is not a confirmed basis
+  // for an implicit batch until the save settles.
+  const hashDefaultBaselineStable = $derived(
+    !hashDefaultSaving &&
+      !hashDefaultLoading &&
+      hashDefaultEnabled !== null &&
+      hashForBatch === hashDefaultEnabled,
+  );
+  const hashChoiceResolved = $derived(hashBatchDirty || hashDefaultBaselineStable);
+  const hashChoiceUnknown = $derived(isManaged && !hashChoiceResolved);
+  const canSubmitBatch = $derived(
+    isConnected &&
+      !addBusy &&
+      addUrl.trim().length > 0 &&
+      !hashChoiceUnknown,
+  );
+  // Explicit retry for the invalidated-baseline state: another controller's
+  // definite save clears this controller's cached default without setting an
+  // error. The automatic load runs once per epoch, so without this the value
+  // stays null with help text mentioning retry but no button. Read-only;
+  // never shown for poison, saving, loading, error, or offline.
+  const showHashNullRetry = $derived(
+    isConnected &&
+      isManaged &&
+      hashDefaultEnabled === null &&
+      !hashDefaultLoading &&
+      !hashDefaultSaving &&
+      !hashDefaultError &&
+      !hashDefaultUnconfirmed,
+  );
 
   // Load the managed limit once per connection epoch. The draft lives in the
-  // UI so list polls never overwrite an in-progress edit. tryClaim gates the
-  // auto attempt so a failed read never loops; manual Retry calls loadRate()
-  // directly and reconnect (epoch bump) allows exactly one new auto attempt.
+  // UI so list polls never overwrite an in-progress edit. The baseline load
+  // runs even while a dirty draft survives a reconnect; the mirror effect
+  // below refuses to replace that edit. tryClaim gates the auto attempt so a
+  // failed read never loops; manual Retry calls loadRate() directly and
+  // reconnect (epoch bump) allows exactly one new auto attempt.
   $effect(() => {
     const phase = snapshot.phase;
     const managed = snapshot.managed === true;
@@ -167,7 +211,6 @@
       if (!isTauri || !controller) return;
       if (phase !== "connected" || !managed) return;
       if (known !== null || loading || poisoned) return;
-      if (rateDirty) return;
       if (!controller.tryClaimRateAutoLoad()) return;
       void controller.loadRate();
     });
@@ -185,22 +228,29 @@
     });
   });
 
-  // Reset the rate draft when the connection leaves managed/connected so a
-  // stale value never looks like the new daemon's limit.
+  // A clean rate draft is cleared when the connection leaves managed/connected
+  // so a stale value never looks like the new daemon's limit. A dirty draft is
+  // preserved across reconnect and is never applied without an explicit save.
   $effect(() => {
     const phase = snapshot.phase;
     const managed = snapshot.managed === true;
     untrack(() => {
       if (phase !== "connected" || !managed) {
-        rateDraft = "";
-        rateDirty = false;
-        rateTouched = false;
+        const next = draftAfterConnectionLoss(rateDraft, rateDirty, rateTouched);
+        rateDraft = next.draft;
+        rateDirty = next.dirty;
+        rateTouched = next.touched;
       }
     });
   });
 
   // Load the daemon concurrency setting once per connection epoch. This is
   // the saved settings value, not the running daemon's active concurrency.
+  // The read is authoritative state, not a draft mutation, so it runs even
+  // while a dirty draft survives a reconnect: gating it on maxConcurrentDirty
+  // left maxConcurrent null and the select/Save disabled. The mirror effect
+  // below still refuses to overwrite an edit, so nothing reaches the daemon
+  // without an explicit save.
   $effect(() => {
     const phase = snapshot.phase;
     const known = snapshot.maxConcurrent;
@@ -210,7 +260,6 @@
       if (!isTauri || !controller) return;
       if (phase !== "connected") return;
       if (known !== null || loading || poisoned) return;
-      if (maxConcurrentDirty) return;
       if (!controller.tryClaimMaxConcurrentAutoLoad()) return;
       void controller.loadMaxConcurrent();
     });
@@ -228,15 +277,21 @@
     });
   });
 
-  // Clear the concurrency draft when the connection leaves connected so a
-  // stale value never looks like the new daemon's setting.
+  // A clean concurrency draft is cleared when the connection leaves connected
+  // so a stale value never looks like the new daemon's setting. A dirty draft
+  // survives reconnect and is only applied by an explicit save.
   $effect(() => {
     const phase = snapshot.phase;
     untrack(() => {
       if (phase !== "connected") {
-        maxConcurrentDraft = "";
-        maxConcurrentDirty = false;
-        maxConcurrentTouched = false;
+        const next = draftAfterConnectionLoss(
+          maxConcurrentDraft,
+          maxConcurrentDirty,
+          maxConcurrentTouched,
+        );
+        maxConcurrentDraft = next.draft;
+        maxConcurrentDirty = next.dirty;
+        maxConcurrentTouched = next.touched;
       }
     });
   });
@@ -283,15 +338,17 @@
 
   // Load visible hashes once per managed connection; manual connections stay
   // empty so another daemon's digests can never read as the current state.
+  // The controller claim is one-shot per epoch: snapshot cloning changes the
+  // rows identity on every emit, so an empty or failed load must not re-trigger
+  // from this effect. Manual hash refresh is the explicit retry, and the
+  // controller owns bounded pending-row polling plus completion triggers.
   $effect(() => {
     const phase = snapshot.phase;
     const managed = snapshot.managed === true;
-    const known = snapshot.hashes;
     untrack(() => {
       if (!isTauri || !controller) return;
       if (phase !== "connected" || !managed) return;
-      if (known !== undefined && known !== null && known.length > 0) return;
-      if (snapshot.hashesLoading === true) return;
+      if (!controller.tryClaimHashesAutoLoad()) return;
       void controller.loadHashes();
     });
   });
@@ -393,12 +450,17 @@
     const requestId = ++maxConcurrentSaveSeq;
     const before = maxConcurrent;
     const value = maxConcurrentParsed;
-    maxConcurrentDirty = false;
+    const submittedDraft = maxConcurrentDraft;
+    // Keep the draft dirty until the daemon confirms on the same epoch. If the
+    // connection drops, the submitted draft and its uncertain outcome stay
+    // visible; nothing is auto-retried on reconnect.
     const ok = await activeController.setMaxConcurrent(before, value);
     // Only the connection/request that started this save may touch the draft.
     if (controller !== activeController) return;
     if (requestId !== maxConcurrentSaveSeq) return;
     if (epoch !== activeController.connectionEpoch()) return;
+    // A newer edit wins over a late confirmation; never clear or overwrite it.
+    if (maxConcurrentDraft !== submittedDraft) return;
     if (ok) {
       untrack(() => {
         maxConcurrentDraft = String(value);
@@ -422,12 +484,17 @@
     const activeController = controller;
     const epoch = activeController.connectionEpoch();
     const requestId = ++rateSaveSeq;
-    rateDirty = false;
+    const submittedDraft = rateDraft;
+    // Keep the draft dirty until the daemon confirms on the same epoch. If the
+    // connection drops, the submitted draft and its uncertain outcome stay
+    // visible; nothing is auto-retried on reconnect.
     const ok = await activeController.setRateLimit(parsed.bytes);
     // Only the connection/request that started this save may touch the draft.
     if (controller !== activeController) return;
     if (requestId !== rateSaveSeq) return;
     if (epoch !== activeController.connectionEpoch()) return;
+    // A newer edit wins over a late confirmation; never clear or overwrite it.
+    if (rateDraft !== submittedDraft) return;
     if (ok) {
       untrack(() => {
         rateDraft = formatRateBpsToMb(parsed.bytes);
@@ -534,12 +601,18 @@
 
   function handleDisconnect() {
     const activeController = controller;
-    rateDraft = "";
-    rateDirty = false;
-    rateTouched = false;
-    maxConcurrentDraft = "";
-    maxConcurrentDirty = false;
-    maxConcurrentTouched = false;
+    const rateNext = draftAfterConnectionLoss(rateDraft, rateDirty, rateTouched);
+    rateDraft = rateNext.draft;
+    rateDirty = rateNext.dirty;
+    rateTouched = rateNext.touched;
+    const maxNext = draftAfterConnectionLoss(
+      maxConcurrentDraft,
+      maxConcurrentDirty,
+      maxConcurrentTouched,
+    );
+    maxConcurrentDraft = maxNext.draft;
+    maxConcurrentDirty = maxNext.dirty;
+    maxConcurrentTouched = maxNext.touched;
     hashBatchDirty = false;
     void activeController?.disconnect();
     pullRecoveries(activeController);
@@ -585,28 +658,58 @@
     void controller.refreshHashes();
   }
 
-  async function handleHashDefaultSave() {
+  async function handleHashDefaultToggle(enabled: boolean, input: HTMLInputElement) {
     if (!isTauri || !controller) return;
-    if (!isConnected || hashDefaultSaving || hashDefaultLoading) return;
-    // Persist the current per-batch choice as the default for future batches.
-    // The in-flight batch keeps its snapshotted value.
+    if (!isConnected || hashDefaultSaving || hashDefaultLoading || hashDefaultUnconfirmed) return;
     const activeController = controller;
     const epoch = activeController.connectionEpoch();
-    const ok = await activeController.setHashDefault(hashForBatch);
+    const ok = await activeController.setHashDefault(enabled);
     if (controller !== activeController) return;
     if (epoch !== activeController.connectionEpoch()) return;
-    if (ok) {
-      untrack(() => {
-        hashBatchDirty = false;
-      });
-      void activeController.loadHashes();
+    const confirmed = activeController.state.hashDefaultEnabled === true;
+    if (!input.isConnected) return;
+    if (!ok) {
+      // The DOM may still show the attempted value because the confirmed state
+      // did not change. Restore it explicitly for enable and disable failures.
+      input.checked = confirmed;
+      return;
     }
+    input.checked = confirmed;
+    void activeController.loadHashes();
   }
 
   const showManagedRetry = $derived(
     snapshot.phase === "error" || (snapshot.phase === "offline" && managedAutoStarted),
   );
   const managedRetryLabel = $derived(snapshot.phase === "error" ? "Retry bundled daemon" : "Start bundled daemon");
+
+  function selectTab(tab: AppTab) {
+    activeTab = resolveAppTab(tab);
+  }
+
+  function handleTabKeydown(event: KeyboardEvent) {
+    const target = event.currentTarget as HTMLElement | null;
+    const tabs = target?.parentElement?.querySelectorAll('[role="tab"]');
+    let next: AppTab | null = null;
+    if (event.key === "ArrowRight") next = activeTab === "downloads" ? "settings" : "downloads";
+    else if (event.key === "ArrowLeft") next = activeTab === "settings" ? "downloads" : "settings";
+    else if (event.key === "Home") next = "downloads";
+    else if (event.key === "End") next = "settings";
+    if (next) {
+      event.preventDefault();
+      selectTab(next);
+      // Move focus to the newly selected tab for screenreader/keyboard users.
+      queueMicrotask(() => {
+        const list = tabs ?? document.querySelectorAll('[role="tab"]');
+        for (const el of Array.from(list ?? [])) {
+          if ((el as HTMLElement).dataset.tab === next) {
+            (el as HTMLElement).focus();
+            break;
+          }
+        }
+      });
+    }
+  }
 
   function handleNativeControl(action: "pause" | "resume" | "removeRecord", id: string) {
     // Native-only: always route through the controller bridge. Never mutate
@@ -644,7 +747,9 @@
   async function handleAdd(event: SubmitEvent) {
     event.preventDefault();
     if (!isTauri || !controller) return;
-    if (!isConnected || addBusy) return;
+    // The persisted hash default must be loaded, or the per-batch choice must
+    // be an explicit user override. Never submit "hashing disabled" by guess.
+    if (!canSubmitBatch) return;
     const input = addUrl.trim();
     if (!input) return;
     const activeController = controller;
@@ -653,6 +758,7 @@
     // Snapshot the per-batch hash choice once; the running batch keeps this
     // value even if the checkbox or default changes mid-batch.
     const hashSnapshot = hashForBatch;
+    const hashChoiceRevisionAtSubmit = hashChoiceRevision;
     addUrl = "";
     const result = await activeController.addBatch(input, hashSnapshot);
     // A reconnect, a newer submission or a disposed controller makes this
@@ -675,12 +781,21 @@
     // resolver, but its full original lines are preserved separately. Restore
     // them only through the non-overwriting merge effect above.
     pullRecoveries(activeController);
-    // The next batch starts again from the persisted default.
-    untrack(() => {
-      hashBatchDirty = false;
-      const def = snapshot.hashDefaultEnabled;
-      if (def !== null && def !== undefined) hashForBatch = def;
-    });
+    // Only the submission that still owns this connection epoch may reset the
+    // next batch's choice. A reconnect, a newer submission, or a newer user
+    // toggle must keep whatever choice belongs to the current epoch.
+    const ownsAdd =
+      controller === activeController &&
+      operationId === addOperationSeq &&
+      epoch === activeController.connectionEpoch();
+    if (ownsAdd && hashChoiceRevision === hashChoiceRevisionAtSubmit) {
+      // The next batch starts again from the persisted default.
+      untrack(() => {
+        hashBatchDirty = false;
+        const def = snapshot.hashDefaultEnabled;
+        if (def !== null && def !== undefined) hashForBatch = def;
+      });
+    }
     // A newly queued batch may carry hash intents; reconcile visible rows.
     if (isManaged) void activeController.refreshHashes();
   }
@@ -696,9 +811,45 @@
         <img class="brand-logo" src={logoUrl} alt="" width="1376" height="768" decoding="async" />
         <span class="brand-divider" aria-hidden="true"></span>
         <span class="brand-text">
-          <h1 class="wordmark">Surge Desktop</h1>
-          <span class="section-name">Daemon connection</span>
+          <h1 class="wordmark">Surgui</h1>
+          <span class="section-name">{activeTab === "settings" ? "Settings" : "Downloads"}</span>
         </span>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Primary" tabindex="-1" onkeydown={handleTabKeydown}>
+        <button
+          type="button"
+          role="tab"
+          data-tab="downloads"
+          aria-selected={activeTab === "downloads" ? "true" : "false"}
+          aria-controls="panel-downloads"
+          id="tab-downloads"
+          tabindex={activeTab === "downloads" ? 0 : -1}
+          class="tab"
+          data-active={activeTab === "downloads" ? "true" : undefined}
+          onclick={() => selectTab("downloads")}
+        >
+          Downloads
+        </button>
+        <button
+          type="button"
+          role="tab"
+          data-tab="settings"
+          aria-selected={activeTab === "settings" ? "true" : "false"}
+          aria-controls="panel-settings"
+          id="tab-settings"
+          tabindex={activeTab === "settings" ? 0 : -1}
+          class="tab"
+          data-active={activeTab === "settings" ? "true" : undefined}
+          onclick={() => selectTab("settings")}
+        >
+          <svg class="tab-gear" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+            <g fill="none" stroke="currentColor" stroke-width="1.4">
+              <circle cx="8" cy="8" r="2.2" />
+              <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2L3.4 12.6" />
+            </g>
+          </svg>
+          Settings
+        </button>
       </div>
       <span class="conn-badge {connTone}" role="status" aria-label={`Connection: ${connLabel}`}>
         <span class="conn-badge-dot" aria-hidden="true"></span>{connLabel}
@@ -736,47 +887,6 @@
           Disconnect
         </button>
       </div>
-      <details class="conn-advanced">
-        <summary class="conn-advanced-summary">Advanced: connect to another daemon</summary>
-        <form class="conn-form" onsubmit={handleConnect}>
-          <div class="field">
-            <label class="field-label" for="daemon-endpoint">Daemon endpoint URL</label>
-            <input
-              id="daemon-endpoint"
-              class="field-input"
-              type="url"
-              inputmode="url"
-              autocomplete="off"
-              spellcheck="false"
-              required
-              placeholder="https://daemon.example.com"
-              bind:value={endpoint}
-              aria-describedby="daemon-endpoint-help"
-            />
-            <p class="field-help" id="daemon-endpoint-help">Remote HTTPS, or loopback HTTP via SSH tunnel. Enter the actual daemon port.</p>
-          </div>
-          <div class="field">
-            <label class="field-label" for="daemon-token">Bearer token</label>
-            <input
-              id="daemon-token"
-              class="field-input"
-              type="password"
-              autocomplete="off"
-              required
-              placeholder="••••••••"
-              bind:value={token}
-              aria-invalid={snapshot.phase === "error" ? "true" : undefined}
-              aria-describedby={snapshot.error ? "daemon-error" : undefined}
-            />
-            <p class="field-help" aria-hidden="true">Sent to the daemon only; never stored.</p>
-          </div>
-          <div class="conn-actions">
-            <button type="submit" class="btn" disabled={isConnecting || snapshot.refreshing && !isConnected}>
-              {isConnecting ? "Connecting…" : "Connect"}
-            </button>
-          </div>
-        </form>
-      </details>
     </section>
     {#if recoveredBatches.length > 0}
       <section class="add-panel" aria-label="Interrupted batch recovery">
@@ -807,6 +917,7 @@
         <p class="add-feedback">Each link above carries its exact outcome. Unconfirmed means the daemon may have accepted it; Not attempted means it was never sent; Invalid or Failed means it was rejected. Full original links are available only in the editable field; nothing was retried automatically.</p>
       </section>
     {/if}
+    <div id="panel-downloads" role="tabpanel" aria-labelledby="tab-downloads" tabindex="0" hidden={activeTab !== "downloads"}>
     {#if showAddPanel}
       <section class="add-panel" aria-label="Add downloads">
         <form class="add-form" onsubmit={handleAdd}>
@@ -815,7 +926,7 @@
             <textarea
               id="add-url"
               class="field-input url-lines"
-              rows="3"
+              rows="8"
               required
               autocomplete="off"
               spellcheck="false"
@@ -827,51 +938,85 @@
             <p class="field-help" id="add-url-help">One HTTP(S) URL per line. Up to {MAX_BATCH_LINES} per batch, sent one at a time through the normal add path. Repeated exact links are sent once per batch; daemon duplicates are reported. Failed, unconfirmed, invalid and unattempted links stay here. The field locks while a batch runs. You can edit offline; submitting needs a connection.</p>
           </div>
           <div class="field hash-field">
-            <label class="hash-check" for="hash-batch">
-              <input
-                id="hash-batch"
-                type="checkbox"
-                class="hash-input"
-                bind:checked={hashForBatch}
-                onchange={() => { hashBatchDirty = true; }}
-                disabled={!isManaged || !isConnected || addBusy}
-              />
-              <span class="hash-check-text">Compute MD5 + SHA-256 for this batch</span>
-            </label>
+            <div class="hash-controls">
+              <label class="hash-check" for="hash-batch">
+                <input
+                  id="hash-batch"
+                  type="checkbox"
+                  class="hash-input"
+                  bind:checked={hashForBatch}
+                  onchange={() => { hashBatchDirty = true; hashChoiceRevision += 1; }}
+                  disabled={!isManaged || !isConnected || addBusy}
+                  aria-describedby="hash-batch-help"
+                />
+                <span class="hash-check-text">Compute hashes for this batch</span>
+              </label>
+              <label class="hash-check hash-persist" for="hash-save-default">
+                <input
+                  id="hash-save-default"
+                  type="checkbox"
+                  class="hash-input"
+                  checked={hashDefaultEnabled === true}
+                  onchange={(event) => {
+                    const input = event.currentTarget;
+                    void handleHashDefaultToggle(input.checked, input);
+                  }}
+                  disabled={!isManaged || !isConnected || hashDefaultSaving || hashDefaultLoading || hashDefaultUnconfirmed || addBusy}
+                  aria-describedby="hash-batch-help"
+                  aria-busy={hashDefaultSaving ? "true" : undefined}
+                />
+                <span class="hash-check-text">Enable hashing by default</span>
+              </label>
+            </div>
             {#if !isManaged}
-              <p class="field-help" id="hash-batch-help">Available only on the bundled daemon connection. Digests identify file content, not trust or safety.</p>
-            {:else}
-              <p class="field-help" id="hash-batch-help">Hashes each queued download after it finishes. Digests identify file content, not trust or safety. {#if hashDefaultEnabled !== null}Default for future batches: {hashDefaultEnabled ? "on" : "off"}.{/if}</p>
+              <p class="field-help" id="hash-batch-help">Available only on the bundled daemon connection.</p>
+            {:else if hashDefaultEnabled !== null}
+              <p class="field-help" id="hash-batch-help">Default for future batches: {hashDefaultEnabled ? "on" : "off"}.</p>
             {/if}
             {#if hashDefaultLoading}
               <p class="add-feedback" role="status">Loading hashing default…</p>
             {:else if hashDefaultError}
               <p class="conn-error" role="alert">{hashDefaultError}</p>
+              {#if !hashDefaultUnconfirmed}
+                <div class="add-actions">
+                  <button type="button" class="btn" onclick={handleHashRetry}>
+                    Retry loading default
+                  </button>
+                </div>
+              {/if}
+            {:else if hashDefaultSaving}
+              <p class="add-feedback" role="status">Saving default…</p>
+            {/if}
+            {#if showHashNullRetry}
               <div class="add-actions">
                 <button type="button" class="btn" onclick={handleHashRetry}>
                   Retry loading default
                 </button>
               </div>
-            {:else if isManaged && isConnected}
-              <div class="add-actions">
-                <button
-                  type="button"
-                  class="btn"
-                  onclick={handleHashDefaultSave}
-                  disabled={hashDefaultSaving || addBusy}
-                  aria-busy={hashDefaultSaving ? "true" : undefined}
-                >
-                  {hashDefaultSaving ? "Saving…" : "Save choice as default"}
-                </button>
-              </div>
+            {/if}
+            {#if hashChoiceUnknown && !hashDefaultLoading}
+              {#if hashDefaultSaving}
+                <p class="field-help" id="hash-choice-help" role="note">
+                  Saving the hashing default. This batch will use it only after the save settles. Choose compute hashes for this batch explicitly to submit now; the old default is not used by guess.
+                </p>
+              {:else if hashDefaultUnconfirmed}
+                <p class="field-help" id="hash-choice-help" role="note">
+                  The saved hashing default is unknown. Choose compute hashes for this batch explicitly before adding; changing the saved default is disabled until the app restarts. No default is guessed.
+                </p>
+              {:else}
+                <p class="field-help" id="hash-choice-help" role="note">
+                  The saved hashing default is not loaded. Choose compute hashes for this batch explicitly, or retry loading the default before adding. No default is guessed.
+                </p>
+              {/if}
             {/if}
           </div>
           <div class="add-actions">
             <button
               type="submit"
               class="btn"
-              disabled={addBusy || addUrl.trim().length === 0 || !isConnected}
+              disabled={addBusy || addUrl.trim().length === 0 || !isConnected || hashChoiceUnknown}
               aria-busy={addBusy ? "true" : undefined}
+              aria-describedby={hashChoiceUnknown && !hashDefaultLoading ? "hash-choice-help" : undefined}
             >
               {!isConnected ? "Connect to add" : batchRunning ? "Adding links…" : isAdding ? "Adding…" : "Add downloads"}
             </button>
@@ -913,7 +1058,80 @@
         {/if}
       </section>
     {/if}
-    {#if isConnected}
+    <!-- Settings panels live in #panel-settings below; drafts persist across tabs. -->
+
+    <QueueScreen
+      items={snapshot.items}
+      mode={queueMode}
+      controllingId={snapshot.controllingId ?? null}
+      onControl={handleNativeControl}
+      isManaged={isManaged}
+      openingId={locationOpeningId}
+      locationError={locationError}
+      locationErrorId={locationErrorId}
+      onOpenLocation={handleOpenLocation}
+      onClearLocationError={handleClearLocationError}
+      bulkAction={bulkAction}
+      bulkSummary={bulkSummary}
+      onBulkControl={handleBulkControl}
+      bulkUncertainties={bulkUncertainties}
+      bulkUncertaintyOverflow={bulkUncertaintyOverflow}
+      onDismissBulkUncertainty={handleDismissBulkUncertainty}
+      onDismissBulkUncertaintyOverflow={handleDismissBulkUncertaintyOverflow}
+      hashIntentWarnings={hashIntentWarnings}
+      hashIntentWarningOverflow={hashIntentWarningOverflow}
+      onDismissHashIntentWarning={handleDismissHashIntentWarning}
+      onDismissHashIntentWarningOverflow={handleDismissHashIntentWarningOverflow}
+      hashes={hashes}
+      hashesLoading={hashesLoading}
+      hashError={hashError}
+      onRefreshHashes={handleHashesRefresh}
+    />
+    </div>
+    <div id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0" hidden={activeTab !== "settings"}>
+      <section class="add-panel" aria-label="Advanced connection">
+        <details class="conn-advanced" open={snapshot.phase !== "connected"}>
+          <summary class="conn-advanced-summary">Advanced: connect to another daemon</summary>
+          <form class="conn-form" onsubmit={handleConnect}>
+            <div class="field">
+              <label class="field-label" for="daemon-endpoint">Daemon endpoint URL</label>
+              <input
+                id="daemon-endpoint"
+                class="field-input"
+                type="url"
+                inputmode="url"
+                autocomplete="off"
+                spellcheck="false"
+                required
+                placeholder="https://daemon.example.com"
+                bind:value={endpoint}
+                aria-describedby="daemon-endpoint-help"
+              />
+              <p class="field-help" id="daemon-endpoint-help">Remote HTTPS, or loopback HTTP via SSH tunnel. Enter the actual daemon port.</p>
+            </div>
+            <div class="field">
+              <label class="field-label" for="daemon-token">Bearer token</label>
+              <input
+                id="daemon-token"
+                class="field-input"
+                type="password"
+                autocomplete="off"
+                required
+                placeholder="••••••••"
+                bind:value={token}
+                aria-invalid={snapshot.phase === "error" ? "true" : undefined}
+                aria-describedby={snapshot.error ? "daemon-error" : undefined}
+              />
+              <p class="field-help">Sent to the daemon only; never stored.</p>
+            </div>
+            <div class="conn-actions">
+              <button type="submit" class="btn" disabled={isConnecting || snapshot.refreshing && !isConnected}>
+                {isConnecting ? "Connecting…" : "Connect"}
+              </button>
+            </div>
+          </form>
+        </details>
+      </section>
       <section class="add-panel" aria-label="Global download speed">
         <form class="add-form" onsubmit={handleRateSave}>
           <div class="field add-field">
@@ -1017,34 +1235,12 @@
           <p class="add-feedback" role="status">{maxConcurrentSavedLabel}</p>
         {/if}
       </section>
-    {/if}
-    <QueueScreen
-      items={snapshot.items}
-      mode={queueMode}
-      controllingId={snapshot.controllingId ?? null}
-      onControl={handleNativeControl}
-      isManaged={isManaged}
-      openingId={locationOpeningId}
-      locationError={locationError}
-      locationErrorId={locationErrorId}
-      onOpenLocation={handleOpenLocation}
-      onClearLocationError={handleClearLocationError}
-      bulkAction={bulkAction}
-      bulkSummary={bulkSummary}
-      onBulkControl={handleBulkControl}
-      bulkUncertainties={bulkUncertainties}
-      bulkUncertaintyOverflow={bulkUncertaintyOverflow}
-      onDismissBulkUncertainty={handleDismissBulkUncertainty}
-      onDismissBulkUncertaintyOverflow={handleDismissBulkUncertaintyOverflow}
-      hashIntentWarnings={hashIntentWarnings}
-      hashIntentWarningOverflow={hashIntentWarningOverflow}
-      onDismissHashIntentWarning={handleDismissHashIntentWarning}
-      onDismissHashIntentWarningOverflow={handleDismissHashIntentWarningOverflow}
-      hashes={hashes}
-      hashesLoading={hashesLoading}
-      hashError={hashError}
-      onRefreshHashes={handleHashesRefresh}
-    />
+      {#if !isConnected}
+        <section class="add-panel" aria-label="Settings unavailable offline">
+          <p class="add-feedback" role="note">Settings stay visible but are disabled offline. Connect the daemon to load speed and concurrency values. Unsaved edits are preserved across reconnect and are only sent when you explicitly save them; the daemon is never restarted by switching tabs.</p>
+        </section>
+      {/if}
+    </div>
   {/if}
 </main>
 
@@ -1138,6 +1334,52 @@
     text-transform: uppercase;
     letter-spacing: 0.14em;
     white-space: nowrap;
+  }
+
+  /* Primary tabs: Downloads default, Settings via Lunarz-inspired gear.
+     Single-line affordances at 320–414px; no wrapping labels. */
+  .tabs {
+    display: flex;
+    gap: var(--space-2xs);
+    margin-left: var(--space-sm);
+    min-width: 0;
+  }
+
+  .tab {
+    min-height: var(--control-h);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2xs);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-neutral);
+    background: transparent;
+    border: 1px solid var(--color-rule);
+    border-radius: 0;
+    padding: 0 var(--space-sm);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .tab-gear {
+    flex: none;
+    display: block;
+  }
+
+  .tab[data-active="true"] {
+    color: var(--color-ink);
+    border-color: var(--color-accent);
+    background: var(--color-accent-wash);
+  }
+
+  @media (hover: hover) {
+    .tab:hover {
+      border-color: var(--color-ink-2);
+      color: var(--color-ink);
+    }
   }
 
   .conn-badge {
@@ -1398,13 +1640,32 @@
     color: var(--color-neutral);
   }
 
+  /* Compact hash toggles: side-by-side on desktop, stacked on narrow. */
+  .hash-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs) var(--space-md);
+    min-width: 0;
+  }
+
+  .hash-controls .hash-check {
+    flex: 1 1 16rem;
+    min-height: var(--control-h);
+  }
+
   .url-lines {
-    min-height: calc(var(--control-h) * 2);
+    min-height: 12rem;
     padding-block: var(--space-sm);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     line-height: 1.5;
     resize: vertical;
+  }
+
+  @media (min-width: 60rem) {
+    .url-lines {
+      min-height: 14rem;
+    }
   }
 
   .select-input {
@@ -1567,6 +1828,27 @@
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       align-items: end;
+    }
+  }
+
+  /* Tabpanels: hidden attribute hides inactive tab without unmounting drafts. */
+  #panel-downloads[hidden],
+  #panel-settings[hidden] {
+    display: none;
+  }
+
+  /* Narrow screens: tabs stay single-line; header wraps, badge drops below. */
+  @media (max-width: 30rem) {
+    .topbar {
+      align-items: flex-start;
+    }
+    .tabs {
+      order: 3;
+      flex: 1 1 100%;
+      margin-left: 0;
+    }
+    .conn-badge {
+      margin-left: 0;
     }
   }
 

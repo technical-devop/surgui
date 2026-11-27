@@ -96,7 +96,7 @@ jobs:
       - name: Upload deb artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: surge-desktop-linux-x64-deb
+          name: surgui-linux-x64-deb
           path: src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
           retention-days: 7
@@ -104,7 +104,7 @@ jobs:
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: surge-desktop-linux-x64-appimage
+          name: surgui-linux-x64-appimage
           path: src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
           retention-days: 7

@@ -407,8 +407,10 @@ describe("App recovery draft wiring", () => {
     );
     assert.match(template, /\{#if showAddPanel\}/, "the add panel must render outside connected-only UI");
     assert.ok(
-      template.includes("disabled={addBusy || addUrl.trim().length === 0 || !isConnected}"),
-      "submission must stay blocked while disconnected",
+      template.includes(
+        "disabled={addBusy || addUrl.trim().length === 0 || !isConnected || hashChoiceUnknown}",
+      ),
+      "submission must stay blocked while disconnected or the hash default is unknown",
     );
     assert.ok(
       template.includes("this draft is preserved and editable"),

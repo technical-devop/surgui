@@ -1,9 +1,14 @@
 // @ts-nocheck — exercised at runtime by node --test (type stripping).
 // Focused frontend tests for automatic-hash IPC wiring.
 // Fake invoke bridge only: no daemon, no paths, no URLs, no secrets.
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { NativeQueueController } from "./native-controller.ts";
+import {
+  NativeQueueController,
+  resetSharedHashDefaultStoreForTests,
+} from "./native-controller.ts";
+
+beforeEach(resetSharedHashDefaultStoreForTests);
 
 const MD5 = "900150983cd24fb0d6963f7d28e17f72";
 const SHA256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -447,4 +452,161 @@ describe("hash request warnings", () => {
       c.dispose();
     }
   });
+
+
+describe("malformed hash responses", () => {
+  const PENDING = { id: "keep", state: "pending" };
+
+  it("rejects a malformed top-level payload without replacing validated rows", async () => {
+    let mode = "valid";
+    let malformedReads = 0;
+    const { invoke } = makeInvoke((command) => {
+      if (command === "start_managed_surge") return [];
+      if (command === "list_downloads") return [];
+      if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+      if (command === "get_download_hashes") {
+        if (mode === "malformed") {
+          malformedReads += 1;
+          return { items: [PENDING] };
+        }
+        if (mode === "empty") return [];
+        if (mode === "mixed") return [PENDING, { id: "bad", state: "calculating" }];
+        return [PENDING];
+      }
+      if (command === "refresh_download_hashes") return [PENDING];
+      throw new Error(`unexpected: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    try {
+      await c.startManaged();
+      await c.loadHashes();
+      assert.deepEqual(c.state.hashes, [PENDING]);
+      assert.equal(c.state.hashError, null);
+
+      mode = "malformed";
+      await c.loadHashes();
+      assert.equal(malformedReads, 1);
+      assert.deepEqual(
+        c.state.hashes,
+        [PENDING],
+        "a malformed object must not replace the last validated rows",
+      );
+      assert.equal(c.state.hashError, "Daemon returned an unexpected hash response.");
+
+      mode = "empty";
+      await c.loadHashes();
+      assert.deepEqual(c.state.hashes, [], "a legitimate empty array is still valid");
+      assert.equal(c.state.hashError, null);
+
+      mode = "mixed";
+      await c.loadHashes();
+      assert.deepEqual(
+        c.state.hashes,
+        [PENDING],
+        "row-level sanitization still drops only the invalid row",
+      );
+      assert.equal(c.state.hashError, null);
+    } finally {
+      c.dispose();
+    }
+  });
+
+  it("preserves rows and mutation uncertainty when the follow-up payload is malformed", async () => {
+    let reads = 0;
+    const releases = [];
+    const { invoke } = makeInvoke((command) => {
+      if (command === "start_managed_surge") return [];
+      if (command === "list_downloads") return [];
+      if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+      if (command === "get_download_hashes") {
+        reads += 1;
+        if (reads === 2) return { items: [PENDING] };
+        return [PENDING];
+      }
+      if (command === "refresh_download_hashes") return [PENDING];
+      if (command === "set_download_hash_intents") {
+        return new Promise((resolve, reject) => {
+          releases.push({ resolve, reject });
+        });
+      }
+      throw new Error(`unexpected: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    try {
+      await c.startManaged();
+      await c.loadHashes();
+
+      const write = c.setHashIntents([{ id: "keep", enabled: true }]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(releases.length, 1, "expected the intent write in flight");
+      releases[0].reject("network");
+      assert.equal(await write, false);
+
+      assert.deepEqual(c.state.hashes, [PENDING], "the failed write keeps validated rows");
+      assert.equal(reads, 2, "the uncertain write gets exactly one follow-up read");
+      assert.match(c.state.hashError, /Cannot reach the daemon for hash state/);
+      assert.match(c.state.hashError, /unexpected hash response/);
+      assert.equal(releases.length, 1, "the failed write is not retried");
+    } finally {
+      c.dispose();
+    }
+  });
+
+  it("combines the reconciliation failure when no current hash error is recorded", async () => {
+    let reads = 0;
+    const releases = [];
+    let pendingRead = null;
+    const { invoke } = makeInvoke((command) => {
+      if (command === "start_managed_surge") return [];
+      if (command === "list_downloads") return [];
+      if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+      if (command === "get_download_hashes") {
+        reads += 1;
+        if (reads === 2) {
+          return new Promise((resolve, reject) => {
+            pendingRead = { resolve, reject };
+          });
+        }
+        return [PENDING];
+      }
+      if (command === "refresh_download_hashes") return [PENDING];
+      if (command === "set_download_hash_intents") {
+        return new Promise((resolve, reject) => {
+          releases.push({ resolve, reject });
+        });
+      }
+      throw new Error(`unexpected: ${command}`);
+    });
+    const c = new NativeQueueController(invoke, () => {}, 60_000);
+    try {
+      await c.startManaged();
+      await c.loadHashes();
+
+      const write = c.setHashIntents([{ id: "keep", enabled: true }]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(releases.length, 1, "expected the intent write in flight");
+      releases[0].reject("network");
+
+      for (let attempt = 0; attempt < 50 && pendingRead === null; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      assert.ok(pendingRead, "expected the reconciliation read in flight");
+
+      // An unset current error must be treated as "nothing to preserve", not
+      // as an error value to concatenate with.
+      c.state.hashError = undefined;
+      pendingRead.reject("network");
+
+      assert.equal(await write, false);
+      assert.equal(
+        c.state.hashError,
+        "Cannot reach the daemon for hash state.",
+        "the reconciliation failure is reported on its own",
+      );
+      assert.equal(releases.length, 1, "the failed write is not retried");
+    } finally {
+      c.dispose();
+    }
+  });
+});
 });

@@ -73,7 +73,11 @@ function toSafeCount(value: unknown): number | undefined {
  * Invalid rows are dropped, never guessed.
  */
 export function sanitizeDownloadHashes(raw: unknown): DownloadHash[] {
-  if (!Array.isArray(raw)) return [];
+  // A top-level object/string is not an empty row set: rejecting it here keeps
+  // the caller from replacing validated rows or advancing its authoritative
+  // sequence on a malformed response. Row-level sanitization below still
+  // drops only individual invalid entries; a legitimate empty array is valid.
+  if (!Array.isArray(raw)) throw "invalidResponse";
   const out: DownloadHash[] = [];
   for (const entry of raw) {
     if (entry === null || typeof entry !== "object") continue;

@@ -14,6 +14,7 @@ pub(crate) const MAX_HASH_RECORDS: usize = 4096;
 pub(crate) const MAX_HASH_ID_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_HASH_INTENTS_PER_CALL: usize = 100;
 pub(crate) const HASH_NAMESPACE_FILE: &str = "automatic-hash-namespace";
+pub(crate) const HASH_NAMESPACE_PENDING_FILE: &str = "automatic-hash-namespace.pending";
 pub(crate) const HASH_NAMESPACE_BYTES: usize = 16;
 pub(crate) const HASH_NAMESPACE_HEX_LEN: usize = HASH_NAMESPACE_BYTES * 2;
 pub(crate) const HASH_FINGERPRINT_HEX_LEN: usize = 64;
@@ -440,20 +441,93 @@ impl HashStateFile {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct HashStore {
     path: Option<PathBuf>,
     data: HashStateFile,
     fence: u64,
+    revision: u64,
+    /// An existing state file could not be decoded. The in-memory value is an
+    /// empty fail-closed placeholder and every commit is rejected so malformed
+    /// metadata is never silently regenerated or overwritten.
+    rejected: bool,
+}
+
+/// One prepared in-memory mutation serialized as the exact bytes that the
+/// isolated persistence owner will durably publish. No filesystem operation
+/// has happened yet; the caller submits these bytes to the owner without
+/// holding a lifecycle, state, or slot lock.
+pub(crate) struct StagedHashWrite {
+    data: Option<HashStateFile>,
+    bytes: Vec<u8>,
+}
+
+impl StagedHashWrite {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Install data that the isolated owner confirmed as published.
+    pub(crate) fn install(mut self, store: &mut HashStore, revision: u64) {
+        if let Some(data) = self.data.take() {
+            store.data = data;
+            store.revision = revision;
+            store.rejected = false;
+        }
+    }
 }
 
 impl HashStore {
     pub(crate) fn load(path: Option<PathBuf>) -> Self {
-        let data = path.as_deref().and_then(load_state).unwrap_or_default();
+        let mut rejected = false;
+        let data = match path.as_deref() {
+            None => HashStateFile::default(),
+            Some(path) => match std::fs::read(path) {
+                Ok(bytes) => match decode_state(&bytes) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        rejected = true;
+                        HashStateFile::default()
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    HashStateFile::default()
+                }
+                Err(_) => {
+                    rejected = true;
+                    HashStateFile::default()
+                }
+            },
+        };
         Self {
             path,
             data,
             fence: 0,
+            revision: 0,
+            rejected,
         }
+    }
+
+    /// Build a store from canonical bytes returned by the isolated
+    /// persistence owner. Invalid bytes are rejected rather than replaced with
+    /// an empty default.
+    pub(crate) fn from_bytes(path: Option<PathBuf>, bytes: &[u8]) -> Result<Self, HashStateError> {
+        Ok(Self {
+            path,
+            data: decode_state(bytes)?,
+            fence: 0,
+            revision: 0,
+            rejected: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_rejected(&self) -> bool {
+        self.rejected
+    }
+
+    pub(crate) fn align_revision(&mut self, revision: u64) {
+        self.revision = revision;
     }
 
     pub(crate) fn default_enabled(&self) -> bool {
@@ -462,6 +536,36 @@ impl HashStore {
 
     pub(crate) fn fence(&self) -> u64 {
         self.fence
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Clone this store for an off-lock mutation. The fork deliberately has no
+    /// path, so its mutators only update memory and never touch the filesystem.
+    pub(crate) fn fork_for_staging(&self) -> Self {
+        Self {
+            path: None,
+            data: self.data.clone(),
+            fence: self.fence,
+            revision: self.revision,
+            rejected: self.rejected,
+        }
+    }
+
+    /// Serialize the current in-memory data without publishing it. The caller
+    /// submits the bytes to the isolated persistence owner and only installs
+    /// them after that owner confirms they are durable.
+    pub(crate) fn stage_write(&self) -> Result<StagedHashWrite, HashStateError> {
+        if self.rejected || !self.data.validate() {
+            return Err(HashStateError);
+        }
+        let bytes = serde_json::to_vec(&self.data).map_err(|_| HashStateError)?;
+        Ok(StagedHashWrite {
+            data: Some(self.data.clone()),
+            bytes,
+        })
     }
 
     pub(crate) fn set_fence(&mut self, fence: u64) {
@@ -732,6 +836,26 @@ impl HashStore {
             .collect()
     }
 
+    /// Rows projected while the persistence owner is quarantined. No digest
+    /// is served and every row is explicitly marked unavailable so stale
+    /// in-memory values can never look current.
+    pub(crate) fn visible_unconfirmed(&self, namespace: Option<&str>) -> Vec<DownloadHashDto> {
+        let Some(namespace) = namespace else {
+            return Vec::new();
+        };
+        self.visible(namespace)
+            .into_iter()
+            .map(|row| DownloadHashDto {
+                id: row.id,
+                state: "unavailable".to_owned(),
+                md5: None,
+                sha256: None,
+                bytes: None,
+                result_version: None,
+            })
+            .collect()
+    }
+
     pub(crate) fn completed_for(&self, namespace: &str) -> Vec<CompletedHash> {
         self.data
             .records
@@ -976,6 +1100,9 @@ impl HashStore {
     }
 
     fn commit(&mut self, data: HashStateFile) -> Result<(), HashStateError> {
+        if self.rejected {
+            return Err(HashStateError);
+        }
         if !data.validate() {
             return Err(HashStateError);
         }
@@ -984,56 +1111,207 @@ impl HashStore {
             atomic_write(path, &bytes).map_err(|_| HashStateError)?;
         }
         self.data = data;
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 }
 
 /// Result of authenticating the managed state directory and loading (or
 /// creating) the random per-owned-queue namespace.
+#[cfg(test)]
 pub(crate) struct NamespaceState {
     pub namespace: Option<String>,
+}
+
+/// Detailed first-run namespace outcome. `Malformed` and `Unavailable` are
+/// fail-closed and must never trigger regeneration or replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NamespaceLoad {
+    Ready(String),
+    Malformed,
+    Unavailable,
+}
+
+/// Read or exclusively create the stable queue namespace.
+///
+/// Creation writes a durable pending marker first, then uses
+/// `O_CREAT | O_EXCL`. A concurrent attempt that observes the marker or loses
+/// the exclusive create fails closed instead of adopting an unconfirmed file.
+/// A malformed, unreadable, symlinked, oversized, or non-regular namespace file
+/// fails closed without rewriting or regenerating it.
+pub(crate) fn ensure_namespace(directory: &Path) -> NamespaceLoad {
+    ensure_namespace_with(directory, directory_sync_supported())
+}
+
+/// Whether this build has a documented way to make a directory entry durable.
+/// Platforms without such a primitive must fail closed before creating
+/// metadata; they must never rely on a later owner accepting an unsynced file.
+pub(crate) fn directory_sync_supported() -> bool {
+    cfg!(any(target_os = "linux", windows))
+}
+
+fn ensure_namespace_with(directory: &Path, sync_supported: bool) -> NamespaceLoad {
+    if !sync_supported {
+        // Without a documented directory-durability primitive, creating the
+        // file on one attempt and accepting it on the next would silently
+        // assume a guarantee this platform does not provide.
+        return NamespaceLoad::Unavailable;
+    }
+    if crate::managed_state::ManagedStateDir::prepare(directory).is_err() {
+        return NamespaceLoad::Unavailable;
+    }
+    if pending_namespace_marker_present(directory) {
+        return NamespaceLoad::Unavailable;
+    }
+    let path = directory.join(HASH_NAMESPACE_FILE);
+    match read_namespace(&path) {
+        Ok(namespace) => NamespaceLoad::Ready(namespace),
+        Err(NamespaceRead::Missing) => create_namespace_exclusive(directory, &path),
+        Err(NamespaceRead::Malformed) => NamespaceLoad::Malformed,
+        Err(NamespaceRead::Unavailable) => NamespaceLoad::Unavailable,
+    }
+}
+
+/// Read-only namespace check for an already-initialized owner. Unlike
+/// [`ensure_namespace`], a missing file is never created or regenerated.
+pub(crate) fn read_namespace_only(directory: &Path) -> NamespaceLoad {
+    if !directory_sync_supported() {
+        return NamespaceLoad::Unavailable;
+    }
+    if crate::managed_state::ManagedStateDir::prepare(directory).is_err() {
+        return NamespaceLoad::Unavailable;
+    }
+    if pending_namespace_marker_present(directory) {
+        return NamespaceLoad::Unavailable;
+    }
+    match read_namespace(&directory.join(HASH_NAMESPACE_FILE)) {
+        Ok(namespace) => NamespaceLoad::Ready(namespace),
+        Err(NamespaceRead::Malformed) => NamespaceLoad::Malformed,
+        Err(NamespaceRead::Missing) | Err(NamespaceRead::Unavailable) => NamespaceLoad::Unavailable,
+    }
 }
 
 /// Read or atomically create the stable queue namespace. A malformed,
 /// unreadable, symlinked, or non-regular namespace file fails closed with no
 /// namespace rather than guessing or overwriting metadata.
+#[cfg(test)]
 pub(crate) fn prepare_namespace(directory: &Path) -> NamespaceState {
-    if crate::managed_state::ManagedStateDir::prepare(directory).is_err() {
-        return NamespaceState { namespace: None };
+    match ensure_namespace(directory) {
+        NamespaceLoad::Ready(namespace) => NamespaceState {
+            namespace: Some(namespace),
+        },
+        NamespaceLoad::Malformed | NamespaceLoad::Unavailable => NamespaceState { namespace: None },
     }
-    let path = directory.join(HASH_NAMESPACE_FILE);
-    match std::fs::symlink_metadata(&path) {
+}
+
+enum NamespaceRead {
+    Missing,
+    Malformed,
+    Unavailable,
+}
+
+fn read_namespace(path: &Path) -> Result<String, NamespaceRead> {
+    match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if !meta.file_type().is_file() || meta.len() > MAX_NAMESPACE_FILE_BYTES as u64 {
-                return NamespaceState { namespace: None };
+                return Err(NamespaceRead::Malformed);
             }
-            let Ok(bytes) = std::fs::read(&path) else {
-                return NamespaceState { namespace: None };
-            };
+            let bytes = std::fs::read(path).map_err(|_| NamespaceRead::Unavailable)?;
             let Ok(text) = std::str::from_utf8(&bytes) else {
-                return NamespaceState { namespace: None };
+                return Err(NamespaceRead::Malformed);
             };
             let value = text.trim_end_matches(['\r', '\n']);
             if valid_namespace(value) {
-                NamespaceState {
-                    namespace: Some(value.to_owned()),
-                }
+                Ok(value.to_owned())
             } else {
-                NamespaceState { namespace: None }
+                Err(NamespaceRead::Malformed)
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let Some(namespace) = random_namespace() else {
-                return NamespaceState { namespace: None };
-            };
-            if atomic_write(&path, namespace.as_bytes()).is_err() {
-                return NamespaceState { namespace: None };
-            }
-            NamespaceState {
-                namespace: Some(namespace),
-            }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(NamespaceRead::Missing),
+        Err(_) => Err(NamespaceRead::Unavailable),
+    }
+}
+
+fn create_namespace_exclusive(directory: &Path, path: &Path) -> NamespaceLoad {
+    let Some(namespace) = random_namespace() else {
+        return NamespaceLoad::Unavailable;
+    };
+    if write_namespace_pending(directory).is_err() {
+        return NamespaceLoad::Unavailable;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another writer (possibly an older build that does not honor the
+            // pending marker) won. Never replace or adopt its metadata while
+            // our own creation is unresolved.
+            return NamespaceLoad::Unavailable;
         }
-        Err(_) => NamespaceState { namespace: None },
+        Err(_) => return NamespaceLoad::Unavailable,
+    };
+    use std::io::Write as _;
+    let written = file
+        .write_all(namespace.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if written.is_err() {
+        // Leave the pending marker: a later run must fail closed instead of
+        // accepting a partially written namespace.
+        return NamespaceLoad::Unavailable;
+    }
+    if sync_parent(directory).is_err() {
+        return NamespaceLoad::Unavailable;
+    }
+    // Detect replacement between exclusive creation and read-back. If the
+    // name no longer matches ours, fail closed rather than adopt either
+    // value blindly.
+    match read_namespace(path) {
+        Ok(current) if current == namespace => {}
+        _ => return NamespaceLoad::Unavailable,
+    }
+    if remove_namespace_pending(directory).is_err() {
+        return NamespaceLoad::Unavailable;
+    }
+    NamespaceLoad::Ready(namespace)
+}
+
+fn write_namespace_pending(directory: &Path) -> Result<(), ()> {
+    let path = directory.join(HASH_NAMESPACE_PENDING_FILE);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(|_| ())?;
+    use std::io::Write as _;
+    file.write_all(b"SURGUI-HASH-NAMESPACE-PENDING-1\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|_| ())?;
+    drop(file);
+    sync_parent(directory).map_err(|_| ())
+}
+
+fn remove_namespace_pending(directory: &Path) -> Result<(), ()> {
+    std::fs::remove_file(directory.join(HASH_NAMESPACE_PENDING_FILE)).map_err(|_| ())?;
+    sync_parent(directory).map_err(|_| ())
+}
+
+fn pending_namespace_marker_present(directory: &Path) -> bool {
+    match std::fs::symlink_metadata(directory.join(HASH_NAMESPACE_PENDING_FILE)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
     }
 }
 
@@ -1047,17 +1325,26 @@ fn random_namespace() -> Option<String> {
     Some(out)
 }
 
-fn load_state(path: &Path) -> Option<HashStateFile> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => return None,
-    };
-    let mut data: HashStateFile = serde_json::from_slice(&bytes).ok()?;
+/// Decode and validate persisted state. Legacy completed results are migrated
+/// in memory to the stricter result shape; callers that persist the result must
+/// write the normalized bytes before serving them as durable.
+fn decode_state(bytes: &[u8]) -> Result<HashStateFile, HashStateError> {
+    let mut data: HashStateFile = serde_json::from_slice(bytes).map_err(|_| HashStateError)?;
     if !data.validate() {
-        migrate_legacy_results(&mut data)?;
+        migrate_legacy_results(&mut data).ok_or(HashStateError)?;
     }
-    data.validate().then_some(data)
+    if data.validate() {
+        Ok(data)
+    } else {
+        Err(HashStateError)
+    }
+}
+
+/// Validate and canonicalize state bytes, including the in-memory legacy
+/// migration. Returns the exact bytes the persistence owner should publish.
+pub(crate) fn normalize_state(bytes: &[u8]) -> Result<Vec<u8>, HashStateError> {
+    let data = decode_state(bytes)?;
+    serde_json::to_vec(&data).map_err(|_| HashStateError)
 }
 
 /// Older completed results lack change-time metadata and therefore cannot be
@@ -1081,7 +1368,7 @@ fn migrate_legacy_results(data: &mut HashStateFile) -> Option<()> {
     Some(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_temp(path: &Path, bytes: &[u8]) -> std::io::Result<(PathBuf, PathBuf)> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1111,24 +1398,86 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let result = (|| {
             file.write_all(bytes)?;
             file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temp, path)?;
-            #[cfg(target_os = "linux")]
-            {
-                let directory = std::fs::File::open(parent)?;
-                directory.sync_all()?;
-            }
             Ok(())
         })();
+        drop(file);
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
+            return result.map(|_| (temp, parent.to_path_buf()));
         }
-        return result;
+        // The temporary file is synced. Publishing is the caller's atomic
+        // rename so lifecycle fencing and persistence can be ordered.
+        return Ok((temp, parent.to_path_buf()));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "temporary state path is busy",
     ))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let (temp, parent) = write_temp(path, bytes)?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    sync_parent(&parent)
+        .map_err(|_| std::io::Error::other("automatic hash state directory sync failed"))
+}
+
+pub(crate) fn sync_parent(parent: &Path) -> Result<(), HashStateError> {
+    #[cfg(target_os = "linux")]
+    {
+        let directory = std::fs::File::open(parent).map_err(|_| HashStateError)?;
+        directory.sync_all().map_err(|_| HashStateError)?;
+    }
+    #[cfg(windows)]
+    {
+        // Windows has no fsync-on-directory equivalent; flushing the directory
+        // handle is the documented durability step for a rename. This is
+        // compiled against the local windows-sys definitions but is not
+        // runtime-verified in this environment.
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let wide: Vec<u16> = parent
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(HashStateError);
+        }
+        let flushed = unsafe { FlushFileBuffers(handle) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if flushed == 0 {
+            return Err(HashStateError);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = parent;
+        return Err(HashStateError);
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for HashStateError {
@@ -1287,16 +1636,78 @@ mod tests {
     }
 
     #[test]
-    fn malformed_state_fails_safe_to_false_and_empty() {
+    fn malformed_state_fails_safe_to_false_and_empty_without_regeneration() {
         let root = temp_dir("malformed");
         let path = state_file(&root);
         std::fs::write(&path, b"{not json").expect("write malformed");
-        let mut store = HashStore::load(Some(path));
+        let mut store = HashStore::load(Some(path.clone()));
+        assert!(store.is_rejected());
         assert!(!store.default_enabled());
         assert!(store.candidates(NS).is_empty());
         assert!(store.visible(NS).is_empty());
-        store.set_default_enabled(true).expect("recover atomically");
-        assert!(HashStore::load(Some(state_file(&root))).default_enabled());
+        assert!(
+            store.set_default_enabled(true).is_err(),
+            "malformed metadata must never be silently regenerated"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read state"),
+            b"{not json",
+            "the malformed file is preserved for inspection"
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[test]
+    fn invalid_persisted_bytes_are_rejected_by_from_bytes() {
+        assert!(HashStore::from_bytes(None, b"{not json").is_err());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn concurrent_first_run_namespace_has_one_exclusive_winner() {
+        let root = namespace_dir("namespace-exclusive");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let root = root.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                ensure_namespace(&root)
+            }));
+        }
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("namespace worker"))
+            .collect();
+        let mut names = std::collections::BTreeSet::new();
+        for outcome in outcomes {
+            if let NamespaceLoad::Ready(namespace) = outcome {
+                names.insert(namespace);
+            }
+        }
+        assert_eq!(names.len(), 1, "exactly one namespace may be published");
+        let winner = names.into_iter().next().expect("winner namespace");
+        assert_eq!(
+            read_namespace(&root.join(HASH_NAMESPACE_FILE))
+                .ok()
+                .as_deref(),
+            Some(winner.as_str())
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn malformed_namespace_is_never_replaced() {
+        let root = namespace_dir("namespace-never-replace");
+        let path = root.join(HASH_NAMESPACE_FILE);
+        std::fs::write(&path, b"not-a-namespace").expect("malformed namespace");
+        assert_eq!(ensure_namespace(&root), NamespaceLoad::Malformed);
+        assert_eq!(
+            std::fs::read(&path).expect("namespace preserved"),
+            b"not-a-namespace"
+        );
         remove_all_best_effort(&root);
     }
 
@@ -1863,15 +2274,69 @@ mod tests {
             panic!("namespace must be created");
         };
         assert!(valid_namespace(&namespace));
-        let path = root.join(HASH_NAMESPACE_FILE);
-        let metadata = std::fs::symlink_metadata(&path).expect("namespace file");
         #[cfg(unix)]
         {
+            let path = root.join(HASH_NAMESPACE_FILE);
+            let metadata = std::fs::symlink_metadata(&path).expect("namespace file");
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
         let second = prepare_namespace(&root);
         assert_eq!(second.namespace.as_deref(), Some(namespace.as_str()));
+        remove_all_best_effort(&root);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn unsupported_directory_sync_never_publishes_a_second_chance_namespace() {
+        let root = namespace_dir("namespace-unsupported-sync");
+        let path = root.join(HASH_NAMESPACE_FILE);
+        assert_eq!(
+            ensure_namespace_with(&root, false),
+            NamespaceLoad::Unavailable,
+            "a platform without directory durability must fail before creating metadata"
+        );
+        assert!(
+            !path.exists(),
+            "the first failed attempt must not leave a file that the next attempt accepts"
+        );
+        assert_eq!(
+            ensure_namespace_with(&root, false),
+            NamespaceLoad::Unavailable,
+            "the second attempt must fail the same way"
+        );
+        assert!(!path.exists());
+        let NamespaceLoad::Ready(namespace) = ensure_namespace_with(&root, true) else {
+            panic!("a supported platform may create the namespace");
+        };
+        let pending = root.join(HASH_NAMESPACE_PENDING_FILE);
+        assert!(
+            !pending.exists(),
+            "a confirmed namespace has no pending marker"
+        );
+        assert_eq!(
+            read_namespace(&path).ok().as_deref(),
+            Some(namespace.as_str())
+        );
+        remove_all_best_effort(&root);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn pending_namespace_marker_fails_closed_without_being_deleted() {
+        let root = namespace_dir("namespace-pending-marker");
+        let pending = root.join(HASH_NAMESPACE_PENDING_FILE);
+        std::fs::write(&pending, b"unresolved").expect("pending marker");
+        assert_eq!(
+            ensure_namespace_with(&root, true),
+            NamespaceLoad::Unavailable,
+            "an existing pending marker cannot be confirmed by a new attempt"
+        );
+        assert_eq!(
+            std::fs::read(&pending).expect("marker preserved"),
+            b"unresolved"
+        );
+        assert!(!root.join(HASH_NAMESPACE_FILE).exists());
         remove_all_best_effort(&root);
     }
 
