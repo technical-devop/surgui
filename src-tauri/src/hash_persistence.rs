@@ -465,16 +465,8 @@ impl PersistenceDomain {
         let mut spawned = None;
         let mut last_error = None;
         for (program, arg) in candidates {
-            let mut command = ProcessCommand::new(program);
-            if let Some(arg) = arg {
-                command.arg(arg);
-            }
-            match command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-            {
+            let mut command = helper_command_for(&program, arg.as_deref());
+            match command.spawn() {
                 Ok(child) => {
                     spawned = Some(child);
                     break;
@@ -1656,6 +1648,31 @@ fn reap_owned_child(mut job: ReapJob) -> bool {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Hide the helper console window on Windows; no-op elsewhere.
+#[cfg(windows)]
+fn apply_no_console_window(command: &mut ProcessCommand) {
+    use std::os::windows::process::CommandExt as _;
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn apply_no_console_window(_command: &mut ProcessCommand) {}
+
+/// Build the helper launch command used for every spawn candidate.
+/// Single constructor keeps piped stdio and the Windows flag identical.
+fn helper_command_for(program: &Path, arg: Option<&std::ffi::OsStr>) -> ProcessCommand {
+    let mut command = ProcessCommand::new(program);
+    if let Some(arg) = arg {
+        command.arg(arg);
+    }
+    apply_no_console_window(&mut command);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command
 }
 
 /// Locate the dedicated helper binary, falling back to re-executing the main
@@ -3006,6 +3023,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn helper_both_candidate_shapes_share_launch_configuration() {
+        // Checks program/args for both candidate shapes. This does not verify
+        // Windows creation flags; std exposes no getter for them.
+        let program = Path::new("dummy-helper");
+        let dedicated = helper_command_for(program, None);
+        assert_eq!(dedicated.get_program(), program.as_os_str());
+        assert!(dedicated.get_args().next().is_none());
+        let fallback = helper_command_for(program, Some(std::ffi::OsStr::new(HELPER_ARG)));
+        assert_eq!(fallback.get_program(), program.as_os_str());
+        let args: Vec<_> = fallback.get_args().collect();
+        assert_eq!(args, vec![std::ffi::OsStr::new(HELPER_ARG)]);
+    }
+
+    #[test]
+    fn helper_launch_configuration_preserves_piped_stdio_round_trip() {
+        // Round-trip through the production constructor to check piped stdio.
+        #[cfg(unix)]
+        let program = PathBuf::from("/bin/cat");
+        #[cfg(windows)]
+        let program = {
+            let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+            PathBuf::from(root).join("System32").join("more.com")
+        };
+        #[cfg(not(any(unix, windows)))]
+        return;
+        assert!(
+            program.exists(),
+            "echo tool for pipe round-trip must exist: {}",
+            program.display()
+        );
+        let mut child = helper_command_for(&program, None)
+            .spawn()
+            .expect("spawn echo with helper launch configuration");
+        let mut stdin = child.stdin.take().expect("piped stdin is preserved");
+        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout is preserved"));
+        stdin.write_all(b"ping\n").expect("write to echo child");
+        stdin.flush().expect("flush echo child");
+        drop(stdin);
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            stdout.read_exact(&mut byte).expect("read echo child");
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+            assert!(line.len() <= 1024, "echo reply is bounded");
+        }
+        assert!(
+            String::from_utf8_lossy(&line).contains("ping"),
+            "piped round-trip survives the no-window launch configuration"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_no_window_flag_matches_documented_value() {
+        // Pins the windows-sys flag constant to the documented value.
+        const DOCUMENTED_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        assert_eq!(
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+            DOCUMENTED_CREATE_NO_WINDOW,
+            "windows-sys CREATE_NO_WINDOW must match the documented value"
+        );
+    }
+
     #[cfg(unix)]
     fn true_child() -> Child {
         ProcessCommand::new("/bin/true")
@@ -3455,14 +3541,7 @@ mod tests {
         root: &Path,
         fault: Option<FaultConfig>,
     ) -> (Child, BufReader<ChildStdout>) {
-        let mut command = ProcessCommand::new(program);
-        if let Some(arg) = arg {
-            command.arg(arg);
-        }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+        let mut child = helper_command_for(program, arg.as_deref())
             .spawn()
             .expect("spawn helper");
         let request = WireRequest {
