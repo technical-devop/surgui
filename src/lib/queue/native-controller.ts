@@ -1623,6 +1623,11 @@ export class NativeQueueController {
     if (keys.length === 0) return false;
     if (this.hashCommandInFlight(epoch)) return false;
     for (const key of keys) this.hashCompletionRequested.add(key);
+    // The completion resets the budget, but an armed poll may still be waiting
+    // on the old exponential delay (up to tens of seconds). Invalidate it so
+    // the worker reply is rechecked on the fresh base cadence instead of after
+    // the stale timer. refreshHashes() reschedules at most one timer itself.
+    this.stopHashAutoRefresh();
     this.resetHashAutoBudget();
     await this.refreshHashes();
     return true;

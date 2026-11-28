@@ -1,7 +1,7 @@
 // @ts-nocheck — exercised at runtime by node --test (type stripping).
 // Deterministic regression tests for automatic hash-row propagation.
 // Fake IPC only: no daemon, no real paths/URLs/secrets.
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { NativeQueueController } from "./native-controller.ts";
 
@@ -160,6 +160,469 @@ describe("automatic hash row refresh", () => {
       c.dispose();
     }
   });
+
+  it(
+    "propagates an authoritative completion promptly while a backed-off hash poll is armed",
+    { timeout: 5000 },
+    async () => {
+      // Controlled clock only: no wall-clock sleeps. hashRefreshMs 5ms makes
+      // the production 2s x 2^attempt backoff deterministic and fast while
+      // preserving its exact timer/backoff behavior.
+      mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+      const flush = async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      };
+
+      let completed = false;
+      let completionWorkerSeen = false;
+      let workerState = "pending";
+      let hashReads = 0;
+      let completionRefreshes = 0;
+      const { invoke } = makeInvoke((command) => {
+        if (command === "start_managed_surge") return [queueRow()];
+        if (command === "list_downloads") {
+          return completed
+            ? [queueRow({ status: "completed", bytesDone: 100 })]
+            : [queueRow()];
+        }
+        if (command === "get_download_hashes") {
+          hashReads += 1;
+          return [workerState === "complete" ? complete() : pending()];
+        }
+        if (command === "refresh_download_hashes") {
+          if (completed && !completionWorkerSeen) {
+            completionWorkerSeen = true;
+            completionRefreshes += 1;
+            // The worker reply observed at completion is still pending; it
+            // becomes complete immediately afterwards, as on the slow host.
+            workerState = "complete";
+            return [pending()];
+          }
+          return [workerState === "complete" ? complete() : pending()];
+        }
+        if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+        throw new Error(`unexpected: ${command}`);
+      });
+      const c = new NativeQueueController(invoke, () => {}, 60_000, undefined, {
+        hashRefreshMs: 5,
+        hashAutoMaxAttempts: 12,
+      });
+      try {
+        await c.startManaged();
+        await c.loadHashes();
+        assert.equal(c.state.hashes[0]?.state, "pending");
+        assert.equal(hashReads, 1);
+
+        // Drive the accelerated pending polling through its natural backoff.
+        // These delays (5, 10, 20, 40, 80) leave the next poll armed for 160ms.
+        const backoffDelays = [5, 10, 20, 40, 80];
+        for (let i = 0; i < backoffDelays.length; i++) {
+          mock.timers.tick(backoffDelays[i]);
+          await flush();
+          assert.equal(hashReads, i + 2, `expected armed pending poll #${i + 2}`);
+        }
+        assert.equal(c.state.hashes[0]?.state, "pending");
+        assert.equal(
+          c.hashAutoTimer !== null,
+          true,
+          "expected a backed-off automatic poll to be armed",
+        );
+
+        // Authoritative completion lands while the 160ms poll is still armed.
+        completed = true;
+        await c.refresh();
+        await flush();
+        assert.equal(completionRefreshes, 1, "completion must trigger exactly one worker pass");
+        assert.equal(
+          c.state.hashes[0]?.state,
+          "pending",
+          "the worker reply at completion is still pending",
+        );
+
+        // 20ms is a short documented display bound (4x the accelerated base
+        // retry, equivalent to a few seconds in production): far below the
+        // remaining ~160ms stale timer. No Refresh hashes click is issued.
+        mock.timers.tick(20);
+        await flush();
+        const withinBound = c.state.hashes[0]?.state;
+
+        // Prove the setup is sound: after the stale 160ms timer finally fires,
+        // the already-complete worker is consumed and the rows do finish. The
+        // only defect is the stale display inside the short bound above.
+        mock.timers.tick(141);
+        await flush();
+        const eventual = c.state.hashes[0]?.state;
+
+        assert.equal(
+          withinBound,
+          "complete",
+          `hash rows stayed ${withinBound} after completion while a stale backed-off timer was armed (they only became ${eventual} once the stale timer fired)`,
+        );
+        assert.equal(eventual, "complete");
+        assert.equal(c.state.hashes[0]?.md5, MD5);
+        assert.equal(c.state.hashes[0]?.sha256, SHA256);
+        assert.equal(c.state.hashError, null);
+      } finally {
+        c.dispose();
+        mock.timers.reset();
+      }
+    },
+  );
+
+  it(
+    "starts the worker from the completion snapshot and rechecks promptly on the fresh timer",
+    { timeout: 5000 },
+    async () => {
+      mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+      const flush = async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      };
+
+      let completed = false;
+      let workerStarted = false;
+      let workerState = "pending";
+      let hashReads = 0;
+      let workerRefreshes = 0;
+      const { invoke, calls } = makeInvoke((command) => {
+        if (command === "start_managed_surge") return [queueRow()];
+        if (command === "list_downloads") {
+          if (!completed) return [queueRow()];
+          if (!workerStarted) {
+            workerStarted = true;
+            // Production: the authoritative snapshot itself nudges/coalesces
+            // the backend worker. Readiness flips shortly afterwards, so the
+            // immediate worker pass still observes pending.
+            setTimeout(() => {
+              workerState = "complete";
+            }, 1);
+          }
+          return [queueRow({ status: "completed", bytesDone: 100 })];
+        }
+        if (command === "get_download_hashes") {
+          hashReads += 1;
+          return [workerState === "complete" ? complete() : pending()];
+        }
+        if (command === "refresh_download_hashes") {
+          workerRefreshes += 1;
+          return [workerState === "complete" ? complete() : pending()];
+        }
+        if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+        throw new Error(`unexpected: ${command}`);
+      });
+      const c = new NativeQueueController(invoke, () => {}, 60_000, undefined, {
+        hashRefreshMs: 5,
+        hashAutoMaxAttempts: 12,
+      });
+      try {
+        await c.startManaged();
+        await c.loadHashes();
+        assert.equal(c.state.hashes[0]?.state, "pending");
+        assert.equal(hashReads, 1);
+
+        const backoffDelays = [5, 10, 20, 40, 80];
+        for (let i = 0; i < backoffDelays.length; i++) {
+          mock.timers.tick(backoffDelays[i]);
+          await flush();
+          assert.equal(hashReads, i + 2, `expected armed pending poll #${i + 2}`);
+        }
+        assert.equal(c.hashAutoTimer !== null, true);
+        const readsBeforeCompletion = hashReads;
+        const callsBeforeCompletion = calls.length;
+
+        completed = true;
+        await c.refresh();
+        await flush();
+        assert.equal(workerStarted, true, "the completion snapshot must start the worker");
+        assert.equal(workerRefreshes, 1, "the snapshot completion must issue one worker pass");
+        assert.equal(
+          c.state.hashes[0]?.state,
+          "pending",
+          "the immediate worker reply still predates readiness",
+        );
+        assert.deepEqual(
+          calls.slice(callsBeforeCompletion).map((call) => call.command),
+          ["list_downloads_snapshot", "list_downloads", "refresh_download_hashes"],
+          "the snapshot must precede exactly one worker pass",
+        );
+
+        // 20ms is far below the remaining ~160ms stale poll but above the
+        // fresh base cadence after the completion reset.
+        mock.timers.tick(20);
+        await flush();
+        assert.equal(c.state.hashes[0]?.state, "complete");
+        assert.equal(c.state.hashes[0]?.sha256, SHA256);
+        assert.equal(hashReads, readsBeforeCompletion + 1, "one fresh recheck, no duplicate reads");
+        assert.equal(workerRefreshes, 1, "completion must not retry the worker");
+        assert.equal(
+          calls[calls.length - 1].command,
+          "get_download_hashes",
+          "the fresh timer must perform the recheck",
+        );
+
+        const settledReads = hashReads;
+        mock.timers.tick(500);
+        await flush();
+        assert.equal(hashReads, settledReads, "terminal rows stop the automatic timer");
+        assert.equal(workerRefreshes, 1, "the worker pass is never retried");
+        assert.equal(count(calls, "add_download"), 0, "hash refresh must never retry downloads");
+        assert.equal(
+          count(calls, "add_download_with_options"),
+          0,
+          "hash refresh must never retry downloads",
+        );
+        assert.equal(c.state.hashError, null);
+      } finally {
+        c.dispose();
+        mock.timers.reset();
+      }
+    },
+  );
+
+  it(
+    "defers a completion reset while a hash read is in flight and fires the replacement timer",
+    { timeout: 5000 },
+    async () => {
+      mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+      const flush = async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      };
+
+      let completed = false;
+      let workerState = "pending";
+      let hashReads = 0;
+      let workerRefreshes = 0;
+      let releaseRead = null;
+      const { invoke, calls } = makeInvoke((command) => {
+        if (command === "start_managed_surge") return [queueRow()];
+        if (command === "list_downloads") {
+          if (!completed) return [queueRow()];
+          if (workerState !== "complete") {
+            setTimeout(() => {
+              workerState = "complete";
+            }, 1);
+          }
+          return [queueRow({ status: "completed", bytesDone: 100 })];
+        }
+        if (command === "get_download_hashes") {
+          hashReads += 1;
+          if (hashReads === 7) {
+            return new Promise((resolve) => {
+              releaseRead = () => resolve([pending()]);
+            });
+          }
+          return [workerState === "complete" ? complete() : pending()];
+        }
+        if (command === "refresh_download_hashes") {
+          workerRefreshes += 1;
+          return [workerState === "complete" ? complete() : pending()];
+        }
+        if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+        throw new Error(`unexpected: ${command}`);
+      });
+      const c = new NativeQueueController(invoke, () => {}, 60_000, undefined, {
+        hashRefreshMs: 5,
+        hashAutoMaxAttempts: 12,
+      });
+      try {
+        await c.startManaged();
+        await c.loadHashes();
+        assert.equal(c.state.hashes[0]?.state, "pending");
+
+        const backoffDelays = [5, 10, 20, 40, 80];
+        for (let i = 0; i < backoffDelays.length; i++) {
+          mock.timers.tick(backoffDelays[i]);
+          await flush();
+          assert.equal(hashReads, i + 2, `expected armed pending poll #${i + 2}`);
+        }
+        assert.equal(c.hashAutoTimer !== null, true);
+
+        const inFlight = c.loadHashes();
+        await flush();
+        assert.equal(hashReads, 7, "the read is in flight");
+        assert.equal(typeof releaseRead, "function");
+        const callsBeforeCompletion = calls.length;
+
+        completed = true;
+        await c.refresh();
+        await flush();
+        assert.equal(workerRefreshes, 0, "a completion cannot reset through an in-flight read");
+        assert.equal(hashReads, 7, "no duplicate read starts while one is in flight");
+        assert.deepEqual(
+          calls.slice(callsBeforeCompletion).map((call) => call.command),
+          ["list_downloads_snapshot", "list_downloads"],
+          "the completion is deferred without issuing the worker",
+        );
+
+        releaseRead();
+        await inFlight;
+        await flush();
+        assert.equal(workerRefreshes, 1, "the deferred worker pass is issued once after the read");
+        assert.equal(c.state.hashes[0]?.state, "pending");
+
+        mock.timers.tick(20);
+        await flush();
+        assert.equal(c.state.hashes[0]?.state, "complete");
+        assert.equal(c.state.hashes[0]?.sha256, SHA256);
+        assert.equal(hashReads, 8, "the replacement timer performs exactly one recheck");
+        assert.equal(workerRefreshes, 1, "the deferred worker is never retried");
+        assert.deepEqual(
+          calls.slice(callsBeforeCompletion).map((call) => call.command),
+          [
+            "list_downloads_snapshot",
+            "list_downloads",
+            "refresh_download_hashes",
+            "get_download_hashes",
+          ],
+          "completion, deferred worker, then one replacement recheck",
+        );
+
+        const settledReads = hashReads;
+        mock.timers.tick(500);
+        await flush();
+        assert.equal(hashReads, settledReads, "terminal rows stop the replacement timer");
+        assert.equal(count(calls, "add_download"), 0);
+        assert.equal(count(calls, "add_download_with_options"), 0);
+        assert.equal(c.state.hashError, null);
+      } finally {
+        c.dispose();
+        mock.timers.reset();
+      }
+    },
+  );
+
+  it(
+    "fences a completion refresh still pending when the connection drops",
+    { timeout: 5000 },
+    async () => {
+      mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+      const flush = async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      };
+
+      let completed = false;
+      let workerRefreshes = 0;
+      const workerReply = deferred();
+      const { invoke, calls } = makeInvoke((command) => {
+        if (command === "start_managed_surge") return [queueRow()];
+        if (command === "list_downloads") {
+          return completed
+            ? [queueRow({ status: "completed", bytesDone: 100 })]
+            : [queueRow()];
+        }
+        if (command === "get_download_hashes") return [pending()];
+        if (command === "refresh_download_hashes") {
+          workerRefreshes += 1;
+          return workerReply.promise;
+        }
+        if (command === "disconnect_surge") return { ok: true };
+        if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+        throw new Error(`unexpected: ${command}`);
+      });
+      const c = new NativeQueueController(invoke, () => {}, 60_000, undefined, {
+        hashRefreshMs: 5,
+        hashAutoMaxAttempts: 12,
+      });
+      try {
+        await c.startManaged();
+        await c.loadHashes();
+        assert.equal(c.state.hashes[0]?.state, "pending");
+
+        completed = true;
+        const completionRefresh = c.refresh();
+        await flush();
+        assert.equal(workerRefreshes, 1, "the completion refresh is pending");
+
+        await c.disconnect();
+        const callsAfterDisconnect = calls.length;
+        assert.deepEqual(c.state.hashes, [], "disconnect clears the old epoch rows");
+        assert.equal(c.hashAutoTimer, null, "disconnect cancels the automatic timer");
+
+        workerReply.resolve([complete()]);
+        await completionRefresh;
+        await flush();
+        assert.deepEqual(c.state.hashes, [], "the stale completion is fenced");
+        assert.equal(c.state.hashError, null);
+        assert.equal(c.hashAutoTimer, null, "no timer is re-armed on the old epoch");
+
+        mock.timers.tick(500);
+        await flush();
+        assert.equal(calls.length, callsAfterDisconnect, "no stale commands run after disconnect");
+        assert.equal(workerRefreshes, 1, "the pending worker is never retried");
+        assert.equal(c.state.phase, "offline");
+      } finally {
+        c.dispose();
+        mock.timers.reset();
+      }
+    },
+  );
+
+  it(
+    "does not retry a failed completion worker and leaves recovery manual",
+    { timeout: 5000 },
+    async () => {
+      mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+      const flush = async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      };
+
+      let completed = false;
+      let workerRefreshes = 0;
+      let hashReads = 0;
+      const { invoke, calls } = makeInvoke((command) => {
+        if (command === "start_managed_surge") return [queueRow()];
+        if (command === "list_downloads") {
+          return completed
+            ? [queueRow({ status: "completed", bytesDone: 100 })]
+            : [queueRow()];
+        }
+        if (command === "get_download_hashes") {
+          hashReads += 1;
+          return [pending()];
+        }
+        if (command === "refresh_download_hashes") {
+          workerRefreshes += 1;
+          throw "network";
+        }
+        if (command === "get_automatic_hash_settings") return { defaultEnabled: true };
+        throw new Error(`unexpected: ${command}`);
+      });
+      const c = new NativeQueueController(invoke, () => {}, 60_000, undefined, {
+        hashRefreshMs: 5,
+        hashAutoMaxAttempts: 12,
+      });
+      try {
+        await c.startManaged();
+        await c.loadHashes();
+        assert.equal(c.state.hashes[0]?.state, "pending");
+        const readsBeforeCompletion = hashReads;
+
+        completed = true;
+        await c.refresh();
+        await flush();
+        assert.equal(workerRefreshes, 1, "the completion worker is issued once");
+        assert.equal(c.state.hashes[0]?.state, "pending");
+        assert.equal(c.state.hashError, "Cannot reach the daemon for hash state.");
+        assert.equal(c.hashAutoTimer, null, "a failed worker stops the automatic timer");
+        assert.equal(hashReads, readsBeforeCompletion, "the failed worker is not re-read");
+
+        mock.timers.tick(500);
+        await flush();
+        assert.equal(workerRefreshes, 1, "the failed command is never retried");
+        assert.equal(hashReads, readsBeforeCompletion, "no retry read is issued");
+        assert.equal(count(calls, "add_download"), 0);
+        assert.equal(count(calls, "add_download_with_options"), 0);
+        assert.equal(c.state.hashError, "Cannot reach the daemon for hash state.");
+      } finally {
+        c.dispose();
+        mock.timers.reset();
+      }
+    },
+  );
 
   it("tracks two jobs independently and stops only when every row is terminal", { timeout: 5000 }, async () => {
     let reads = 0;
